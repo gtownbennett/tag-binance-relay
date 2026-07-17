@@ -3,7 +3,6 @@ services:
     name: tag-binance-relay
     runtime: docker
     region: frankfurt
-    # Render currently defaults an omitted plan to Starter.
-    # Add `plan: free` here only for testing; sleeping stops live liquidation tracking.
+    plan: free
     healthCheckPath: /health
     autoDeployTrigger: commit
