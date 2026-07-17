@@ -36,10 +36,19 @@ liquidation_lock = asyncio.Lock()
 
 stream_lock = asyncio.Lock()
 stream_state: dict[str, Any] = {
+    # Regular market stream: mark price, ticker and liquidations.
     "connected": False,
     "endpoint": None,
     "lastMessageAt": None,
     "lastError": None,
+
+    # Dedicated high-frequency public order-book stream.
+    "depthConnected": False,
+    "depthEndpoint": None,
+    "depthLastMessageAt": None,
+    "depthLastError": None,
+    "depthMode": None,
+
     "markPrice": None,
     "indexPrice": None,
     "fundingRate": None,
@@ -305,7 +314,11 @@ async def collect_snapshot() -> dict[str, Any]:
     if mark_price is None:
         errors.append("Mark-price stream has not produced a value yet.")
     if live.get("depth") is None:
-        errors.append("Depth stream has not produced a value yet.")
+        detail = live.get("depthLastError")
+        errors.append(
+            "Depth stream has not produced a value yet."
+            + (f" Last error: {detail}" if detail else "")
+        )
 
     return {
         "symbol": SYMBOL,
@@ -318,6 +331,10 @@ async def collect_snapshot() -> dict[str, Any]:
         ),
         "marketStreamConnected": bool(live.get("connected")),
         "marketStreamLastMessageAt": live.get("lastMessageAt"),
+        "depthStreamConnected": bool(live.get("depthConnected")),
+        "depthStreamEndpoint": live.get("depthEndpoint"),
+        "depthStreamLastMessageAt": live.get("depthLastMessageAt"),
+        "depthStreamMode": live.get("depthMode"),
         "markPrice": mark_price,
         "indexPrice": index_price,
         "basisBps": basis_bps,
@@ -434,13 +451,16 @@ async def record_liquidation(payload: dict[str, Any]) -> None:
 
 
 async def market_stream_listener() -> None:
+    """
+    Regular market data belongs on Binance's /market route.
+    Order-book depth is intentionally handled by depth_stream_listener().
+    """
     symbol = SYMBOL.lower()
     streams = "/".join(
         [
             f"{symbol}@forceOrder",
             f"{symbol}@markPrice@1s",
             f"{symbol}@ticker",
-            f"{symbol}@depth20@100ms",
         ]
     )
     retry_seconds = 2
@@ -471,12 +491,19 @@ async def market_stream_listener() -> None:
 
                     async for raw_message in websocket:
                         wrapper = json.loads(raw_message)
-                        payload = wrapper.get("data", wrapper) if isinstance(wrapper, dict) else {}
+                        payload = (
+                            wrapper.get("data", wrapper)
+                            if isinstance(wrapper, dict)
+                            else {}
+                        )
                         if not isinstance(payload, dict):
                             continue
 
                         event_type = str(payload.get("e", ""))
-                        event_time = as_int(payload.get("E")) or int(time.time() * 1000)
+                        event_time = (
+                            as_int(payload.get("E"))
+                            or int(time.time() * 1000)
+                        )
 
                         async with stream_lock:
                             stream_state["lastMessageAt"] = utc_iso(event_time)
@@ -500,14 +527,6 @@ async def market_stream_listener() -> None:
                                 stream_state["tradeCount24h"] = as_int(payload.get("n"))
                                 stream_state["tickerEventTime"] = event_time
 
-                        elif event_type == "depthUpdate":
-                            async with stream_lock:
-                                stream_state["depth"] = {
-                                    "bids": payload.get("b") or [],
-                                    "asks": payload.get("a") or [],
-                                }
-                                stream_state["depthEventTime"] = event_time
-
             except asyncio.CancelledError:
                 async with stream_lock:
                     stream_state["connected"] = False
@@ -516,7 +535,6 @@ async def market_stream_listener() -> None:
                 async with stream_lock:
                     stream_state["connected"] = False
                     stream_state["lastError"] = f"{type(exc).__name__}: {exc}"
-                continue
 
         if not connected_this_round:
             async with stream_lock:
@@ -526,25 +544,140 @@ async def market_stream_listener() -> None:
         retry_seconds = min(retry_seconds * 2, 60)
 
 
+async def depth_stream_listener() -> None:
+    """
+    High-frequency order-book data belongs on Binance's /public route.
+
+    Try partial-depth snapshots first. If a particular depth level does not emit
+    for TAGUSDT, fall back to the individual bookTicker stream so the relay still
+    returns best bid, best ask, spread and top-level imbalance.
+    """
+    symbol = SYMBOL.lower()
+    candidates = [
+        (f"{symbol}@depth20@100ms", "partial-depth-20"),
+        (f"{symbol}@depth10@100ms", "partial-depth-10"),
+        (f"{symbol}@depth5@100ms", "partial-depth-5"),
+        (f"{symbol}@bookTicker", "book-ticker-fallback"),
+    ]
+    retry_seconds = 2
+
+    while True:
+        got_any_message = False
+
+        for base in WS_BASES:
+            for stream_name, mode in candidates:
+                endpoint = f"{base}/public/ws/{stream_name}"
+
+                async with stream_lock:
+                    stream_state["depthEndpoint"] = endpoint
+                    stream_state["depthMode"] = mode
+                    stream_state["depthConnected"] = False
+
+                try:
+                    async with websockets.connect(
+                        endpoint,
+                        ping_interval=20,
+                        ping_timeout=20,
+                        close_timeout=10,
+                        max_size=4_000_000,
+                    ) as websocket:
+                        async with stream_lock:
+                            stream_state["depthConnected"] = True
+                            stream_state["depthLastError"] = None
+
+                        while True:
+                            raw_message = await asyncio.wait_for(
+                                websocket.recv(),
+                                timeout=20,
+                            )
+                            payload = json.loads(raw_message)
+                            if not isinstance(payload, dict):
+                                continue
+
+                            event_type = str(payload.get("e", ""))
+                            event_time = (
+                                as_int(payload.get("E"))
+                                or int(time.time() * 1000)
+                            )
+
+                            if event_type == "depthUpdate":
+                                bids = payload.get("b") or []
+                                asks = payload.get("a") or []
+                            elif event_type == "bookTicker":
+                                bid_price = payload.get("b")
+                                bid_qty = payload.get("B")
+                                ask_price = payload.get("a")
+                                ask_qty = payload.get("A")
+                                bids = (
+                                    [[bid_price, bid_qty]]
+                                    if bid_price is not None and bid_qty is not None
+                                    else []
+                                )
+                                asks = (
+                                    [[ask_price, ask_qty]]
+                                    if ask_price is not None and ask_qty is not None
+                                    else []
+                                )
+                            else:
+                                continue
+
+                            async with stream_lock:
+                                stream_state["depth"] = {
+                                    "bids": bids,
+                                    "asks": asks,
+                                }
+                                stream_state["depthEventTime"] = event_time
+                                stream_state["depthLastMessageAt"] = utc_iso(event_time)
+                                stream_state["depthConnected"] = True
+                                stream_state["depthMode"] = mode
+                                stream_state["depthLastError"] = None
+
+                            got_any_message = True
+
+                except asyncio.CancelledError:
+                    async with stream_lock:
+                        stream_state["depthConnected"] = False
+                    raise
+                except Exception as exc:
+                    async with stream_lock:
+                        stream_state["depthConnected"] = False
+                        stream_state["depthLastError"] = (
+                            f"{mode}: {type(exc).__name__}: {exc}"
+                        )
+
+                    # When a stream had already produced data, retry it on reconnect.
+                    if got_any_message:
+                        break
+
+            if got_any_message:
+                break
+
+        await asyncio.sleep(retry_seconds)
+        retry_seconds = min(retry_seconds * 2, 30)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global http_client
 
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(15.0, connect=10.0),
-        headers={"User-Agent": "TAG-Terminal-Relay/2.0"},
+        headers={"User-Agent": "TAG-Terminal-Relay/2.1.0"},
         follow_redirects=True,
     )
-    listener_task = asyncio.create_task(market_stream_listener())
+    market_task = asyncio.create_task(market_stream_listener())
+    depth_task = asyncio.create_task(depth_stream_listener())
 
     try:
         yield
     finally:
-        listener_task.cancel()
-        try:
-            await listener_task
-        except asyncio.CancelledError:
-            pass
+        market_task.cancel()
+        depth_task.cancel()
+        await asyncio.gather(
+            market_task,
+            depth_task,
+            return_exceptions=True,
+        )
 
         if http_client is not None:
             await http_client.aclose()
@@ -553,7 +686,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="TAG Binance Market Data Relay",
-    version="2.0.0",
+    version="2.1.0",
     description=(
         "Read-only relay for public Binance USDⓈ-M futures market data. "
         "No account, trading, wallet, or order functionality."
@@ -574,7 +707,7 @@ app.add_middleware(
 async def root() -> dict[str, Any]:
     return {
         "service": "TAG Binance Market Data Relay",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "symbol": SYMBOL,
         "readOnly": True,
         "docs": "/docs",
@@ -599,17 +732,25 @@ async def health() -> dict[str, Any]:
         connected = bool(stream_state["connected"])
         stream_error = stream_state["lastError"]
         last_message = stream_state["lastMessageAt"]
+        depth_connected = bool(stream_state["depthConnected"])
+        depth_error = stream_state["depthLastError"]
+        depth_message = stream_state["depthLastMessageAt"]
+        depth_mode = stream_state["depthMode"]
 
     return {
-        "ok": connected,
+        "ok": connected and depth_connected,
         "serviceTime": utc_iso(),
-        "version": "2.0.0",
+        "version": "2.1.0",
         "symbol": SYMBOL,
         "binanceRestPingReachable": binance_rest_reachable,
         "binanceRestPingError": ping_error,
         "marketStreamConnected": connected,
         "marketStreamLastMessageAt": last_message,
         "marketStreamLastError": stream_error,
+        "depthStreamConnected": depth_connected,
+        "depthStreamLastMessageAt": depth_message,
+        "depthStreamMode": depth_mode,
+        "depthStreamLastError": depth_error,
     }
 
 
