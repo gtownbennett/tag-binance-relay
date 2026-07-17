@@ -1,0 +1,161 @@
+@Composable
+private fun Leverage(s: DashboardState) {
+    val f = s.futures
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Spacer(Modifier.height(18.dp))
+
+        Text(
+            "Leverage desk",
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            "Binance derivatives first, then spot confirmation.",
+            color = Muted
+        )
+
+        Metric(
+            "Open interest",
+            compact(f.openInterestUsd),
+            Modifier.fillMaxWidth()
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Metric("OI 5m", pct(f.oiChange5mPct), Modifier.weight(1f))
+            Metric("OI 15m", pct(f.oiChange15mPct), Modifier.weight(1f))
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Metric("OI 1h", pct(f.oiChange1hPct), Modifier.weight(1f))
+            Metric("OI 4h", pct(f.oiChange4hPct), Modifier.weight(1f))
+        }
+
+        Title("Positioning")
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Metric("Funding", rawPct(f.fundingRate), Modifier.weight(1f))
+            Metric("Global L/S", raw(f.longShortRatio), Modifier.weight(1f))
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Metric("Top accounts", raw(f.topAccountRatio), Modifier.weight(1f))
+            Metric("Top positions", raw(f.topPositionRatio), Modifier.weight(1f))
+        }
+
+        Data(
+            "Global account split",
+            "${pct(f.globalLongPct)} long / ${pct(f.globalShortPct)} short"
+        )
+
+        Title("Aggressive futures flow")
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Metric(
+                "Taker buy/sell",
+                raw(f.takerBuySellRatio),
+                Modifier.weight(1f)
+            )
+            Metric(
+                "Futures volume 24h",
+                compact(f.futuresQuoteVolume24hUsd),
+                Modifier.weight(1f)
+            )
+        }
+
+        Data("5m taker buys", raw(f.takerBuyVolume5m))
+        Data("5m taker sells", raw(f.takerSellVolume5m))
+        Data("Futures price 24h", pct(f.futuresPriceChange24hPct))
+
+        Title("Order book")
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Metric("Bid depth", compact(f.bidDepthUsd), Modifier.weight(1f))
+            Metric("Ask depth", compact(f.askDepthUsd), Modifier.weight(1f))
+        }
+
+        Data("Book imbalance", pct(f.orderBookImbalancePct))
+        Data(
+            "Mark / index",
+            "${money(f.markPrice, 8)} / ${money(f.indexPrice, 8)}"
+        )
+        Data(
+            "Basis",
+            f.basisBps?.let { String.format(Locale.US, "%.2f bps", it) } ?: "—"
+        )
+        Data(
+            "Spread",
+            f.spreadBps?.let { String.format(Locale.US, "%.2f bps", it) } ?: "—"
+        )
+
+        Title("Liquidations observed by relay")
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Metric(
+                "Long liq. 1h",
+                compact(f.longLiquidation1h),
+                Modifier.weight(1f)
+            )
+            Metric(
+                "Short liq. 1h",
+                compact(f.shortLiquidation1h),
+                Modifier.weight(1f)
+            )
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Metric(
+                "Long tracked 24h",
+                compact(f.longLiquidation24h),
+                Modifier.weight(1f)
+            )
+            Metric(
+                "Short tracked 24h",
+                compact(f.shortLiquidation24h),
+                Modifier.weight(1f)
+            )
+        }
+
+        Data(
+            "Liquidation stream",
+            if (f.liquidationTrackerConnected) "LIVE" else "RECONNECTING"
+        )
+
+        if (f.errors.isNotEmpty()) {
+            Title("Unavailable fields")
+            f.errors.forEach { error ->
+                Text(error, color = Warning)
+            }
+        }
+
+        if (f.source.isNotBlank()) {
+            Text(f.source, color = Muted)
+        }
+        if (f.updatedAt.isNotBlank()) {
+            Text("Relay updated ${f.updatedAt}", color = Muted)
+        }
+
+        Title("Pattern guide")
+
+        listOf(
+            "Price ↑ + OI ↑ + controlled funding" to
+                "Expansion potential. Confirm spot volume and short crowding.",
+            "Price ↑ + OI ↓" to
+                "Short covering or deleveraging; may lack lasting fuel.",
+            "Price flat + OI surges" to
+                "Trap risk. Leverage is growing faster than price.",
+            "Price ↓ + OI ↓" to
+                "Leverage flush. Wait for stabilization.",
+            "Price ↓ + OI ↑" to
+                "Fresh short pressure or trapped longs."
+        ).forEach {
+            Info(it.first, it.second)
+        }
+    }
+}
