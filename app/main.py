@@ -19,7 +19,6 @@ SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
 WS_BASES = [
     os.getenv("BINANCE_WS_BASE", "wss://fstream.binance.com").rstrip("/"),
-    "wss://stream.binancefuture.com",
 ]
 RELAY_TOKEN = os.getenv("RELAY_TOKEN", "").strip()
 CACHE_SECONDS = max(5, int(os.getenv("CACHE_SECONDS", "15")))
@@ -31,13 +30,28 @@ snapshot_cache: dict[str, Any] = {"time": 0.0, "value": None}
 cache_lock = asyncio.Lock()
 
 service_started_ms = int(time.time() * 1000)
+
 liquidation_events: deque[dict[str, Any]] = deque(maxlen=20_000)
 liquidation_lock = asyncio.Lock()
-liquidation_status: dict[str, Any] = {
+
+stream_lock = asyncio.Lock()
+stream_state: dict[str, Any] = {
     "connected": False,
+    "endpoint": None,
     "lastMessageAt": None,
     "lastError": None,
-    "endpoint": None,
+    "markPrice": None,
+    "indexPrice": None,
+    "fundingRate": None,
+    "nextFundingTime": None,
+    "markEventTime": None,
+    "priceChange24hPct": None,
+    "volume24hContracts": None,
+    "quoteVolume24hUsd": None,
+    "tradeCount24h": None,
+    "tickerEventTime": None,
+    "depth": None,
+    "depthEventTime": None,
 }
 
 
@@ -91,13 +105,11 @@ async def get_json(path: str, params: dict[str, Any] | None = None) -> Any:
     if http_client is None:
         raise RuntimeError("HTTP client has not started.")
 
-    url = f"{REST_BASE}{path}"
-    response = await http_client.get(url, params=params)
+    response = await http_client.get(f"{REST_BASE}{path}", params=params)
 
     if response.status_code == 451:
         raise RuntimeError(
-            "Binance returned HTTP 451 to the relay. Deploy the service in a region "
-            "where Binance public market data is available."
+            "Binance returned HTTP 451. The relay region cannot access this endpoint."
         )
 
     response.raise_for_status()
@@ -107,9 +119,10 @@ async def get_json(path: str, params: dict[str, Any] | None = None) -> Any:
         raise RuntimeError(f"Binance returned non-JSON data for {path}.") from exc
 
 
-def book_metrics(depth: dict[str, Any], mark_price: float | None) -> dict[str, float | None]:
-    bids_raw = depth.get("bids") or []
-    asks_raw = depth.get("asks") or []
+def book_metrics(depth: dict[str, Any] | None, mark_price: float | None) -> dict[str, float | None]:
+    depth = depth or {}
+    bids_raw = depth.get("bids") or depth.get("b") or []
+    asks_raw = depth.get("asks") or depth.get("a") or []
 
     bids = [
         (as_float(row[0]), as_float(row[1]))
@@ -133,7 +146,7 @@ def book_metrics(depth: dict[str, Any], mark_price: float | None) -> dict[str, f
     )
 
     def notional(rows: list[tuple[float, float]]) -> float:
-        return sum(price * qty for price, qty in rows)
+        return sum(price * quantity for price, quantity in rows)
 
     def within(rows: list[tuple[float, float]], percent: float, side: str) -> float | None:
         if mid is None:
@@ -159,6 +172,9 @@ def book_metrics(depth: dict[str, Any], mark_price: float | None) -> dict[str, f
         "bestBid": best_bid,
         "bestAsk": best_ask,
         "spreadBps": spread_bps,
+        "bidDepthUsdTop20": bid_total,
+        "askDepthUsdTop20": ask_total,
+        # Keep the original field names so the Android replacement still works.
         "bidDepthUsdTop100": bid_total,
         "askDepthUsdTop100": ask_total,
         "orderBookImbalancePct": imbalance,
@@ -186,12 +202,18 @@ async def liquidation_summary() -> dict[str, Any]:
             if event["liquidationSide"] == side and event["time"] >= since_ms
         )
 
+    async with stream_lock:
+        connected = bool(stream_state["connected"])
+        endpoint = stream_state["endpoint"]
+        last_message_at = stream_state["lastMessageAt"]
+        last_error = stream_state["lastError"]
+
     return {
-        "trackerConnected": bool(liquidation_status["connected"]),
-        "trackerEndpoint": liquidation_status["endpoint"],
+        "trackerConnected": connected,
+        "trackerEndpoint": endpoint,
         "trackerStartedAt": utc_iso(service_started_ms),
-        "lastMessageAt": liquidation_status["lastMessageAt"],
-        "lastError": liquidation_status["lastError"],
+        "lastMessageAt": last_message_at,
+        "lastError": last_error,
         "eventsTracked24h": len(events),
         "longLiquidation1hUsd": total("LONG", one_hour_ago),
         "shortLiquidation1hUsd": total("SHORT", one_hour_ago),
@@ -199,7 +221,7 @@ async def liquidation_summary() -> dict[str, Any]:
         "shortLiquidationTracked24hUsd": total("SHORT", twenty_four_hours_ago),
         "note": (
             "Liquidation totals include only events observed while this relay was running. "
-            "Binance's stream sends snapshots, not a guaranteed complete historical ledger."
+            "The Binance stream provides liquidation snapshots, not a complete historical ledger."
         ),
     }
 
@@ -207,9 +229,8 @@ async def liquidation_summary() -> dict[str, Any]:
 async def collect_snapshot() -> dict[str, Any]:
     errors: list[str] = []
 
+    # These /futures/data endpoints are working from the current Render relay.
     calls = {
-        "premium": get_json("/fapi/v1/premiumIndex", {"symbol": SYMBOL}),
-        "oi_current": get_json("/fapi/v1/openInterest", {"symbol": SYMBOL}),
         "oi_hist": get_json(
             "/futures/data/openInterestHist",
             {"symbol": SYMBOL, "period": "5m", "limit": 60},
@@ -230,8 +251,6 @@ async def collect_snapshot() -> dict[str, Any]:
             "/futures/data/takerlongshortRatio",
             {"symbol": SYMBOL, "period": "5m", "limit": 2},
         ),
-        "ticker": get_json("/fapi/v1/ticker/24hr", {"symbol": SYMBOL}),
-        "depth": get_json("/fapi/v1/depth", {"symbol": SYMBOL, "limit": 100}),
     }
 
     names = list(calls.keys())
@@ -245,22 +264,20 @@ async def collect_snapshot() -> dict[str, Any]:
         else:
             data[name] = result
 
-    premium = data.get("premium") if isinstance(data.get("premium"), dict) else {}
-    oi_current = data.get("oi_current") if isinstance(data.get("oi_current"), dict) else {}
-    ticker = data.get("ticker") if isinstance(data.get("ticker"), dict) else {}
-    depth = data.get("depth") if isinstance(data.get("depth"), dict) else {}
+    async with stream_lock:
+        live = dict(stream_state)
+
+    mark_price = as_float(live.get("markPrice"))
+    index_price = as_float(live.get("indexPrice"))
+    funding_rate = as_float(live.get("fundingRate"))
+    next_funding_time = as_int(live.get("nextFundingTime"))
 
     oi_history = data.get("oi_hist") if isinstance(data.get("oi_hist"), list) else []
     oi_history = [row for row in oi_history if isinstance(row, dict)]
 
-    mark_price = as_float(premium.get("markPrice"))
-    index_price = as_float(premium.get("indexPrice"))
-    open_interest_contracts = as_float(oi_current.get("openInterest"))
-    open_interest_usd = (
-        open_interest_contracts * mark_price
-        if open_interest_contracts is not None and mark_price is not None
-        else None
-    )
+    latest_oi_row = oi_history[-1] if oi_history else {}
+    open_interest_contracts = as_float(latest_oi_row.get("sumOpenInterest"))
+    open_interest_usd = as_float(latest_oi_row.get("sumOpenInterestValue"))
 
     oi_values = [as_float(row.get("sumOpenInterestValue")) for row in oi_history]
     oi_values = [value for value in oi_values if value is not None]
@@ -280,19 +297,32 @@ async def collect_snapshot() -> dict[str, Any]:
     if mark_price is not None and index_price not in (None, 0):
         basis_bps = ((mark_price - index_price) / index_price) * 10_000.0
 
-    order_book = book_metrics(depth, mark_price)
+    order_book = book_metrics(live.get("depth"), mark_price)
     liquidations = await liquidation_summary()
+
+    if not live.get("connected"):
+        errors.append("Binance market WebSocket is reconnecting.")
+    if mark_price is None:
+        errors.append("Mark-price stream has not produced a value yet.")
+    if live.get("depth") is None:
+        errors.append("Depth stream has not produced a value yet.")
 
     return {
         "symbol": SYMBOL,
         "source": "Binance USDⓈ-M Futures public market data",
         "relayGeneratedAt": utc_iso(),
-        "binanceEventTime": as_int(premium.get("time")),
+        "binanceEventTime": (
+            as_int(live.get("markEventTime"))
+            or as_int(live.get("tickerEventTime"))
+            or as_int(latest_oi_row.get("timestamp"))
+        ),
+        "marketStreamConnected": bool(live.get("connected")),
+        "marketStreamLastMessageAt": live.get("lastMessageAt"),
         "markPrice": mark_price,
         "indexPrice": index_price,
         "basisBps": basis_bps,
-        "fundingRate": as_float(premium.get("lastFundingRate")),
-        "nextFundingTime": as_int(premium.get("nextFundingTime")),
+        "fundingRate": funding_rate,
+        "nextFundingTime": next_funding_time,
         "openInterestContracts": open_interest_contracts,
         "openInterestUsd": open_interest_usd,
         "openInterestHistoryLatestUsd": latest_oi_hist,
@@ -336,10 +366,10 @@ async def collect_snapshot() -> dict[str, Any]:
         "takerBuySellRatio": as_float(taker.get("buySellRatio")),
         "takerBuyVolumeContracts5m": as_float(taker.get("buyVol")),
         "takerSellVolumeContracts5m": as_float(taker.get("sellVol")),
-        "futuresPriceChange24hPct": as_float(ticker.get("priceChangePercent")),
-        "futuresVolume24hContracts": as_float(ticker.get("volume")),
-        "futuresQuoteVolume24hUsd": as_float(ticker.get("quoteVolume")),
-        "futuresTradeCount24h": as_int(ticker.get("count")),
+        "futuresPriceChange24hPct": as_float(live.get("priceChange24hPct")),
+        "futuresVolume24hContracts": as_float(live.get("volume24hContracts")),
+        "futuresQuoteVolume24hUsd": as_float(live.get("quoteVolume24hUsd")),
+        "futuresTradeCount24h": as_int(live.get("tradeCount24h")),
         **order_book,
         **liquidations,
         "errors": errors,
@@ -364,16 +394,65 @@ async def cached_snapshot(force: bool = False) -> dict[str, Any]:
         return value
 
 
-async def liquidation_listener() -> None:
-    stream_path = f"/market/ws/{SYMBOL.lower()}@forceOrder"
+async def record_liquidation(payload: dict[str, Any]) -> None:
+    order = payload.get("o")
+    if not isinstance(order, dict):
+        return
+    if str(order.get("s", "")).upper() != SYMBOL:
+        return
+
+    side = str(order.get("S", "")).upper()
+    liquidation_side = "LONG" if side == "SELL" else "SHORT"
+
+    price = as_float(order.get("ap")) or as_float(order.get("p"))
+    quantity = (
+        as_float(order.get("z"))
+        or as_float(order.get("l"))
+        or as_float(order.get("q"))
+    )
+    event_time = (
+        as_int(order.get("T"))
+        or as_int(payload.get("E"))
+        or int(time.time() * 1000)
+    )
+
+    if price is None or quantity is None:
+        return
+
+    event = {
+        "time": event_time,
+        "timeIso": utc_iso(event_time),
+        "liquidationSide": liquidation_side,
+        "orderSide": side,
+        "price": price,
+        "quantity": quantity,
+        "notionalUsd": price * quantity,
+    }
+
+    async with liquidation_lock:
+        liquidation_events.append(event)
+
+
+async def market_stream_listener() -> None:
+    symbol = SYMBOL.lower()
+    streams = "/".join(
+        [
+            f"{symbol}@forceOrder",
+            f"{symbol}@markPrice@1s",
+            f"{symbol}@ticker",
+            f"{symbol}@depth20@100ms",
+        ]
+    )
     retry_seconds = 2
 
     while True:
-        connected = False
+        connected_this_round = False
 
         for base in WS_BASES:
-            endpoint = f"{base}{stream_path}"
-            liquidation_status["endpoint"] = endpoint
+            endpoint = f"{base}/market/stream?streams={streams}"
+
+            async with stream_lock:
+                stream_state["endpoint"] = endpoint
 
             try:
                 async with websockets.connect(
@@ -381,71 +460,67 @@ async def liquidation_listener() -> None:
                     ping_interval=20,
                     ping_timeout=20,
                     close_timeout=10,
-                    max_size=2_000_000,
+                    max_size=4_000_000,
                 ) as websocket:
-                    connected = True
+                    connected_this_round = True
                     retry_seconds = 2
-                    liquidation_status["connected"] = True
-                    liquidation_status["lastError"] = None
+
+                    async with stream_lock:
+                        stream_state["connected"] = True
+                        stream_state["lastError"] = None
 
                     async for raw_message in websocket:
-                        payload = json.loads(raw_message)
-                        if isinstance(payload, dict) and "data" in payload:
-                            payload = payload["data"]
-
+                        wrapper = json.loads(raw_message)
+                        payload = wrapper.get("data", wrapper) if isinstance(wrapper, dict) else {}
                         if not isinstance(payload, dict):
                             continue
 
-                        order = payload.get("o")
-                        if not isinstance(order, dict):
-                            continue
-                        if str(order.get("s", "")).upper() != SYMBOL:
-                            continue
+                        event_type = str(payload.get("e", ""))
+                        event_time = as_int(payload.get("E")) or int(time.time() * 1000)
 
-                        side = str(order.get("S", "")).upper()
-                        # A forced SELL closes a long. A forced BUY closes a short.
-                        liquidation_side = "LONG" if side == "SELL" else "SHORT"
+                        async with stream_lock:
+                            stream_state["lastMessageAt"] = utc_iso(event_time)
 
-                        price = as_float(order.get("ap")) or as_float(order.get("p"))
-                        quantity = (
-                            as_float(order.get("z"))
-                            or as_float(order.get("l"))
-                            or as_float(order.get("q"))
-                        )
-                        event_time = (
-                            as_int(order.get("T"))
-                            or as_int(payload.get("E"))
-                            or int(time.time() * 1000)
-                        )
+                        if event_type == "forceOrder":
+                            await record_liquidation(payload)
 
-                        if price is None or quantity is None:
-                            continue
+                        elif event_type == "markPriceUpdate":
+                            async with stream_lock:
+                                stream_state["markPrice"] = as_float(payload.get("p"))
+                                stream_state["indexPrice"] = as_float(payload.get("i"))
+                                stream_state["fundingRate"] = as_float(payload.get("r"))
+                                stream_state["nextFundingTime"] = as_int(payload.get("T"))
+                                stream_state["markEventTime"] = event_time
 
-                        event = {
-                            "time": event_time,
-                            "timeIso": utc_iso(event_time),
-                            "liquidationSide": liquidation_side,
-                            "orderSide": side,
-                            "price": price,
-                            "quantity": quantity,
-                            "notionalUsd": price * quantity,
-                        }
+                        elif event_type == "24hrTicker":
+                            async with stream_lock:
+                                stream_state["priceChange24hPct"] = as_float(payload.get("P"))
+                                stream_state["volume24hContracts"] = as_float(payload.get("v"))
+                                stream_state["quoteVolume24hUsd"] = as_float(payload.get("q"))
+                                stream_state["tradeCount24h"] = as_int(payload.get("n"))
+                                stream_state["tickerEventTime"] = event_time
 
-                        async with liquidation_lock:
-                            liquidation_events.append(event)
-
-                        liquidation_status["lastMessageAt"] = event["timeIso"]
+                        elif event_type == "depthUpdate":
+                            async with stream_lock:
+                                stream_state["depth"] = {
+                                    "bids": payload.get("b") or [],
+                                    "asks": payload.get("a") or [],
+                                }
+                                stream_state["depthEventTime"] = event_time
 
             except asyncio.CancelledError:
-                liquidation_status["connected"] = False
+                async with stream_lock:
+                    stream_state["connected"] = False
                 raise
             except Exception as exc:
-                liquidation_status["connected"] = False
-                liquidation_status["lastError"] = f"{type(exc).__name__}: {exc}"
+                async with stream_lock:
+                    stream_state["connected"] = False
+                    stream_state["lastError"] = f"{type(exc).__name__}: {exc}"
                 continue
 
-        if not connected:
-            liquidation_status["connected"] = False
+        if not connected_this_round:
+            async with stream_lock:
+                stream_state["connected"] = False
 
         await asyncio.sleep(retry_seconds)
         retry_seconds = min(retry_seconds * 2, 60)
@@ -457,10 +532,10 @@ async def lifespan(_: FastAPI):
 
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(15.0, connect=10.0),
-        headers={"User-Agent": "TAG-Terminal-Relay/1.0"},
+        headers={"User-Agent": "TAG-Terminal-Relay/2.0"},
         follow_redirects=True,
     )
-    listener_task = asyncio.create_task(liquidation_listener())
+    listener_task = asyncio.create_task(market_stream_listener())
 
     try:
         yield
@@ -478,10 +553,10 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="TAG Binance Market Data Relay",
-    version="1.0.0",
+    version="2.0.0",
     description=(
         "Read-only relay for public Binance USDⓈ-M futures market data. "
-        "It has no trading, wallet, account, or order endpoints."
+        "No account, trading, wallet, or order functionality."
     ),
     lifespan=lifespan,
 )
@@ -499,6 +574,7 @@ app.add_middleware(
 async def root() -> dict[str, Any]:
     return {
         "service": "TAG Binance Market Data Relay",
+        "version": "2.0.0",
         "symbol": SYMBOL,
         "readOnly": True,
         "docs": "/docs",
@@ -511,22 +587,29 @@ async def root() -> dict[str, Any]:
 @app.get("/health")
 async def health() -> dict[str, Any]:
     ping_error = None
-    binance_reachable = False
+    binance_rest_reachable = False
 
     try:
         await get_json("/fapi/v1/ping")
-        binance_reachable = True
+        binance_rest_reachable = True
     except Exception as exc:
         ping_error = str(exc)
 
+    async with stream_lock:
+        connected = bool(stream_state["connected"])
+        stream_error = stream_state["lastError"]
+        last_message = stream_state["lastMessageAt"]
+
     return {
-        "ok": binance_reachable,
+        "ok": connected,
         "serviceTime": utc_iso(),
+        "version": "2.0.0",
         "symbol": SYMBOL,
-        "binanceReachable": binance_reachable,
-        "binanceError": ping_error,
-        "liquidationTrackerConnected": liquidation_status["connected"],
-        "liquidationTrackerLastError": liquidation_status["lastError"],
+        "binanceRestPingReachable": binance_rest_reachable,
+        "binanceRestPingError": ping_error,
+        "marketStreamConnected": connected,
+        "marketStreamLastMessageAt": last_message,
+        "marketStreamLastError": stream_error,
     }
 
 
