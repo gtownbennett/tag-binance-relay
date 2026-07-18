@@ -1,11 +1,13 @@
-# TAG Binance Market Data Relay
+# TAG Binance Market Data Relay + Chad
 
 This is a read-only relay for **public Binance USDⓈ-M futures market data** for
 `TAGUSDT`. It contains no login, wallet, trading, account, order, withdrawal, or
 API-secret functionality.
 
 It is designed for the existing Android **TAG Terminal** app so one request can
-fill the leverage screen instead of leaving most fields blank.
+fill the leverage screen instead of leaving most fields blank. Version 2.2.0 also
+adds a protected server-side **Chad** endpoint that sends verified Binance data to
+OpenAI without exposing the OpenAI key in the Android APK.
 
 ## Data returned
 
@@ -29,6 +31,18 @@ Returns the raw Binance history arrays for OI, ratios and taker flow.
 `GET /v1/tag/liquidations`
 
 Returns the liquidation events observed while the service has been running.
+
+`POST /v1/chad/analyze`
+
+Collects a fresh TAG snapshot, selected Binance history and recent observed
+liquidations, then requests a structured leverage-first analysis from OpenAI.
+The response includes Chad's plain-English summary, confidence, leverage
+assessment, confirmation/invalidation levels, three probability scenarios and
+data-quality warnings.
+
+This endpoint requires both `OPENAI_API_KEY` and `RELAY_TOKEN` in Render. The
+relay token is intentionally mandatory for Chad because each request can create
+OpenAI API charges.
 
 ## Important limitation
 
@@ -123,6 +137,43 @@ X-Relay-Key: your-long-random-value
 The Android replacement `ApiClient.kt` already sends the value saved in the
 app's existing Settings key box. Until the Settings wording is renamed, that box
 can hold the relay token.
+
+## Enable and test Chad
+
+In Render → **Environment**, add:
+
+```text
+OPENAI_API_KEY = your private replacement OpenAI project key
+RELAY_TOKEN = a long random secret you create
+```
+
+Optional tuning variables:
+
+```text
+OPENAI_MODEL = gpt-5.6-luna
+OPENAI_REASONING_EFFORT = low
+OPENAI_MAX_OUTPUT_TOKENS = 2200
+OPENAI_TIMEOUT_SECONDS = 75
+```
+
+After the deployment becomes live, open `/docs`, expand
+`POST /v1/chad/analyze`, click **Try it out**, and supply the same `RELAY_TOKEN`
+in the `X-Relay-Key` header. A small test body is:
+
+```json
+{
+  "question": "What is TAG doing right now?",
+  "historyPeriod": "5m",
+  "historyLimit": 72,
+  "positionTag": 100812406,
+  "averageEntryUsd": 0.00014105,
+  "forceFresh": true,
+  "includeRawHistory": false
+}
+```
+
+The OpenAI key is read only by the Render server. It is never returned by the
+API and must never be placed in Android source code or GitHub.
 
 ## Connect the Android TAG Terminal
 
@@ -243,7 +294,12 @@ relay is for the outbound request to originate there.
 
 See `.env.example`.
 
-- `RELAY_TOKEN`: optional protection for relay endpoints
+- `RELAY_TOKEN`: optional for public market-data endpoints; required for Chad
+- `OPENAI_API_KEY`: private server-side OpenAI project key
+- `OPENAI_MODEL`: defaults to `gpt-5.6-luna`
+- `OPENAI_REASONING_EFFORT`: defaults to `low`
+- `OPENAI_MAX_OUTPUT_TOKENS`: defaults to 2200
+- `OPENAI_TIMEOUT_SECONDS`: defaults to 75
 - `BINANCE_SYMBOL`: defaults to `TAGUSDT`
 - `BINANCE_REST_BASE`: defaults to `https://fapi.binance.com`
 - `BINANCE_WS_BASE`: defaults to `wss://fstream.binance.com`
