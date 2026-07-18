@@ -1,15 +1,21 @@
-# TAG Binance Market Data Relay + Chad
+# TAG Market Data Relay + Chad
 
 This is a read-only relay for **public Binance USDⓈ-M futures market data** for
 `TAGUSDT`. It contains no login, wallet, trading, account, order, withdrawal, or
 API-secret functionality.
 
 It is designed for the existing Android **TAG Terminal** app so one request can
-fill the leverage screen instead of leaving most fields blank. Version 2.2.0 also
-adds a protected server-side **Chad** endpoint that sends verified Binance data to
-OpenAI without exposing the OpenAI key in the Android APK.
+fill the leverage screen instead of leaving most fields blank. Version 2.3.0 adds primary-pair PancakeSwap spot confirmation through DEX Screener and keeps the protected server-side **Chad** endpoint that sends verified futures and spot data to OpenAI without exposing the OpenAI key in the Android APK.
 
 ## Data returned
+
+`GET /v1/tag/spot`
+
+- Primary TAG/WBNB PancakeSwap price and circulating market cap
+- DEX liquidity, FDV and 5-minute/1-hour/6-hour/24-hour total volume
+- Buy and sell transaction counts for each window
+- Price change for each window
+- Clear warning that buy/sell counts are transactions, not dollar buy/sell volume
 
 `GET /v1/tag/snapshot`
 
@@ -34,8 +40,7 @@ Returns the liquidation events observed while the service has been running.
 
 `POST /v1/chad/analyze`
 
-Collects a fresh TAG snapshot, selected Binance history and recent observed
-liquidations, then requests a structured leverage-first analysis from OpenAI.
+Collects a fresh TAG futures snapshot, primary-pair DEX spot snapshot, selected Binance history and recent observed liquidations, then requests a structured leverage-first analysis from OpenAI.
 The response includes Chad's plain-English summary, confidence, leverage
 assessment, confirmation/invalidation levels, three probability scenarios and
 data-quality warnings.
@@ -150,7 +155,7 @@ RELAY_TOKEN = a long random secret you create
 Optional tuning variables:
 
 ```text
-OPENAI_MODEL = gpt-5.6-luna
+OPENAI_MODEL = gpt-5.5
 OPENAI_REASONING_EFFORT = low
 OPENAI_MAX_OUTPUT_TOKENS = 2200
 OPENAI_TIMEOUT_SECONDS = 75
@@ -172,7 +177,7 @@ in the `X-Relay-Key` header. A small test body is:
 }
 ```
 
-The OpenAI key is read only by the Render server. It is never returned by the
+The DEX Screener pair endpoint is cached by the relay and is within the official 300 requests-per-minute pair-endpoint limit. The OpenAI key is read only by the Render server. It is never returned by the
 API and must never be placed in Android source code or GitHub.
 
 ## Connect the Android TAG Terminal

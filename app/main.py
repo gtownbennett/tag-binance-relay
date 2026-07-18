@@ -16,7 +16,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.2.0"
+SERVICE_VERSION = "2.3.0"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -28,7 +28,16 @@ CACHE_SECONDS = max(5, int(os.getenv("CACHE_SECONDS", "15")))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5").strip() or "gpt-5.5"
+
+DEXSCREENER_BASE = os.getenv("DEXSCREENER_BASE", "https://api.dexscreener.com").rstrip("/")
+DEX_CHAIN_ID = os.getenv("DEX_CHAIN_ID", "bsc").strip() or "bsc"
+DEX_PAIR_ADDRESS = os.getenv(
+    "DEX_PAIR_ADDRESS", "0xf0750c373EbBB3BaEEF7e03D8300cAaD1983d67c"
+).strip()
+TAG_CIRCULATING_SUPPLY = float(
+    os.getenv("TAG_CIRCULATING_SUPPLY", "108404572594")
+)
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip().lower()
 OPENAI_MAX_OUTPUT_TOKENS = max(600, int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "2200")))
 OPENAI_TIMEOUT_SECONDS = max(20, int(os.getenv("OPENAI_TIMEOUT_SECONDS", "75")))
@@ -42,7 +51,9 @@ VALID_PERIODS = {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
 http_client: httpx.AsyncClient | None = None
 openai_client: httpx.AsyncClient | None = None
 snapshot_cache: dict[str, Any] = {"time": 0.0, "value": None}
+spot_cache: dict[str, Any] = {"time": 0.0, "value": None}
 cache_lock = asyncio.Lock()
+spot_cache_lock = asyncio.Lock()
 
 service_started_ms = int(time.time() * 1000)
 
@@ -163,7 +174,7 @@ Analyze TAGUSDT using ONLY the verified data supplied in the user message.
 
 Required analysis order:
 1. Derivatives structure: price versus open interest, funding, taker flow, long/short ratios, liquidations, basis and order-book imbalance.
-2. Spot confirmation. The supplied relay is Binance futures data unless a field explicitly says spot or DEX. If spot data is absent, state that clearly and lower confidence.
+2. Spot confirmation. Use the supplied DEX spot object for price, market cap, liquidity, total volume and buy/sell transaction counts. Transaction counts are not dollar buy/sell volume; do not mislabel them. If spot data is unavailable, state that clearly and lower confidence.
 3. Catalysts. If no verified catalyst data was supplied, say unavailable; never invent news.
 4. Technical structure and confirmation/invalidation levels.
 
@@ -177,6 +188,7 @@ Rules:
 - Plain English first, then technical detail.
 - Quote exact supplied numbers when useful.
 - Never claim a market cap, DEX volume, catalyst, whale move, or spot-buying confirmation unless it is in the supplied data.
+- Compare futures movement with DEX spot participation. A futures-led move with weak DEX volume or weak transaction confirmation deserves lower durability confidence.
 - Missing or contradictory data must reduce confidence.
 - Give exactly three scenarios whose probabilities total 100.
 - Separate a temporary squeeze from a durable trend.
@@ -298,6 +310,157 @@ async def get_json(path: str, params: dict[str, Any] | None = None) -> Any:
         return response.json()
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Binance returned non-JSON data for {path}.") from exc
+
+
+async def get_dex_json(path: str) -> Any:
+    if http_client is None:
+        raise RuntimeError("HTTP client has not started.")
+
+    response = await http_client.get(f"{DEXSCREENER_BASE}{path}")
+    response.raise_for_status()
+    try:
+        return response.json()
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"DEX Screener returned non-JSON data for {path}.") from exc
+
+
+def _window_value(container: Any, window: str, field: str | None = None) -> Any:
+    if not isinstance(container, dict):
+        return None
+    value = container.get(window)
+    if field is None:
+        return value
+    if not isinstance(value, dict):
+        return None
+    return value.get(field)
+
+
+async def collect_spot_data() -> dict[str, Any]:
+    errors: list[str] = []
+    path = f"/latest/dex/pairs/{DEX_CHAIN_ID}/{DEX_PAIR_ADDRESS}"
+
+    try:
+        payload = await get_dex_json(path)
+    except Exception as exc:
+        return {
+            "source": "DEX Screener pair API",
+            "chainId": DEX_CHAIN_ID,
+            "pairAddress": DEX_PAIR_ADDRESS,
+            "generatedAt": utc_iso(),
+            "available": False,
+            "errors": [str(exc)],
+        }
+
+    pairs = payload.get("pairs") if isinstance(payload, dict) else None
+    pair = pairs[0] if isinstance(pairs, list) and pairs and isinstance(pairs[0], dict) else None
+    if pair is None:
+        return {
+            "source": "DEX Screener pair API",
+            "chainId": DEX_CHAIN_ID,
+            "pairAddress": DEX_PAIR_ADDRESS,
+            "generatedAt": utc_iso(),
+            "available": False,
+            "errors": ["TAG/WBNB pair was not returned by DEX Screener."],
+        }
+
+    price_usd = as_float(pair.get("priceUsd"))
+    api_market_cap = as_float(pair.get("marketCap"))
+    estimated_market_cap = (
+        price_usd * TAG_CIRCULATING_SUPPLY if price_usd is not None else None
+    )
+    market_cap = api_market_cap or estimated_market_cap
+
+    liquidity = pair.get("liquidity") if isinstance(pair.get("liquidity"), dict) else {}
+    volume = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
+    price_change = (
+        pair.get("priceChange") if isinstance(pair.get("priceChange"), dict) else {}
+    )
+    txns = pair.get("txns") if isinstance(pair.get("txns"), dict) else {}
+
+    def txn_window(window: str) -> dict[str, Any]:
+        buys = as_int(_window_value(txns, window, "buys"))
+        sells = as_int(_window_value(txns, window, "sells"))
+        total = (buys or 0) + (sells or 0)
+        return {
+            "buys": buys,
+            "sells": sells,
+            "total": total if buys is not None or sells is not None else None,
+            "buySharePct": ((buys or 0) / total * 100.0) if total else None,
+            "buySellRatio": ((buys or 0) / sells) if sells else None,
+        }
+
+    base_token = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+    quote_token = pair.get("quoteToken") if isinstance(pair.get("quoteToken"), dict) else {}
+
+    return {
+        "source": "DEX Screener pair API",
+        "sourceUrl": pair.get("url"),
+        "generatedAt": utc_iso(),
+        "available": True,
+        "chainId": pair.get("chainId") or DEX_CHAIN_ID,
+        "dexId": pair.get("dexId"),
+        "pairAddress": pair.get("pairAddress") or DEX_PAIR_ADDRESS,
+        "baseToken": {
+            "address": base_token.get("address"),
+            "name": base_token.get("name"),
+            "symbol": base_token.get("symbol"),
+        },
+        "quoteToken": {
+            "address": quote_token.get("address"),
+            "name": quote_token.get("name"),
+            "symbol": quote_token.get("symbol"),
+        },
+        "priceUsd": price_usd,
+        "priceNative": as_float(pair.get("priceNative")),
+        "marketCapUsd": market_cap,
+        "marketCapSource": (
+            "DEX Screener" if api_market_cap is not None else "price × configured circulating supply"
+        ),
+        "fdvUsd": as_float(pair.get("fdv")),
+        "liquidityUsd": as_float(liquidity.get("usd")),
+        "volumeUsd": {
+            "m5": as_float(volume.get("m5")),
+            "h1": as_float(volume.get("h1")),
+            "h6": as_float(volume.get("h6")),
+            "h24": as_float(volume.get("h24")),
+        },
+        "priceChangePct": {
+            "m5": as_float(price_change.get("m5")),
+            "h1": as_float(price_change.get("h1")),
+            "h6": as_float(price_change.get("h6")),
+            "h24": as_float(price_change.get("h24")),
+        },
+        "transactions": {
+            "m5": txn_window("m5"),
+            "h1": txn_window("h1"),
+            "h6": txn_window("h6"),
+            "h24": txn_window("h24"),
+        },
+        "pairCreatedAt": as_int(pair.get("pairCreatedAt")),
+        "errors": errors,
+        "notes": [
+            "DEX transaction buys/sells are transaction counts, not dollar buy/sell volume.",
+            "Volume fields are total traded notional for each window.",
+        ],
+    }
+
+
+async def cached_spot(force: bool = False) -> dict[str, Any]:
+    now = time.monotonic()
+    cached = spot_cache.get("value")
+    if not force and cached is not None and now - spot_cache["time"] < CACHE_SECONDS:
+        return cached
+
+    async with spot_cache_lock:
+        now = time.monotonic()
+        cached = spot_cache.get("value")
+        if not force and cached is not None and now - spot_cache["time"] < CACHE_SECONDS:
+            return cached
+
+        value = await collect_spot_data()
+        spot_cache["time"] = time.monotonic()
+        spot_cache["value"] = value
+        return value
 
 
 async def collect_history_data(period: str, limit: int) -> dict[str, Any]:
@@ -436,6 +599,7 @@ async def request_chad_analysis(
     snapshot: dict[str, Any],
     history: dict[str, Any],
     liquidation_data: dict[str, Any],
+    spot_data: dict[str, Any],
     position_tag: float | None,
     average_entry_usd: float | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -449,10 +613,13 @@ async def request_chad_analysis(
         "importantUserLevelsUsd": [0.00075, 0.00080, 0.00088, 0.00100, 0.00105, 0.00110],
         "dataNotes": [
             "snapshot and history are Binance USD-M futures market data",
+            "spot is the primary TAG/WBNB PancakeSwap pair from the DEX Screener pair API",
+            "DEX buys/sells are transaction counts, not dollar buy/sell volume",
             "liquidation totals only cover events observed while the relay was running",
-            "no DEX spot, market-cap, news, catalyst, or whale data is supplied in this request",
+            "no news, catalyst, or whale data is supplied in this request",
         ],
         "snapshot": snapshot,
+        "spot": spot_data,
         "history": compact_history_for_chad(history),
         "liquidations": liquidation_data,
     }
@@ -1095,11 +1262,11 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="TAG Binance Market Data Relay",
+    title="TAG Market Data Relay",
     version=SERVICE_VERSION,
     description=(
-        "Read-only relay for public Binance USDⓈ-M futures market data plus a protected "
-        "server-side Chad analysis endpoint. No account, trading, wallet, or order functionality."
+        "Read-only relay for public Binance USDⓈ-M futures data, primary-pair DEX spot data, "
+        "and a protected server-side Chad analysis endpoint. No account, trading, wallet, or order functionality."
     ),
     lifespan=lifespan,
 )
@@ -1116,13 +1283,14 @@ app.add_middleware(
 @app.get("/")
 async def root() -> dict[str, Any]:
     return {
-        "service": "TAG Binance Market Data Relay",
+        "service": "TAG Market Data Relay",
         "version": SERVICE_VERSION,
         "symbol": SYMBOL,
         "readOnly": True,
         "docs": "/docs",
         "health": "/health",
         "snapshot": "/v1/tag/snapshot",
+        "spot": "/v1/tag/spot",
         "history": "/v1/tag/history?period=5m&limit=100",
         "chad": "/v1/chad/analyze",
     }
@@ -1177,6 +1345,15 @@ async def tag_snapshot(
     return await cached_snapshot(force=force)
 
 
+@app.get("/v1/tag/spot")
+async def tag_spot(
+    force: bool = Query(False, description="Ignore the short cache and request fresh DEX data."),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return await cached_spot(force=force)
+
+
 @app.get("/v1/tag/history")
 async def tag_history(
     period: str = Query("5m"),
@@ -1217,9 +1394,10 @@ async def chad_analyze(
             detail=f"historyPeriod must be one of: {', '.join(sorted(VALID_PERIODS))}",
         )
 
-    snapshot, history = await asyncio.gather(
+    snapshot, history, spot = await asyncio.gather(
         cached_snapshot(force=request.forceFresh),
         collect_history_data(request.historyPeriod, request.historyLimit),
+        cached_spot(force=request.forceFresh),
     )
 
     async with liquidation_lock:
@@ -1235,6 +1413,7 @@ async def chad_analyze(
         snapshot=snapshot,
         history=history,
         liquidation_data=liquidation_data,
+        spot_data=spot,
         position_tag=request.positionTag,
         average_entry_usd=request.averageEntryUsd,
     )
@@ -1248,6 +1427,7 @@ async def chad_analyze(
         "analysis": analysis,
         "dataUsed": {
             "snapshot": snapshot,
+            "spot": spot,
             "historyPeriod": request.historyPeriod,
             "historyLimit": request.historyLimit,
             "historyErrors": history.get("errors", []),
