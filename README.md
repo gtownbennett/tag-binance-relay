@@ -5,7 +5,7 @@ This is a read-only relay for **public Binance USDⓈ-M futures market data** fo
 API-secret functionality.
 
 It is designed for the existing Android **TAG Terminal** app so one request can
-fill the leverage screen instead of leaving most fields blank. Version 2.3.0 adds primary-pair PancakeSwap spot confirmation through DEX Screener and keeps the protected server-side **Chad** endpoint that sends verified futures and spot data to OpenAI without exposing the OpenAI key in the Android APK.
+fill the leverage screen instead of leaving most fields blank. Version 2.4.0 keeps primary-pair PancakeSwap spot confirmation and adds a protected **prediction ledger**. Every Chad analysis now creates 6-hour, 24-hour, 3-day and 7-day machine-readable forecasts, grades matured forecasts against Binance 5-minute closes, records what was right or wrong, and feeds cautious performance calibration back into future analyses.
 
 ## Data returned
 
@@ -48,6 +48,35 @@ data-quality warnings.
 This endpoint requires both `OPENAI_API_KEY` and `RELAY_TOKEN` in Render. The
 relay token is intentionally mandatory for Chad because each request can create
 OpenAI API charges.
+
+### Prediction ledger endpoints
+
+`GET /v1/chad/ledger`
+
+Returns saved forecasts, due dates, actual outcomes, range hits, direction accuracy,
+error, score and automatic post-mortems. Due forecasts are graded before the response.
+
+`GET /v1/chad/performance`
+
+Returns overall and per-horizon accuracy. Chad does not treat the score as meaningful
+until at least eight horizons have been graded.
+
+`POST /v1/chad/ledger/grade`
+
+Forces a check of due forecasts without creating a new OpenAI analysis.
+
+`GET /v1/chad/ledger/export`
+
+Downloads the current ledger as JSON for backup.
+
+Every ledger endpoint requires the same `X-Relay-Key` used by Chad. Grading itself
+does not call OpenAI and therefore does not create an AI charge.
+
+**Storage warning:** the default `LEDGER_DB_PATH` is
+`/tmp/tag_prediction_ledger.sqlite3`. This works immediately, but Render can erase
+temporary container files during a restart or redeploy. The export endpoint provides
+a backup. Durable server memory requires a persistent disk or database and a durable
+`LEDGER_DB_PATH`.
 
 ## Important limitation
 
@@ -159,6 +188,10 @@ OPENAI_MODEL = gpt-5.5
 OPENAI_REASONING_EFFORT = low
 OPENAI_MAX_OUTPUT_TOKENS = 2200
 OPENAI_TIMEOUT_SECONDS = 75
+LEDGER_ENABLED = true
+LEDGER_DB_PATH = /tmp/tag_prediction_ledger.sqlite3
+LEDGER_DEADBAND_PCT = 1.0
+LEDGER_MAX_RECORDS = 5000
 ```
 
 After the deployment becomes live, open `/docs`, expand

@@ -10,13 +10,15 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
+from app.ledger import PredictionLedger
+
 import httpx
 import websockets
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.3.0"
+SERVICE_VERSION = "2.4.0"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -42,6 +44,11 @@ OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip().lo
 OPENAI_MAX_OUTPUT_TOKENS = max(600, int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "2200")))
 OPENAI_TIMEOUT_SECONDS = max(20, int(os.getenv("OPENAI_TIMEOUT_SECONDS", "75")))
 
+LEDGER_ENABLED = os.getenv("LEDGER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+LEDGER_DB_PATH = os.getenv("LEDGER_DB_PATH", "/tmp/tag_prediction_ledger.sqlite3").strip() or "/tmp/tag_prediction_ledger.sqlite3"
+LEDGER_DEADBAND_PCT = max(0.1, float(os.getenv("LEDGER_DEADBAND_PCT", "1.0")))
+LEDGER_MAX_RECORDS = max(100, int(os.getenv("LEDGER_MAX_RECORDS", "5000")))
+
 VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 if OPENAI_REASONING_EFFORT not in VALID_REASONING_EFFORTS:
     OPENAI_REASONING_EFFORT = "low"
@@ -54,6 +61,12 @@ snapshot_cache: dict[str, Any] = {"time": 0.0, "value": None}
 spot_cache: dict[str, Any] = {"time": 0.0, "value": None}
 cache_lock = asyncio.Lock()
 spot_cache_lock = asyncio.Lock()
+ledger_lock = asyncio.Lock()
+prediction_ledger = PredictionLedger(
+    LEDGER_DB_PATH,
+    deadband_pct=LEDGER_DEADBAND_PCT,
+    max_records=LEDGER_MAX_RECORDS,
+)
 
 service_started_ms = int(time.time() * 1000)
 
@@ -139,6 +152,48 @@ CHAD_RESPONSE_SCHEMA: dict[str, Any] = {
             },
         },
         "actionableGuidance": {"type": "array", "items": {"type": "string"}},
+        "forecastLedger": {
+            "type": "object",
+            "properties": {
+                "thesis": {"type": "string"},
+                "confidenceAdjustment": {"type": "string"},
+                "horizons": {
+                    "type": "array",
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "horizon": {
+                                "type": "string",
+                                "enum": ["6h", "24h", "3d", "7d"],
+                            },
+                            "direction": {
+                                "type": "string",
+                                "enum": ["up", "down", "sideways"],
+                            },
+                            "probability": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "targetLowUsd": {"type": "number", "minimum": 0},
+                            "targetHighUsd": {"type": "number", "minimum": 0},
+                            "invalidationUsd": {"type": "number", "minimum": 0},
+                            "reasoning": {"type": "string"},
+                        },
+                        "required": [
+                            "horizon",
+                            "direction",
+                            "probability",
+                            "targetLowUsd",
+                            "targetHighUsd",
+                            "invalidationUsd",
+                            "reasoning",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["thesis", "confidenceAdjustment", "horizons"],
+            "additionalProperties": False,
+        },
         "dataQuality": {
             "type": "object",
             "properties": {
@@ -162,6 +217,7 @@ CHAD_RESPONSE_SCHEMA: dict[str, Any] = {
         "keyLevels",
         "scenarios",
         "actionableGuidance",
+        "forecastLedger",
         "dataQuality",
     ],
     "additionalProperties": False,
@@ -191,6 +247,10 @@ Rules:
 - Compare futures movement with DEX spot participation. A futures-led move with weak DEX volume or weak transaction confirmation deserves lower durability confidence.
 - Missing or contradictory data must reduce confidence.
 - Give exactly three scenarios whose probabilities total 100.
+- Produce exactly four machine-readable forecast horizons: 6h, 24h, 3d and 7d. Use the supplied primary DEX spot price as the anchor when available. Each horizon needs one direction, one stated probability, a realistic target range and a clear invalidation price.
+- targetLowUsd must be less than or equal to targetHighUsd. Avoid false precision and do not make every horizon point in the same direction unless the evidence supports it.
+- Use prediction-ledger performance only when enough graded outcomes exist. If fewer than 8 horizons are graded, explicitly say the sample is too small for meaningful calibration.
+- Similar historical setups are project-specific analogs, not proof that the same outcome will repeat.
 - Separate a temporary squeeze from a durable trend.
 - Do not promise profit or present a trade as certain.
 - Keep the response concise enough for a phone screen but detailed enough to explain why the view changed.
@@ -551,6 +611,116 @@ def compact_history_for_chad(history: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
+
+def current_market_features(snapshot: dict[str, Any], spot: dict[str, Any]) -> dict[str, Any]:
+    spot_changes = spot.get("priceChangePct") if isinstance(spot.get("priceChangePct"), dict) else {}
+    spot_txns = spot.get("transactions") if isinstance(spot.get("transactions"), dict) else {}
+    spot_h1 = spot_txns.get("h1") if isinstance(spot_txns.get("h1"), dict) else {}
+    spot_volume = spot.get("volumeUsd") if isinstance(spot.get("volumeUsd"), dict) else {}
+    return {
+        "priceUsd": as_float(spot.get("priceUsd")) or as_float(snapshot.get("markPrice")),
+        "marketCapUsd": as_float(spot.get("marketCapUsd")),
+        "openInterestUsd": as_float(snapshot.get("openInterestUsd")),
+        "oiChange1hPct": as_float(snapshot.get("oiChange1hPct")),
+        "oiChange4hPct": as_float(snapshot.get("oiChange4hPct")),
+        "fundingRate": as_float(snapshot.get("fundingRate")),
+        "takerBuySellRatio": as_float(snapshot.get("takerBuySellRatio")),
+        "globalLongShortRatio": as_float(snapshot.get("globalLongShortRatio")),
+        "topPositionRatio": as_float(snapshot.get("topPositionRatio")),
+        "basisBps": as_float(snapshot.get("basisBps")),
+        "futuresPriceChange24hPct": as_float(snapshot.get("futuresPriceChange24hPct")),
+        "futuresQuoteVolume24hUsd": as_float(snapshot.get("futuresQuoteVolume24hUsd")),
+        "spotPriceChange1hPct": as_float(spot_changes.get("h1")),
+        "spotPriceChange24hPct": as_float(spot_changes.get("h24")),
+        "spotVolume1hUsd": as_float(spot_volume.get("h1")),
+        "spotVolume24hUsd": as_float(spot_volume.get("h24")),
+        "spotBuyShare1hPct": as_float(spot_h1.get("buySharePct")),
+        "spotLiquidityUsd": as_float(spot.get("liquidityUsd")),
+    }
+
+
+async def historical_futures_price_near(due_ts: float) -> tuple[float | None, str | None, str | None]:
+    due_ms = int(due_ts * 1000)
+    try:
+        rows = await get_json(
+            "/fapi/v1/klines",
+            {
+                "symbol": SYMBOL,
+                "interval": "5m",
+                "startTime": due_ms - 5 * 60 * 1000,
+                "endTime": due_ms + 10 * 60 * 1000,
+                "limit": 4,
+            },
+        )
+    except Exception as exc:
+        return None, None, str(exc)
+
+    if not isinstance(rows, list) or not rows:
+        return None, None, "Binance returned no 5-minute candle near the forecast due time."
+
+    candidates: list[tuple[int, float, int]] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 7:
+            continue
+        open_time = as_int(row[0])
+        close_price = as_float(row[4])
+        close_time = as_int(row[6])
+        if open_time is None or close_price is None or close_time is None:
+            continue
+        candidates.append((abs(close_time - due_ms), close_price, close_time))
+
+    if not candidates:
+        return None, None, "Binance candle rows were missing a usable close price."
+
+    _, price, close_time = min(candidates, key=lambda item: item[0])
+    return price, utc_iso(close_time), "Binance futures 5m close nearest forecast due time"
+
+
+async def grade_due_ledger_predictions(limit: int = 50) -> dict[str, Any]:
+    if not LEDGER_ENABLED:
+        return {"enabled": False, "graded": 0, "pendingDue": 0, "errors": []}
+
+    async with ledger_lock:
+        due = prediction_ledger.due_horizons(
+            now_ts=time.time() - 5 * 60,
+            limit=max(1, min(200, int(limit))),
+        )
+        graded: list[dict[str, Any]] = []
+        errors: list[str] = []
+        price_cache: dict[int, tuple[float | None, str | None, str | None]] = {}
+
+        for item in due:
+            due_bucket = int(float(item["due_ts"]) // 300 * 300)
+            if due_bucket not in price_cache:
+                price_cache[due_bucket] = await historical_futures_price_near(float(item["due_ts"]))
+            actual_price, actual_at, error = price_cache[due_bucket]
+            if actual_price is None or actual_at is None:
+                errors.append(
+                    f"{item['prediction_id']} {item['horizon']}: {error or 'price unavailable'}"
+                )
+                continue
+            try:
+                graded.append(
+                    prediction_ledger.grade_horizon(
+                        prediction_id=str(item["prediction_id"]),
+                        horizon=str(item["horizon"]),
+                        actual_price_usd=actual_price,
+                        actual_at=actual_at,
+                        actual_source="Binance futures 5m close nearest forecast due time",
+                    )
+                )
+            except Exception as exc:
+                errors.append(f"{item['prediction_id']} {item['horizon']}: {exc}")
+
+        return {
+            "enabled": True,
+            "graded": len(graded),
+            "gradedItems": graded,
+            "pendingDue": max(0, len(due) - len(graded)),
+            "errors": errors,
+        }
+
+
 def extract_openai_text(payload: dict[str, Any]) -> str:
     output = payload.get("output")
     if not isinstance(output, list):
@@ -602,6 +772,8 @@ async def request_chad_analysis(
     spot_data: dict[str, Any],
     position_tag: float | None,
     average_entry_usd: float | None,
+    ledger_performance: dict[str, Any],
+    similar_setups: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if openai_client is None:
         raise RuntimeError("OpenAI client has not started.")
@@ -622,6 +794,14 @@ async def request_chad_analysis(
         "spot": spot_data,
         "history": compact_history_for_chad(history),
         "liquidations": liquidation_data,
+        "predictionLedger": {
+            "performance": ledger_performance,
+            "similarHistoricalSetups": similar_setups,
+            "gradingMethod": (
+                "Forecasts are graded against the Binance futures 5-minute close nearest each due time. "
+                "Direction uses a configured deadband; target-range hits and midpoint error are tracked separately."
+            ),
+        },
     }
 
     request_body: dict[str, Any] = {
@@ -1234,6 +1414,9 @@ async def lifespan(_: FastAPI):
         headers={"User-Agent": f"TAG-Terminal-Relay/{SERVICE_VERSION}"},
         follow_redirects=True,
     )
+    if LEDGER_ENABLED:
+        prediction_ledger.initialize()
+
     openai_client = httpx.AsyncClient(
         timeout=httpx.Timeout(float(OPENAI_TIMEOUT_SECONDS), connect=15.0),
         headers={"User-Agent": f"TAG-Terminal-Chad/{SERVICE_VERSION}"},
@@ -1266,7 +1449,7 @@ app = FastAPI(
     version=SERVICE_VERSION,
     description=(
         "Read-only relay for public Binance USDⓈ-M futures data, primary-pair DEX spot data, "
-        "and a protected server-side Chad analysis endpoint. No account, trading, wallet, or order functionality."
+        "a protected server-side Chad analysis endpoint, and a prediction ledger with automatic outcome grading. No account, trading, wallet, or order functionality."
     ),
     lifespan=lifespan,
 )
@@ -1293,6 +1476,8 @@ async def root() -> dict[str, Any]:
         "spot": "/v1/tag/spot",
         "history": "/v1/tag/history?period=5m&limit=100",
         "chad": "/v1/chad/analyze",
+        "ledger": "/v1/chad/ledger",
+        "performance": "/v1/chad/performance",
     }
 
 
@@ -1333,6 +1518,9 @@ async def health() -> dict[str, Any]:
         "chadConfigured": bool(OPENAI_API_KEY and RELAY_TOKEN),
         "chadProtected": bool(RELAY_TOKEN),
         "openAIModel": OPENAI_MODEL,
+        "predictionLedgerEnabled": LEDGER_ENABLED,
+        "predictionLedgerPath": LEDGER_DB_PATH if LEDGER_ENABLED else None,
+        "predictionLedgerStorageWarning": prediction_ledger.persistent_hint if LEDGER_ENABLED else None,
     }
 
 
@@ -1381,6 +1569,66 @@ async def tag_liquidations(
         "events": events,
     }
 
+
+@app.post("/v1/chad/ledger/grade")
+async def chad_ledger_grade(
+    limit: int = Query(50, ge=1, le=200),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_chad_access(x_relay_key)
+    result = await grade_due_ledger_predictions(limit=limit)
+    result["performance"] = prediction_ledger.performance_summary()
+    return result
+
+
+@app.get("/v1/chad/performance")
+async def chad_performance(
+    gradeDue: bool = Query(True, description="Grade due forecasts before returning performance."),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_chad_access(x_relay_key)
+    grading = await grade_due_ledger_predictions(limit=100) if gradeDue else None
+    return {
+        "ok": True,
+        "generatedAt": utc_iso(),
+        "grading": grading,
+        "performance": prediction_ledger.performance_summary(),
+    }
+
+
+@app.get("/v1/chad/ledger")
+async def chad_ledger(
+    limit: int = Query(50, ge=1, le=500),
+    status: str = Query("all", pattern="^(all|pending|graded)$"),
+    includeAnalysis: bool = Query(False),
+    gradeDue: bool = Query(True),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_chad_access(x_relay_key)
+    grading = await grade_due_ledger_predictions(limit=100) if gradeDue else None
+    return {
+        "ok": True,
+        "generatedAt": utc_iso(),
+        "grading": grading,
+        "performance": prediction_ledger.performance_summary(),
+        "predictions": prediction_ledger.list_predictions(
+            limit=limit,
+            status=status,
+            include_analysis=includeAnalysis,
+        ),
+    }
+
+
+@app.get("/v1/chad/ledger/export")
+async def chad_ledger_export(
+    limit: int = Query(5000, ge=1, le=5000),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_chad_access(x_relay_key)
+    await grade_due_ledger_predictions(limit=200)
+    return prediction_ledger.export_data(limit=limit)
+
+
 @app.post("/v1/chad/analyze")
 async def chad_analyze(
     request: ChadAnalyzeRequest,
@@ -1408,6 +1656,19 @@ async def chad_analyze(
         "recentEvents": recent_events,
     }
 
+    grading_before = await grade_due_ledger_predictions(limit=100)
+    features = current_market_features(snapshot, spot)
+    ledger_performance = (
+        prediction_ledger.performance_summary()
+        if LEDGER_ENABLED
+        else {"enabled": False, "learningReady": False}
+    )
+    similar_setups = (
+        prediction_ledger.similar_setups(features, limit=3)
+        if LEDGER_ENABLED and ledger_performance.get("learningReady")
+        else []
+    )
+
     analysis, raw_response = await request_chad_analysis(
         question=request.question,
         snapshot=snapshot,
@@ -1416,7 +1677,46 @@ async def chad_analyze(
         spot_data=spot,
         position_tag=request.positionTag,
         average_entry_usd=request.averageEntryUsd,
+        ledger_performance=ledger_performance,
+        similar_setups=similar_setups,
     )
+
+    ledger_saved = False
+    ledger_prediction_id: str | None = None
+    ledger_error: str | None = None
+    forecast_ledger = analysis.get("forecastLedger") if isinstance(analysis, dict) else None
+    start_price = as_float(spot.get("priceUsd")) or as_float(snapshot.get("markPrice"))
+
+    if LEDGER_ENABLED and isinstance(forecast_ledger, dict) and start_price is not None:
+        try:
+            ledger_prediction_id = prediction_ledger.save_prediction(
+                model=str(raw_response.get("model", OPENAI_MODEL)),
+                question=request.question,
+                start_price_usd=start_price,
+                market_cap_usd=as_float(spot.get("marketCapUsd")),
+                market_state=str(analysis.get("marketState", "")),
+                confidence=as_int(analysis.get("confidence")),
+                data_quality=(
+                    as_int(analysis.get("dataQuality", {}).get("score"))
+                    if isinstance(analysis.get("dataQuality"), dict)
+                    else None
+                ),
+                thesis=str(forecast_ledger.get("thesis", "")),
+                horizons=(
+                    forecast_ledger.get("horizons")
+                    if isinstance(forecast_ledger.get("horizons"), list)
+                    else []
+                ),
+                features=features,
+                analysis=analysis,
+                snapshot=snapshot,
+                spot=spot,
+            )
+            ledger_saved = True
+        except Exception as exc:
+            ledger_error = str(exc)
+    elif LEDGER_ENABLED:
+        ledger_error = "Prediction was not saved because forecastLedger or a valid start price was missing."
 
     result: dict[str, Any] = {
         "ok": True,
@@ -1425,6 +1725,16 @@ async def chad_analyze(
         "model": raw_response.get("model", OPENAI_MODEL),
         "openAIResponseId": raw_response.get("id"),
         "analysis": analysis,
+        "predictionLedger": {
+            "enabled": LEDGER_ENABLED,
+            "saved": ledger_saved,
+            "predictionId": ledger_prediction_id,
+            "saveError": ledger_error,
+            "gradedBeforeAnalysis": grading_before,
+            "performance": prediction_ledger.performance_summary() if LEDGER_ENABLED else None,
+            "similarSetupsUsed": similar_setups,
+            "storageWarning": prediction_ledger.persistent_hint if LEDGER_ENABLED else None,
+        },
         "dataUsed": {
             "snapshot": snapshot,
             "spot": spot,

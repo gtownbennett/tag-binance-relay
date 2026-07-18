@@ -1,0 +1,17 @@
+TAG Prediction Ledger v2.4.0
+
+What happens automatically:
+1. Each time you tap Analyze TAG, Chad makes 6h, 24h, 3d and 7d forecasts.
+2. The relay saves the starting price, leverage/spot setup and forecast ranges.
+3. On later requests, forecasts whose due time passed are graded automatically.
+4. After at least 8 horizons are graded, Chad receives the accuracy summary and may cautiously recalibrate confidence.
+
+New protected endpoints in /docs:
+- GET /v1/chad/ledger
+- GET /v1/chad/performance
+- POST /v1/chad/ledger/grade
+- GET /v1/chad/ledger/export
+
+You do not need to add or change any Render environment variable for the first test.
+The default database is temporary on Render and can be erased by a restart or redeploy.
+Use the export endpoint for backup until durable storage is added.
