@@ -1,0 +1,34 @@
+name: Test TAG relay
+
+on:
+  push:
+    branches:
+      - main
+      - v2.5.0-durable-intelligence
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile Python
+        run: python -m compileall -q app
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v

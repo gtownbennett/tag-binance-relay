@@ -1,0 +1,19 @@
+TAG Relay v2.5.0 — Durable Intelligence
+
+Added
+- Background grading loop for matured forecasts
+- Atomic ledger JSON backup and startup restore
+- Protected export import recovery workflow
+- Data freshness endpoint and confidence controls
+- Probability calibration profile and weak-horizon detection
+- Deterministic Why Chad Changed His Mind history
+- Storage and background-grader health details
+- Branch-specific GHCR dev image publishing
+- Automated unit tests
+
+Preserved
+- Binance public futures data
+- PancakeSwap v3 spot confirmation
+- OpenAI server-side key protection
+- Relay token authentication
+- Existing v2.4.1 API fields and Android compatibility

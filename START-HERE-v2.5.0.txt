@@ -1,0 +1,22 @@
+TAG RELAY v2.5.0 — START HERE
+
+This package updates the backend only. It does not replace the stable Android app.
+
+Use the local repository folder:
+Documents\GitHub\tag-binance-relay-live
+
+Required branch:
+v2.5.0-durable-intelligence
+
+Copy everything inside this package into that repository folder and replace matching files.
+Then commit and push.
+
+GitHub should run two workflows:
+1. Test TAG relay
+2. Build and publish TAG relay image
+
+The development image tag is:
+ghcr.io/gtownbennett/tag-binance-relay:v2.5.0-durable-intelligence
+
+Do not point the stable Render service at this tag until the separate test service passes.
+No OpenAI key or relay token is included in this package.

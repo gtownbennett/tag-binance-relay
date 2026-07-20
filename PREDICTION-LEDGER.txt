@@ -1,17 +1,33 @@
-TAG Prediction Ledger v2.4.0
+TAG TERMINAL PREDICTION LEDGER v2.5.0
 
-What happens automatically:
-1. Each time you tap Analyze TAG, Chad makes 6h, 24h, 3d and 7d forecasts.
-2. The relay saves the starting price, leverage/spot setup and forecast ranges.
-3. On later requests, forecasts whose due time passed are graded automatically.
-4. After at least 8 horizons are graded, Chad receives the accuracy summary and may cautiously recalibrate confidence.
+Forecast horizons
+- 6 hours
+- 24 hours
+- 3 days
+- 7 days
 
-New protected endpoints in /docs:
-- GET /v1/chad/ledger
-- GET /v1/chad/performance
-- POST /v1/chad/ledger/grade
-- GET /v1/chad/ledger/export
+Automatic behavior
+- Every successful Chad analysis records four machine-readable horizons.
+- A background task checks matured forecasts every LEDGER_AUTO_GRADE_SECONDS.
+- Grading uses the Binance futures 5-minute close nearest the due time.
+- Direction, target-range hit, invalidation, midpoint error, score and post-mortem are saved.
+- After every save or grade, an atomic JSON backup is written to LEDGER_BACKUP_PATH.
+- If SQLite is empty at startup and the backup exists, the service restores it automatically.
 
-You do not need to add or change any Render environment variable for the first test.
-The default database is temporary on Render and can be erased by a restart or redeploy.
-Use the export endpoint for backup until durable storage is added.
+Learning safeguards
+- Calibration is inactive until at least eight horizons are graded.
+- Probability bins compare stated probability with realized direction accuracy.
+- Weak horizons receive lower confidence multipliers.
+- A deterministic confidence cap is applied only after enough outcomes exist.
+- Stale or missing live data can impose a stricter confidence cap.
+
+Recovery
+- GET /v1/chad/ledger/export creates a portable JSON backup.
+- POST /v1/chad/ledger/import merges or replaces from that export.
+- This allows TAG Terminal's on-device copy to restore the server after a redeploy.
+- Full server-side durability still requires a persistent disk because /tmp can be erased.
+
+Transparency
+- GET /v1/chad/changes explains why the current durable view changed.
+- GET /v1/chad/calibration exposes confidence calibration.
+- GET /v1/tag/freshness exposes source age and stale-data warnings.

@@ -18,7 +18,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.4.1"
+SERVICE_VERSION = "2.5.0"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -41,13 +41,18 @@ TAG_CIRCULATING_SUPPLY = float(
     os.getenv("TAG_CIRCULATING_SUPPLY", "108404572594")
 )
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip().lower()
-OPENAI_MAX_OUTPUT_TOKENS = max(600, int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "2200")))
+OPENAI_MAX_OUTPUT_TOKENS = max(600, int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "8000")))
 OPENAI_TIMEOUT_SECONDS = max(20, int(os.getenv("OPENAI_TIMEOUT_SECONDS", "75")))
 
 LEDGER_ENABLED = os.getenv("LEDGER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 LEDGER_DB_PATH = os.getenv("LEDGER_DB_PATH", "/tmp/tag_prediction_ledger.sqlite3").strip() or "/tmp/tag_prediction_ledger.sqlite3"
+LEDGER_BACKUP_PATH = os.getenv("LEDGER_BACKUP_PATH", f"{LEDGER_DB_PATH}.backup.json").strip()
+LEDGER_AUTO_BACKUP = os.getenv("LEDGER_AUTO_BACKUP", "true").strip().lower() not in {"0", "false", "no", "off"}
+LEDGER_AUTO_GRADE_SECONDS = max(60, int(os.getenv("LEDGER_AUTO_GRADE_SECONDS", "300")))
 LEDGER_DEADBAND_PCT = max(0.1, float(os.getenv("LEDGER_DEADBAND_PCT", "1.0")))
 LEDGER_MAX_RECORDS = max(100, int(os.getenv("LEDGER_MAX_RECORDS", "5000")))
+FRESHNESS_WARN_SECONDS = max(15, int(os.getenv("FRESHNESS_WARN_SECONDS", "90")))
+FRESHNESS_STALE_SECONDS = max(FRESHNESS_WARN_SECONDS + 15, int(os.getenv("FRESHNESS_STALE_SECONDS", "300")))
 
 VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 if OPENAI_REASONING_EFFORT not in VALID_REASONING_EFFORTS:
@@ -62,10 +67,19 @@ spot_cache: dict[str, Any] = {"time": 0.0, "value": None}
 cache_lock = asyncio.Lock()
 spot_cache_lock = asyncio.Lock()
 ledger_lock = asyncio.Lock()
+grader_state: dict[str, Any] = {
+    "running": False,
+    "lastRunAt": None,
+    "lastResult": None,
+    "lastError": None,
+    "intervalSeconds": LEDGER_AUTO_GRADE_SECONDS,
+}
 prediction_ledger = PredictionLedger(
     LEDGER_DB_PATH,
     deadband_pct=LEDGER_DEADBAND_PCT,
     max_records=LEDGER_MAX_RECORDS,
+    backup_path=LEDGER_BACKUP_PATH,
+    auto_backup=LEDGER_AUTO_BACKUP,
 )
 
 service_started_ms = int(time.time() * 1000)
@@ -245,7 +259,7 @@ Rules:
 - Quote exact supplied numbers when useful.
 - Never claim a market cap, DEX volume, catalyst, whale move, or spot-buying confirmation unless it is in the supplied data.
 - Compare futures movement with DEX spot participation. A futures-led move with weak DEX volume or weak transaction confirmation deserves lower durability confidence.
-- Missing or contradictory data must reduce confidence.
+- Missing, delayed, stale, or contradictory data must reduce confidence and obey the supplied confidence cap.
 - Give exactly three scenarios whose probabilities total 100.
 - Produce exactly four machine-readable forecast horizons: 6h, 24h, 3d and 7d. Use the supplied primary DEX spot price as the anchor when available. Each horizon needs one direction, one stated probability, a realistic target range and a clear invalidation price.
 - targetLowUsd must be less than or equal to targetHighUsd. Avoid false precision and do not make every horizon point in the same direction unless the evidence supports it.
@@ -254,6 +268,7 @@ Rules:
 - Separate a temporary squeeze from a durable trend.
 - Do not promise profit or present a trade as certain.
 - Keep the response concise enough for a phone screen but detailed enough to explain why the view changed.
+- Use the supplied calibration profile only when learningReady is true. Weak historical horizons should lower confidence rather than force a directional call.
 """.strip()
 
 
@@ -289,6 +304,153 @@ stream_state: dict[str, Any] = {
 def utc_iso(ms: int | None = None) -> str:
     timestamp = (ms / 1000) if ms is not None else time.time()
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+def timestamp_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return numeric / 1000.0 if numeric > 10_000_000_000 else numeric
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return None
+    return None
+
+
+def freshness_item(name: str, timestamp: Any, *, critical: bool = True, note: str | None = None) -> dict[str, Any]:
+    parsed = timestamp_seconds(timestamp)
+    age = max(0.0, time.time() - parsed) if parsed is not None else None
+    if age is None:
+        status = "missing"
+    elif age > FRESHNESS_STALE_SECONDS:
+        status = "stale"
+    elif age > FRESHNESS_WARN_SECONDS:
+        status = "delayed"
+    else:
+        status = "fresh"
+    return {
+        "name": name,
+        "timestamp": utc_iso(int(parsed * 1000)) if parsed is not None else None,
+        "ageSeconds": round(age, 1) if age is not None else None,
+        "status": status,
+        "critical": critical,
+        "note": note,
+    }
+
+
+def build_freshness_report(
+    snapshot: dict[str, Any],
+    spot: dict[str, Any],
+    history: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    items = [
+        freshness_item(
+            "Binance market event",
+            snapshot.get("binanceEventTime"),
+            note="Exchange event timestamp from mark/ticker/OI data.",
+        ),
+        freshness_item(
+            "Binance market stream",
+            snapshot.get("marketStreamLastMessageAt"),
+            note="Last mark-price/ticker WebSocket message observed by the relay.",
+        ),
+        freshness_item(
+            "Binance depth stream",
+            snapshot.get("depthStreamLastMessageAt"),
+            note="Last order-book WebSocket message observed by the relay.",
+        ),
+        freshness_item(
+            "PancakeSwap spot fetch",
+            spot.get("generatedAt"),
+            note="DEX Screener fetch time; the upstream pair API does not supply a trade-event timestamp.",
+        ),
+    ]
+    if history is not None:
+        items.append(
+            freshness_item(
+                "Binance history fetch",
+                history.get("generatedAt"),
+                critical=False,
+            )
+        )
+
+    critical_items = [item for item in items if item["critical"]]
+    statuses = [item["status"] for item in critical_items]
+    warnings: list[str] = []
+    for item in items:
+        if item["status"] != "fresh":
+            warnings.append(f"{item['name']} is {item['status']}.")
+
+    if "stale" in statuses:
+        overall = "stale"
+        score = 40
+        confidence_cap = 50
+    elif "missing" in statuses:
+        overall = "incomplete"
+        score = 55
+        confidence_cap = 60
+    elif "delayed" in statuses:
+        overall = "delayed"
+        score = 72
+        confidence_cap = 72
+    else:
+        overall = "fresh"
+        score = 95
+        confidence_cap = None
+
+    return {
+        "overall": overall,
+        "score": score,
+        "confidenceCap": confidence_cap,
+        "warnAfterSeconds": FRESHNESS_WARN_SECONDS,
+        "staleAfterSeconds": FRESHNESS_STALE_SECONDS,
+        "sources": items,
+        "warnings": warnings,
+        "generatedAt": utc_iso(),
+    }
+
+
+def apply_confidence_controls(
+    analysis: dict[str, Any],
+    *,
+    freshness: dict[str, Any],
+    calibration: dict[str, Any],
+) -> dict[str, Any]:
+    original = as_int(analysis.get("confidence"))
+    caps: list[int] = []
+    freshness_cap = as_int(freshness.get("confidenceCap"))
+    if freshness_cap is not None:
+        caps.append(freshness_cap)
+    calibration_cap = as_int(calibration.get("suggestedConfidenceCap"))
+    if calibration.get("learningReady") and calibration_cap is not None:
+        caps.append(calibration_cap)
+    applied_cap = min(caps) if caps else None
+    adjusted = min(original, applied_cap) if original is not None and applied_cap is not None else original
+    if adjusted is not None:
+        analysis["confidence"] = adjusted
+
+    quality = analysis.get("dataQuality") if isinstance(analysis.get("dataQuality"), dict) else {}
+    warnings = quality.get("warnings") if isinstance(quality.get("warnings"), list) else []
+    for warning in freshness.get("warnings", []):
+        if warning not in warnings:
+            warnings.append(warning)
+    if original is not None and adjusted is not None and adjusted < original:
+        warnings.append(f"Confidence was capped from {original} to {adjusted} by deterministic freshness/calibration controls.")
+    quality["warnings"] = warnings
+    if as_int(quality.get("score")) is not None:
+        quality["score"] = min(as_int(quality.get("score")) or 0, as_int(freshness.get("score")) or 100)
+    analysis["dataQuality"] = quality
+    analysis["confidenceControls"] = {
+        "originalConfidence": original,
+        "adjustedConfidence": adjusted,
+        "appliedCap": applied_cap,
+        "freshnessCap": freshness_cap,
+        "calibrationCap": calibration_cap if calibration.get("learningReady") else None,
+    }
+    return analysis
 
 
 def as_float(value: Any) -> float | None:
@@ -773,7 +935,9 @@ async def request_chad_analysis(
     position_tag: float | None,
     average_entry_usd: float | None,
     ledger_performance: dict[str, Any],
+    calibration_profile: dict[str, Any],
     similar_setups: list[dict[str, Any]],
+    freshness: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if openai_client is None:
         raise RuntimeError("OpenAI client has not started.")
@@ -794,8 +958,10 @@ async def request_chad_analysis(
         "spot": spot_data,
         "history": compact_history_for_chad(history),
         "liquidations": liquidation_data,
+        "freshness": freshness,
         "predictionLedger": {
             "performance": ledger_performance,
+            "calibrationProfile": calibration_profile,
             "similarHistoricalSetups": similar_setups,
             "gradingMethod": (
                 "Forecasts are graded against the Binance futures 5-minute close nearest each due time. "
@@ -1405,6 +1571,26 @@ async def depth_stream_listener() -> None:
         retry_seconds = min(retry_seconds * 2, 30)
 
 
+async def ledger_grader_loop() -> None:
+    grader_state["running"] = True
+    try:
+        await asyncio.sleep(30)
+        while True:
+            try:
+                result = await grade_due_ledger_predictions(limit=200)
+                grader_state["lastRunAt"] = utc_iso()
+                grader_state["lastResult"] = result
+                grader_state["lastError"] = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                grader_state["lastRunAt"] = utc_iso()
+                grader_state["lastError"] = f"{type(exc).__name__}: {exc}"
+            await asyncio.sleep(LEDGER_AUTO_GRADE_SECONDS)
+    finally:
+        grader_state["running"] = False
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global http_client, openai_client
@@ -1424,15 +1610,19 @@ async def lifespan(_: FastAPI):
     )
     market_task = asyncio.create_task(market_stream_listener())
     depth_task = asyncio.create_task(depth_stream_listener())
+    grader_task = asyncio.create_task(ledger_grader_loop()) if LEDGER_ENABLED else None
 
     try:
         yield
     finally:
         market_task.cancel()
         depth_task.cancel()
+        if grader_task is not None:
+            grader_task.cancel()
         await asyncio.gather(
             market_task,
             depth_task,
+            *( [grader_task] if grader_task is not None else [] ),
             return_exceptions=True,
         )
 
@@ -1449,7 +1639,7 @@ app = FastAPI(
     version=SERVICE_VERSION,
     description=(
         "Read-only relay for public Binance USDⓈ-M futures data, primary-pair DEX spot data, "
-        "a protected server-side Chad analysis endpoint, and a prediction ledger with automatic outcome grading. No account, trading, wallet, or order functionality."
+        "a protected server-side Chad analysis endpoint, and a durable/recoverable prediction ledger with background outcome grading, calibration and decision-change history. No account, trading, wallet, or order functionality."
     ),
     lifespan=lifespan,
 )
@@ -1478,6 +1668,11 @@ async def root() -> dict[str, Any]:
         "chad": "/v1/chad/analyze",
         "ledger": "/v1/chad/ledger",
         "performance": "/v1/chad/performance",
+        "freshness": "/v1/tag/freshness",
+        "calibration": "/v1/chad/calibration",
+        "changes": "/v1/chad/changes",
+        "ledgerImport": "/v1/chad/ledger/import",
+        "ledgerBackup": "/v1/chad/ledger/backup",
     }
 
 
@@ -1521,6 +1716,8 @@ async def health() -> dict[str, Any]:
         "predictionLedgerEnabled": LEDGER_ENABLED,
         "predictionLedgerPath": LEDGER_DB_PATH if LEDGER_ENABLED else None,
         "predictionLedgerStorageWarning": prediction_ledger.persistent_hint if LEDGER_ENABLED else None,
+        "predictionLedgerStorage": prediction_ledger.storage_status() if LEDGER_ENABLED else None,
+        "automaticGrader": dict(grader_state) if LEDGER_ENABLED else None,
     }
 
 
@@ -1540,6 +1737,23 @@ async def tag_spot(
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
     return await cached_spot(force=force)
+
+
+@app.get("/v1/tag/freshness")
+async def tag_freshness(
+    force: bool = Query(False, description="Request fresh futures and spot data before scoring freshness."),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    snapshot, spot = await asyncio.gather(
+        cached_snapshot(force=force),
+        cached_spot(force=force),
+    )
+    return {
+        "ok": True,
+        "symbol": SYMBOL,
+        "freshness": build_freshness_report(snapshot, spot),
+    }
 
 
 @app.get("/v1/tag/history")
@@ -1570,6 +1784,71 @@ async def tag_liquidations(
     }
 
 
+@app.get("/v1/chad/calibration")
+async def chad_calibration(
+    gradeDue: bool = Query(True),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_chad_access(x_relay_key)
+    grading = await grade_due_ledger_predictions(limit=200) if gradeDue else None
+    return {
+        "ok": True,
+        "generatedAt": utc_iso(),
+        "grading": grading,
+        "performance": prediction_ledger.performance_summary(),
+        "calibration": prediction_ledger.calibration_profile(),
+    }
+
+
+@app.get("/v1/chad/changes")
+async def chad_changes(
+    limit: int = Query(25, ge=1, le=100),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_chad_access(x_relay_key)
+    return {
+        "ok": True,
+        "generatedAt": utc_iso(),
+        "changes": prediction_ledger.changes_history(limit=limit),
+    }
+
+
+@app.post("/v1/chad/ledger/import")
+async def chad_ledger_import(
+    payload: dict[str, Any],
+    merge: bool = Query(True, description="Merge with current records. Set false to replace the ledger."),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_chad_access(x_relay_key)
+    try:
+        imported = prediction_ledger.import_data(payload, merge=merge)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "generatedAt": utc_iso(),
+        "import": imported,
+        "storage": prediction_ledger.storage_status(),
+        "performance": prediction_ledger.performance_summary(),
+    }
+
+
+@app.post("/v1/chad/ledger/backup")
+async def chad_ledger_backup(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_chad_access(x_relay_key)
+    try:
+        backup = prediction_ledger.backup_now()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Ledger backup failed: {exc}") from exc
+    return {
+        "ok": bool(backup.get("ok")),
+        "backup": backup,
+        "storage": prediction_ledger.storage_status(),
+    }
+
+
 @app.post("/v1/chad/ledger/grade")
 async def chad_ledger_grade(
     limit: int = Query(50, ge=1, le=200),
@@ -1593,6 +1872,9 @@ async def chad_performance(
         "generatedAt": utc_iso(),
         "grading": grading,
         "performance": prediction_ledger.performance_summary(),
+        "calibration": prediction_ledger.calibration_profile(),
+        "automaticGrader": dict(grader_state),
+        "storage": prediction_ledger.storage_status(),
     }
 
 
@@ -1611,6 +1893,8 @@ async def chad_ledger(
         "generatedAt": utc_iso(),
         "grading": grading,
         "performance": prediction_ledger.performance_summary(),
+        "calibration": prediction_ledger.calibration_profile(),
+        "storage": prediction_ledger.storage_status(),
         "predictions": prediction_ledger.list_predictions(
             limit=limit,
             status=status,
@@ -1658,11 +1942,18 @@ async def chad_analyze(
 
     grading_before = await grade_due_ledger_predictions(limit=100)
     features = current_market_features(snapshot, spot)
+    freshness = build_freshness_report(snapshot, spot, history)
     ledger_performance = (
         prediction_ledger.performance_summary()
         if LEDGER_ENABLED
         else {"enabled": False, "learningReady": False}
     )
+    calibration_profile = (
+        prediction_ledger.calibration_profile()
+        if LEDGER_ENABLED
+        else {"learningReady": False, "gradedHorizons": 0}
+    )
+    previous_prediction = prediction_ledger.latest_prediction(include_analysis=True) if LEDGER_ENABLED else None
     similar_setups = (
         prediction_ledger.similar_setups(features, limit=3)
         if LEDGER_ENABLED and ledger_performance.get("learningReady")
@@ -1678,7 +1969,19 @@ async def chad_analyze(
         position_tag=request.positionTag,
         average_entry_usd=request.averageEntryUsd,
         ledger_performance=ledger_performance,
+        calibration_profile=calibration_profile,
         similar_setups=similar_setups,
+        freshness=freshness,
+    )
+    analysis = apply_confidence_controls(analysis, freshness=freshness, calibration=calibration_profile)
+    decision_change = (
+        prediction_ledger.decision_delta(
+            current_analysis=analysis,
+            current_features=features,
+            previous=previous_prediction,
+        )
+        if LEDGER_ENABLED
+        else None
     )
 
     ledger_saved = False
@@ -1725,6 +2028,8 @@ async def chad_analyze(
         "model": raw_response.get("model", OPENAI_MODEL),
         "openAIResponseId": raw_response.get("id"),
         "analysis": analysis,
+        "decisionChange": decision_change,
+        "freshness": freshness,
         "predictionLedger": {
             "enabled": LEDGER_ENABLED,
             "saved": ledger_saved,
@@ -1732,8 +2037,11 @@ async def chad_analyze(
             "saveError": ledger_error,
             "gradedBeforeAnalysis": grading_before,
             "performance": prediction_ledger.performance_summary() if LEDGER_ENABLED else None,
+            "calibration": prediction_ledger.calibration_profile() if LEDGER_ENABLED else None,
             "similarSetupsUsed": similar_setups,
             "storageWarning": prediction_ledger.persistent_hint if LEDGER_ENABLED else None,
+            "storage": prediction_ledger.storage_status() if LEDGER_ENABLED else None,
+            "automaticGrader": dict(grader_state) if LEDGER_ENABLED else None,
         },
         "dataUsed": {
             "snapshot": snapshot,

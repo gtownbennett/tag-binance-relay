@@ -5,7 +5,24 @@ This is a read-only relay for **public Binance USDⓈ-M futures market data** fo
 API-secret functionality.
 
 It is designed for the existing Android **TAG Terminal** app so one request can
-fill the leverage screen instead of leaving most fields blank. Version 2.4.0 keeps primary-pair PancakeSwap spot confirmation and adds a protected **prediction ledger**. Every Chad analysis now creates 6-hour, 24-hour, 3-day and 7-day machine-readable forecasts, grades matured forecasts against Binance 5-minute closes, records what was right or wrong, and feeds cautious performance calibration back into future analyses.
+fill the leverage screen instead of leaving most fields blank. Version **2.5.0** keeps primary-pair PancakeSwap spot confirmation and upgrades Chad into a recoverable decision-memory service. Every Chad analysis creates 6-hour, 24-hour, 3-day and 7-day forecasts, grades matured forecasts automatically in the background, records what changed between analyses, scores data freshness, and applies cautious confidence calibration after enough outcomes exist.
+
+
+## Version 2.5.0 — Durable Intelligence
+
+New in this release:
+
+- Background forecast grading every five minutes without an OpenAI call
+- Atomic JSON ledger backup after every saved prediction and graded outcome
+- Startup restoration when the SQLite database is empty and a backup exists
+- Protected ledger import endpoint for recovery from TAG Terminal's on-device copy
+- Deterministic **Why Chad Changed His Mind** records
+- Probability calibration bins, weak-horizon detection and confidence caps
+- Futures/spot/depth freshness scoring with stale-data confidence controls
+- Separate branch Docker image tag so v2.5.0 can be tested without replacing `latest`
+- Unit tests for backup, restore, calibration, decision changes and stale-data controls
+
+The relay remains read-only. It cannot trade, access an exchange account, move tokens or access a wallet.
 
 ## Data returned
 
@@ -49,34 +66,47 @@ This endpoint requires both `OPENAI_API_KEY` and `RELAY_TOKEN` in Render. The
 relay token is intentionally mandatory for Chad because each request can create
 OpenAI API charges.
 
-### Prediction ledger endpoints
+### Prediction ledger and intelligence endpoints
 
 `GET /v1/chad/ledger`
 
-Returns saved forecasts, due dates, actual outcomes, range hits, direction accuracy,
-error, score and automatic post-mortems. Due forecasts are graded before the response.
+Returns saved forecasts, due dates, actual outcomes, range hits, direction accuracy, error, score, post-mortems, calibration and storage status.
 
 `GET /v1/chad/performance`
 
-Returns overall and per-horizon accuracy. Chad does not treat the score as meaningful
-until at least eight horizons have been graded.
+Returns overall and per-horizon accuracy, calibration and the background grader status. Chad does not treat the score as meaningful until at least eight horizons have been graded.
+
+`GET /v1/chad/calibration`
+
+Returns probability calibration bins, weak horizons, per-horizon confidence multipliers and the deterministic confidence cap.
+
+`GET /v1/chad/changes`
+
+Returns the server-side **Why Chad Changed His Mind** timeline by comparing adjacent analyses and their verified market evidence.
 
 `POST /v1/chad/ledger/grade`
 
-Forces a check of due forecasts without creating a new OpenAI analysis.
+Forces a check of due forecasts without creating a new OpenAI analysis. The service also grades automatically in the background.
 
 `GET /v1/chad/ledger/export`
 
 Downloads the current ledger as JSON for backup.
 
-Every ledger endpoint requires the same `X-Relay-Key` used by Chad. Grading itself
-does not call OpenAI and therefore does not create an AI charge.
+`POST /v1/chad/ledger/import`
 
-**Storage warning:** the default `LEDGER_DB_PATH` is
-`/tmp/tag_prediction_ledger.sqlite3`. This works immediately, but Render can erase
-temporary container files during a restart or redeploy. The export endpoint provides
-a backup. Durable server memory requires a persistent disk or database and a durable
-`LEDGER_DB_PATH`.
+Restores or merges a `tag-terminal-prediction-ledger-v1` JSON export. This is designed for recovery from TAG Terminal's on-device backup after a server redeploy.
+
+`POST /v1/chad/ledger/backup`
+
+Forces an atomic JSON backup to `LEDGER_BACKUP_PATH`.
+
+`GET /v1/tag/freshness`
+
+Scores the age of the Binance market stream, depth stream, exchange event and PancakeSwap spot fetch. Chad's confidence is capped automatically when critical data is delayed, missing or stale.
+
+Every Chad and ledger endpoint requires the same `X-Relay-Key`. Grading, import, export, backup, calibration and change-history requests do not call OpenAI and do not create an AI charge.
+
+**Storage reality:** the default paths are under `/tmp`, so both SQLite and its JSON sidecar can be erased together after a Render restart or redeploy. Full server-side durability requires a persistent disk and paths such as `/var/data/tag_prediction_ledger.sqlite3`. Without a disk, use `GET /v1/chad/ledger/export` plus `POST /v1/chad/ledger/import`; TAG Terminal v0.4.1 already keeps an on-device copy that can become the recovery source.
 
 ## Important limitation
 
@@ -186,12 +216,17 @@ Optional tuning variables:
 ```text
 OPENAI_MODEL = gpt-5.5
 OPENAI_REASONING_EFFORT = low
-OPENAI_MAX_OUTPUT_TOKENS = 2200
+OPENAI_MAX_OUTPUT_TOKENS = 8000
 OPENAI_TIMEOUT_SECONDS = 75
 LEDGER_ENABLED = true
 LEDGER_DB_PATH = /tmp/tag_prediction_ledger.sqlite3
+LEDGER_BACKUP_PATH = /tmp/tag_prediction_ledger.sqlite3.backup.json
+LEDGER_AUTO_BACKUP = true
+LEDGER_AUTO_GRADE_SECONDS = 300
 LEDGER_DEADBAND_PCT = 1.0
 LEDGER_MAX_RECORDS = 5000
+FRESHNESS_WARN_SECONDS = 90
+FRESHNESS_STALE_SECONDS = 300
 ```
 
 After the deployment becomes live, open `/docs`, expand
@@ -302,6 +337,14 @@ Build → Rebuild Project
 ```
 
 Then install the new debug APK.
+
+## Automated tests
+
+The `Test TAG relay` GitHub Action runs on `main` and `v2.5.0-durable-intelligence`. Locally:
+
+```text
+python -m unittest discover -s tests -v
+```
 
 ## Local test without Render
 

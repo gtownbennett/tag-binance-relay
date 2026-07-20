@@ -1,0 +1,8 @@
+TAG Relay v2.5.0 GHCR workflow
+
+The GitHub Actions workflow publishes:
+- main branch -> ghcr.io/gtownbennett/tag-binance-relay:latest
+- v2.5.0-durable-intelligence branch -> ghcr.io/gtownbennett/tag-binance-relay:v2.5.0-durable-intelligence
+- every build -> a short SHA tag
+
+Test the branch-specific image on a separate Render service before merging into main.

@@ -1,0 +1,16 @@
+TAG Relay v2.5.0 TEST DEPLOYMENT
+
+1. Copy this package into the local tag-binance-relay-live repository while the current branch is v2.5.0-durable-intelligence.
+2. Commit: TAG Relay v2.5.0 Durable Intelligence
+3. Push origin.
+4. In GitHub Actions, wait for both workflows to turn green:
+   - Test TAG relay
+   - Build and publish TAG relay image
+5. The development image will be:
+   ghcr.io/gtownbennett/tag-binance-relay:v2.5.0-durable-intelligence
+6. Create a separate Render Existing Image service for that development tag. Do not change the stable tag-binance-relay-latest service yet.
+7. Copy the existing OPENAI_API_KEY, OPENAI_MODEL, OPENAI_MAX_OUTPUT_TOKENS and RELAY_TOKEN values into the test service.
+8. Test /health and /docs.
+9. Run Chad from Swagger or the app only after the test service is live.
+
+For true server-side persistence, a Render persistent disk is required. Without one, v2.5.0 can recover through ledger export/import and the app's on-device backup.
