@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.source="https://github.com/gtownbennett/tag-binance-relay"
+LABEL org.opencontainers.image.description="TAG Binance market-data relay with Chad analysis and prediction ledger"
+LABEL org.opencontainers.image.licenses="MIT"
+
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 

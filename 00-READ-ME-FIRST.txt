@@ -1,0 +1,37 @@
+TAG RELAY COMPLETE v2.4.1
+
+IMPORTANT:
+.github/workflows/publish-image.yml is NOT a web address.
+It is a file inside this ZIP. GitHub Actions only recognizes it when it is
+uploaded in exactly this folder structure:
+
+.github
+  workflows
+    publish-image.yml
+
+WHAT TO UPLOAD TO GITHUB:
+Upload everything inside this extracted folder to the ROOT of:
+gtownbennett/tag-binance-relay
+
+The required files are:
+- .github/workflows/publish-image.yml
+- Dockerfile
+- requirements.txt
+- app/__init__.py
+- app/main.py
+- app/ledger.py
+- README.md
+- LICENSE
+- PREDICTION-LEDGER.txt
+
+The folder WORKFLOW-BACKUP-DO-NOT-UPLOAD-HERE is only a visible backup copy.
+You may leave it out of GitHub. The real workflow must remain under .github/workflows.
+
+AFTER UPLOAD:
+1. Open GitHub in Chrome.
+2. Open the repository.
+3. Click Actions.
+4. Look for: Build and publish TAG relay image
+5. Wait for a green check.
+
+No API key or relay token is included in this ZIP.

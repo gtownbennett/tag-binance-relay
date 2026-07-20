@@ -1,0 +1,20 @@
+UPLOAD CHECKLIST
+
+Before clicking Commit changes on GitHub, confirm these appear in the upload:
+[ ] .github/workflows/publish-image.yml
+[ ] Dockerfile
+[ ] requirements.txt
+[ ] app/main.py
+[ ] app/ledger.py
+[ ] app/__init__.py
+[ ] README.md
+[ ] LICENSE
+[ ] PREDICTION-LEDGER.txt
+
+After committing:
+[ ] Click Actions in GitHub Chrome
+[ ] See "Build and publish TAG relay image"
+[ ] Wait for green check
+
+Do not use GitHub Desktop for this step unless you prefer it.
+Do not type .github/workflows/publish-image.yml into the browser address bar.
