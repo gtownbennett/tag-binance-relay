@@ -37,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.6.0-rc1"
+SERVICE_VERSION = "2.6.0-rc2"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -615,7 +615,14 @@ async def collect_spot_data() -> dict[str, Any]:
     estimated_market_cap = (
         price_usd * TAG_CIRCULATING_SUPPLY if price_usd is not None else None
     )
-    market_cap = api_market_cap or estimated_market_cap
+
+    # DEX Screener currently reports TAG's fully diluted/maximum-supply value in
+    # both `marketCap` and `fdv` for this pair. TAG Terminal's historical alert
+    # levels use the configured circulating supply, so the canonical market cap
+    # must be price × circulating supply whenever price is available. Preserve
+    # the raw DEX value separately for transparency instead of using it for
+    # alerts, levels, position context, or Chad's market-cap conclusions.
+    market_cap = estimated_market_cap if estimated_market_cap is not None else api_market_cap
 
     liquidity = pair.get("liquidity") if isinstance(pair.get("liquidity"), dict) else {}
     volume = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
@@ -661,8 +668,11 @@ async def collect_spot_data() -> dict[str, Any]:
         "priceNative": as_float(pair.get("priceNative")),
         "marketCapUsd": market_cap,
         "marketCapSource": (
-            "DEX Screener" if api_market_cap is not None else "price × configured circulating supply"
+            "price × configured circulating supply"
+            if estimated_market_cap is not None
+            else "DEX Screener fallback"
         ),
+        "dexScreenerMarketCapUsd": api_market_cap,
         "fdvUsd": as_float(pair.get("fdv")),
         "liquidityUsd": as_float(liquidity.get("usd")),
         "volumeUsd": {
