@@ -1,0 +1,10 @@
+TAG Relay 2.6.0 RC1
+
+- Built additively on uploaded Relay 2.5.0 Durable Intelligence.
+- Preserved all v2.5 Chad, ledger, freshness and calibration routes.
+- Added exact trailing-hour Binance taker flow and labeled warmup fallback.
+- Added persistent-compatible five-exchange history, depth heatmap and liquidation storage.
+- Added deterministic Chad terminal, Future Paths, Opportunity Engine, alerts and share packet.
+- Added Binance Vision backfill support.
+- Added storage status/warnings to /health.
+- Added 4 new terminal tests; total test suite: 9 passing.

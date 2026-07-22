@@ -1,0 +1,16 @@
+TAG TERMINAL RELAY 2.6.0 RC1 — START HERE
+
+DO NOT REPLACE PRODUCTION MAIN FIRST.
+
+1. Keep GitHub main on working Relay v2.5.0.
+2. Keep backup-before-v3.1-current untouched.
+3. Use a test branch/service for Relay 2.6.0 RC1.
+4. Upload the CONTENTS of this relay folder to the test branch root.
+5. Let GitHub Actions run relay-tests.yml. All tests must pass.
+6. Deploy the test branch to a separate Render test service.
+7. Open /health and confirm version 2.6.0-rc1, streams connected, and no storage error.
+8. Open /v1/tag/terminal and verify spot, five-exchange futures, Chad, forecast, heatmap and alerts.
+9. Restart/redeploy the test service and verify history survives only if persistent storage is configured.
+10. Only after all checks pass should this be considered for main.
+
+Android is a separate project. Do not overwrite the working Android Studio folder.
