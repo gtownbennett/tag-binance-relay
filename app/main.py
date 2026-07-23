@@ -11,14 +11,33 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.ledger import PredictionLedger
+from app.terminal_config import DATABASE_URL as TERMINAL_DATABASE_URL
+from app.terminal_addon import (
+    APP_VERSION as TERMINAL_ADDON_VERSION,
+    alert_feed as terminal_alert_feed,
+    backfill_day as terminal_backfill_day,
+    backfill_month as terminal_backfill_month,
+    backfill_recent as terminal_backfill_recent,
+    build_chad_report as build_terminal_chad_report,
+    chad_history as terminal_chad_history,
+    evaluate_alerts as evaluate_terminal_alerts,
+    heatmap as terminal_heatmap,
+    liquidation_feed as terminal_liquidation_feed,
+    prediction_ledger as terminal_prediction_ledger,
+    server_oi_history,
+    share_report_text as terminal_share_report_text,
+    terminal_addon,
+)
+
 
 import httpx
 import websockets
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Body, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.5.0"
+SERVICE_VERSION = "2.6.0-rc3"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -86,6 +105,12 @@ service_started_ms = int(time.time() * 1000)
 
 liquidation_events: deque[dict[str, Any]] = deque(maxlen=20_000)
 liquidation_lock = asyncio.Lock()
+
+# Exact Binance trailing-hour taker tape. A reconnect resets continuity so a
+# partial/gapped window is never mislabeled as exact.
+recent_agg_trades: deque[tuple[int, bool, float]] = deque()
+agg_trade_window_started_ms: int | None = None
+agg_trade_lock = asyncio.Lock()
 
 stream_lock = asyncio.Lock()
 
@@ -590,7 +615,14 @@ async def collect_spot_data() -> dict[str, Any]:
     estimated_market_cap = (
         price_usd * TAG_CIRCULATING_SUPPLY if price_usd is not None else None
     )
-    market_cap = api_market_cap or estimated_market_cap
+
+    # DEX Screener currently reports TAG's fully diluted/maximum-supply value in
+    # both `marketCap` and `fdv` for this pair. TAG Terminal's historical alert
+    # levels use the configured circulating supply, so the canonical market cap
+    # must be price × circulating supply whenever price is available. Preserve
+    # the raw DEX value separately for transparency instead of using it for
+    # alerts, levels, position context, or Chad's market-cap conclusions.
+    market_cap = estimated_market_cap if estimated_market_cap is not None else api_market_cap
 
     liquidity = pair.get("liquidity") if isinstance(pair.get("liquidity"), dict) else {}
     volume = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
@@ -636,8 +668,11 @@ async def collect_spot_data() -> dict[str, Any]:
         "priceNative": as_float(pair.get("priceNative")),
         "marketCapUsd": market_cap,
         "marketCapSource": (
-            "DEX Screener" if api_market_cap is not None else "price × configured circulating supply"
+            "price × configured circulating supply"
+            if estimated_market_cap is not None
+            else "DEX Screener fallback"
         ),
+        "dexScreenerMarketCapUsd": api_market_cap,
         "fdvUsd": as_float(pair.get("fdv")),
         "liquidityUsd": as_float(liquidity.get("usd")),
         "volumeUsd": {
@@ -1175,6 +1210,10 @@ async def collect_snapshot() -> dict[str, Any]:
             "/futures/data/takerlongshortRatio",
             {"symbol": SYMBOL, "period": "5m", "limit": 2},
         ),
+        "taker_1h": get_json(
+            "/futures/data/takerlongshortRatio",
+            {"symbol": SYMBOL, "period": "5m", "limit": 12},
+        ),
     }
 
     names = list(calls.keys())
@@ -1216,12 +1255,41 @@ async def collect_snapshot() -> dict[str, Any]:
     top_account = latest_item(data.get("top_account")) or {}
     top_position = latest_item(data.get("top_position")) or {}
     taker = latest_item(data.get("taker")) or {}
+    rolling_taker = await rolling_taker_1h()
+    taker_history = data.get("taker_1h") if isinstance(data.get("taker_1h"), list) else []
+    fallback_buy_contracts = sum(as_float(row.get("buyVol")) or 0.0 for row in taker_history if isinstance(row, dict))
+    fallback_sell_contracts = sum(as_float(row.get("sellVol")) or 0.0 for row in taker_history if isinstance(row, dict))
+    fallback_buy_usd = fallback_buy_contracts * mark_price if mark_price is not None and fallback_buy_contracts > 0 else None
+    fallback_sell_usd = fallback_sell_contracts * mark_price if mark_price is not None and fallback_sell_contracts > 0 else None
+    fallback_ratio = (fallback_buy_contracts / fallback_sell_contracts) if fallback_sell_contracts > 0 else None
+    use_exact_taker = rolling_taker.get("quality") == "live-exact"
+    taker_buy_usd_1h = rolling_taker.get("buyUsd") if use_exact_taker else fallback_buy_usd
+    taker_sell_usd_1h = rolling_taker.get("sellUsd") if use_exact_taker else fallback_sell_usd
+    taker_ratio_1h = rolling_taker.get("ratio") if use_exact_taker else fallback_ratio
+    taker_quality = "live-exact" if use_exact_taker else ("binance-5m-history" if fallback_ratio is not None else "warming-up")
 
     basis_bps = None
     if mark_price is not None and index_price not in (None, 0):
         basis_bps = ((mark_price - index_price) / index_price) * 10_000.0
 
     order_book = book_metrics(live.get("depth"), mark_price)
+    raw_depth = live.get("depth") if isinstance(live.get("depth"), dict) else {}
+    def normalized_levels(rows: Any) -> list[list[float]]:
+        output: list[list[float]] = []
+        if not isinstance(rows, list):
+            return output
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            price = as_float(row[0])
+            quantity = as_float(row[1])
+            if price is not None and quantity is not None:
+                output.append([price, quantity, price * quantity])
+        return output
+    depth_levels = {
+        "bids": normalized_levels(raw_depth.get("bids") or raw_depth.get("b") or []),
+        "asks": normalized_levels(raw_depth.get("asks") or raw_depth.get("a") or []),
+    }
     liquidations = await liquidation_summary()
 
     if not live.get("connected"):
@@ -1295,9 +1363,17 @@ async def collect_snapshot() -> dict[str, Any]:
             if as_float(top_position.get("shortAccount")) is not None
             else None
         ),
-        "takerBuySellRatio": as_float(taker.get("buySellRatio")),
+        "takerBuySellRatio": taker_ratio_1h,
+        "takerBuySellRatio1h": taker_ratio_1h,
+        "takerBuyVolumeUsd1h": taker_buy_usd_1h,
+        "takerSellVolumeUsd1h": taker_sell_usd_1h,
+        "takerWindowCoverageSeconds": rolling_taker.get("coverageSeconds"),
+        "takerWindowStartTime": utc_iso(rolling_taker.get("windowStartMs")) if rolling_taker.get("windowStartMs") else None,
+        "takerWindowEndTime": utc_iso(rolling_taker.get("windowEndMs")) if rolling_taker.get("windowEndMs") else None,
+        "takerWindowQuality": taker_quality,
         "takerBuyVolumeContracts5m": as_float(taker.get("buyVol")),
         "takerSellVolumeContracts5m": as_float(taker.get("sellVol")),
+        "depthLevels": depth_levels,
         "futuresPriceChange24hPct": as_float(live.get("priceChange24hPct")),
         "futuresVolume24hContracts": as_float(live.get("volume24hContracts")),
         "futuresQuoteVolume24hUsd": as_float(live.get("quoteVolume24hUsd")),
@@ -1324,6 +1400,47 @@ async def cached_snapshot(force: bool = False) -> dict[str, Any]:
         snapshot_cache["time"] = time.monotonic()
         snapshot_cache["value"] = value
         return value
+
+
+async def record_agg_trade(payload: dict[str, Any], event_time: int) -> None:
+    price = as_float(payload.get("p"))
+    quantity = as_float(payload.get("q"))
+    if price is None or quantity is None:
+        return
+    # buyer-is-maker means the seller crossed the spread: taker sell.
+    is_taker_buy = not bool(payload.get("m"))
+    notional = price * quantity
+    cutoff = int(time.time() * 1000) - 60 * 60 * 1000
+    async with agg_trade_lock:
+        if event_time >= cutoff:
+            recent_agg_trades.append((event_time, is_taker_buy, notional))
+        while recent_agg_trades and recent_agg_trades[0][0] < cutoff:
+            recent_agg_trades.popleft()
+
+
+async def rolling_taker_1h() -> dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    cutoff = now_ms - 60 * 60 * 1000
+    async with agg_trade_lock:
+        while recent_agg_trades and recent_agg_trades[0][0] < cutoff:
+            recent_agg_trades.popleft()
+        rows = list(recent_agg_trades)
+        started = agg_trade_window_started_ms
+
+    buy = sum(notional for event_time, is_buy, notional in rows if event_time >= cutoff and is_buy)
+    sell = sum(notional for event_time, is_buy, notional in rows if event_time >= cutoff and not is_buy)
+    coverage_seconds = max(0, int((now_ms - started) / 1000)) if started else 0
+    exact = coverage_seconds >= 3600
+    return {
+        "buyUsd": buy if buy > 0 else None,
+        "sellUsd": sell if sell > 0 else None,
+        "ratio": (buy / sell) if sell > 0 else None,
+        "tradeCount": len(rows),
+        "coverageSeconds": min(coverage_seconds, 3600),
+        "windowStartMs": cutoff,
+        "windowEndMs": now_ms,
+        "quality": "live-exact" if exact else "warming-up",
+    }
 
 
 async def record_liquidation(payload: dict[str, Any]) -> None:
@@ -1363,9 +1480,11 @@ async def record_liquidation(payload: dict[str, Any]) -> None:
 
     async with liquidation_lock:
         liquidation_events.append(event)
+    terminal_addon.persist_liquidation(event)
 
 
 async def market_stream_listener() -> None:
+    global agg_trade_window_started_ms
     """
     Regular market data belongs on Binance's /market route.
     Order-book depth is intentionally handled by depth_stream_listener().
@@ -1376,6 +1495,7 @@ async def market_stream_listener() -> None:
             f"{symbol}@forceOrder",
             f"{symbol}@markPrice@1s",
             f"{symbol}@ticker",
+            f"{symbol}@aggTrade",
         ]
     )
     retry_seconds = 2
@@ -1399,6 +1519,9 @@ async def market_stream_listener() -> None:
                 ) as websocket:
                     connected_this_round = True
                     retry_seconds = 2
+                    async with agg_trade_lock:
+                        recent_agg_trades.clear()
+                        agg_trade_window_started_ms = int(time.time() * 1000)
 
                     async with stream_lock:
                         stream_state["connected"] = True
@@ -1441,6 +1564,9 @@ async def market_stream_listener() -> None:
                                 stream_state["quoteVolume24hUsd"] = as_float(payload.get("q"))
                                 stream_state["tradeCount24h"] = as_int(payload.get("n"))
                                 stream_state["tickerEventTime"] = event_time
+
+                        elif event_type == "aggTrade":
+                            await record_agg_trade(payload, event_time)
 
             except asyncio.CancelledError:
                 async with stream_lock:
@@ -1602,6 +1728,7 @@ async def lifespan(_: FastAPI):
     )
     if LEDGER_ENABLED:
         prediction_ledger.initialize()
+    await terminal_addon.start()
 
     openai_client = httpx.AsyncClient(
         timeout=httpx.Timeout(float(OPENAI_TIMEOUT_SECONDS), connect=15.0),
@@ -1611,6 +1738,7 @@ async def lifespan(_: FastAPI):
     market_task = asyncio.create_task(market_stream_listener())
     depth_task = asyncio.create_task(depth_stream_listener())
     grader_task = asyncio.create_task(ledger_grader_loop()) if LEDGER_ENABLED else None
+    terminal_addon.start_collector(cached_snapshot, cached_spot)
 
     try:
         yield
@@ -1628,6 +1756,7 @@ async def lifespan(_: FastAPI):
 
         if http_client is not None:
             await http_client.aclose()
+        await terminal_addon.stop()
         if openai_client is not None:
             await openai_client.aclose()
         http_client = None
@@ -1673,6 +1802,15 @@ async def root() -> dict[str, Any]:
         "changes": "/v1/chad/changes",
         "ledgerImport": "/v1/chad/ledger/import",
         "ledgerBackup": "/v1/chad/ledger/backup",
+        "terminal": "/v1/tag/terminal",
+        "market": "/v1/tag/market",
+        "heatmap": "/v1/tag/heatmap",
+        "liquidations": "/v1/tag/liquidations",
+        "alerts": "/v1/tag/alerts",
+        "forecast": "/v1/tag/forecast",
+        "patterns": "/v1/tag/patterns",
+        "shareReport": "/v1/tag/share-report",
+        "visionBackfill": "/v1/admin/binance-vision/backfill",
     }
 
 
@@ -1696,8 +1834,23 @@ async def health() -> dict[str, Any]:
         depth_message = stream_state["depthLastMessageAt"]
         depth_mode = stream_state["depthMode"]
 
+    try:
+        terminal_counts = terminal_addon.counts()
+        terminal_storage_error = None
+    except Exception as exc:
+        terminal_counts = None
+        terminal_storage_error = f"{type(exc).__name__}: {exc}"
+
+    terminal_storage_persistent = (
+        TERMINAL_DATABASE_URL.startswith("postgresql+")
+        or (
+            TERMINAL_DATABASE_URL.startswith("sqlite")
+            and "/tmp/" not in TERMINAL_DATABASE_URL
+        )
+    )
+
     return {
-        "ok": connected and depth_connected,
+        "ok": connected and depth_connected and terminal_storage_error is None,
         "serviceTime": utc_iso(),
         "version": SERVICE_VERSION,
         "symbol": SYMBOL,
@@ -1718,6 +1871,16 @@ async def health() -> dict[str, Any]:
         "predictionLedgerStorageWarning": prediction_ledger.persistent_hint if LEDGER_ENABLED else None,
         "predictionLedgerStorage": prediction_ledger.storage_status() if LEDGER_ENABLED else None,
         "automaticGrader": dict(grader_state) if LEDGER_ENABLED else None,
+        "terminalAddonVersion": TERMINAL_ADDON_VERSION,
+        "terminalCollectorRunning": bool(terminal_addon.collector_task and not terminal_addon.collector_task.done()),
+        "terminalHistoryCounts": terminal_counts,
+        "terminalStoragePersistent": terminal_storage_persistent,
+        "terminalStorageWarning": (
+            None
+            if terminal_storage_persistent
+            else "Terminal history uses ephemeral/default storage. Configure TERMINAL_DATABASE_URL with PostgreSQL or a persistent disk before treating history as durable."
+        ),
+        "terminalStorageError": terminal_storage_error,
     }
 
 
@@ -2058,3 +2221,184 @@ async def chad_analyze(
 
     return result
 
+
+
+# ---------------------------------------------------------------------------
+# TAG Terminal v0.5 compatibility and persistent-intelligence endpoints.
+# These are additive. All v2.5 Durable Intelligence routes above remain intact.
+# ---------------------------------------------------------------------------
+
+async def collect_terminal_market(force: bool = False) -> dict[str, Any]:
+    binance, spot = await asyncio.gather(
+        cached_snapshot(force=force),
+        cached_spot(force=force),
+    )
+    return await terminal_addon.collect_market(binance, spot, force=force)
+
+
+def require_terminal_admin(x_admin_key: str | None) -> None:
+    from app.terminal_config import ADMIN_KEY
+
+    if not ADMIN_KEY:
+        raise HTTPException(status_code=503, detail="ADMIN_KEY is not configured.")
+    supplied = (x_admin_key or "").strip()
+    if not supplied or not hmac.compare_digest(supplied, ADMIN_KEY):
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Admin-Key.")
+
+
+@app.get("/v1/tag/market")
+async def terminal_market(
+    force: bool = Query(False),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return await collect_terminal_market(force=force)
+
+
+@app.post("/v1/tag/client-snapshot")
+async def terminal_client_snapshot(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return terminal_addon.accept_client_snapshot(payload)
+
+
+@app.get("/v1/tag/heatmap")
+async def terminal_heatmap_endpoint(
+    hours: int = Query(24, ge=1, le=168),
+    bins: int = Query(32, ge=12, le=80),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return terminal_heatmap(hours, bins)
+
+
+@app.get("/v1/tag/predictions")
+async def terminal_predictions_endpoint(
+    limit: int = Query(50, ge=1, le=300),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return terminal_prediction_ledger(limit)
+
+
+@app.get("/v1/tag/alerts")
+async def terminal_alerts_endpoint(
+    limit: int = Query(30, ge=1, le=200),
+    evaluate: bool = Query(True),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    if evaluate:
+        await collect_terminal_market()
+        report = build_terminal_chad_report(store=True)
+        evaluate_terminal_alerts(report)
+    return terminal_alert_feed(limit)
+
+
+@app.get("/v1/tag/chad")
+async def terminal_chad_endpoint(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    await collect_terminal_market()
+    return build_terminal_chad_report(store=True)
+
+
+@app.get("/v1/tag/chad/history")
+async def terminal_chad_history_endpoint(
+    limit: int = Query(30, ge=1, le=200),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return terminal_chad_history(limit)
+
+
+@app.get("/v1/tag/forecast")
+async def terminal_forecast_endpoint(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    await collect_terminal_market()
+    report = build_terminal_chad_report(store=True)
+    return {
+        "generatedAt": report.get("generatedAt"),
+        "futurePaths": report.get("futurePaths", []),
+        "horizons": report.get("forecastHorizons", []),
+        "opportunities": report.get("opportunities", []),
+        "ledger": terminal_prediction_ledger(60),
+        "dataQuality": report.get("dataQuality"),
+        "warnings": report.get("dataWarnings", []),
+    }
+
+
+@app.get("/v1/tag/patterns")
+async def terminal_patterns_endpoint(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    await collect_terminal_market()
+    report = build_terminal_chad_report(store=False)
+    specialists = report.get("specialistConsensus") if isinstance(report.get("specialistConsensus"), list) else []
+    return {
+        "generatedAt": report.get("generatedAt"),
+        "regime": report.get("regime"),
+        "matches": report.get("historicalAnalogs", []),
+        "specialist": next(
+            (
+                row
+                for row in specialists
+                if isinstance(row, dict) and row.get("name") == "Pattern specialist"
+            ),
+            None,
+        ),
+        "status": (
+            "TAG-specific analog memory is active"
+            if report.get("historicalAnalogs")
+            else "Collecting comparable TAG states"
+        ),
+    }
+
+
+@app.get("/v1/tag/share-report", response_class=PlainTextResponse)
+async def terminal_share_report_endpoint(
+    x_relay_key: str | None = Header(default=None),
+) -> str:
+    require_relay_key(x_relay_key)
+    await collect_terminal_market()
+    return terminal_share_report_text(build_terminal_chad_report(store=False))
+
+
+@app.get("/v1/tag/terminal")
+async def terminal_bundle_endpoint(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    market = await collect_terminal_market()
+    terminal = terminal_addon.build_terminal_payload()
+    return {
+        "generatedAt": terminal.get("generatedAt"),
+        "spot": market.get("spot"),
+        "futures": market.get("futures"),
+        "binance": market.get("binance"),
+        **terminal,
+    }
+
+
+@app.post("/v1/admin/binance-vision/backfill")
+async def terminal_backfill_endpoint(
+    day: str | None = Query(default=None),
+    month: str | None = Query(default=None),
+    days: int = Query(2, ge=1, le=31),
+    interval: str = Query("5m"),
+    x_admin_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_terminal_admin(x_admin_key)
+    if day and month:
+        raise HTTPException(status_code=400, detail="Use day or month, not both.")
+    if day:
+        return await terminal_backfill_day(day, interval)
+    if month:
+        return await terminal_backfill_month(month)
+    return await terminal_backfill_recent(days, interval)

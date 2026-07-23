@@ -1,0 +1,14 @@
+test_stale_stream_caps_confidence (test_freshness.FreshnessTests.test_stale_stream_caps_confidence) ... ok
+test_calibration_waits_for_minimum_sample (test_ledger.PredictionLedgerDurabilityTests.test_calibration_waits_for_minimum_sample) ... ok
+test_decision_delta_reports_state_and_confidence_change (test_ledger.PredictionLedgerDurabilityTests.test_decision_delta_reports_state_and_confidence_change) ... ok
+test_export_import_restores_prediction (test_ledger.PredictionLedgerDurabilityTests.test_export_import_restores_prediction) ... ok
+test_save_creates_atomic_backup (test_ledger.PredictionLedgerDurabilityTests.test_save_creates_atomic_backup) ... ok
+test_binance_normalisation (test_terminal_addon.TerminalAddonTests.test_binance_normalisation) ... ok
+test_exact_trailing_hour_taker_ratio_uses_same_window (test_terminal_addon.TerminalAddonTests.test_exact_trailing_hour_taker_ratio_uses_same_window) ... ok
+test_funding_parser (test_terminal_addon.TerminalAddonTests.test_funding_parser) ... ok
+test_history_heatmap_liquidations_and_chad (test_terminal_addon.TerminalAddonTests.test_history_heatmap_liquidations_and_chad) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.111s
+
+OK

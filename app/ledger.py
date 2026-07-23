@@ -12,6 +12,9 @@ from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import create_engine, text as sql_text
+from sqlalchemy.engine import Connection, Engine
+
 HORIZON_HOURS: dict[str, int] = {
     "6h": 6,
     "24h": 24,
@@ -135,6 +138,94 @@ def _post_mortem(
     )
 
 
+class _SqlAlchemyRow:
+    """Small mapping wrapper so SQLAlchemy rows behave like sqlite3.Row."""
+
+    def __init__(self, row: Any) -> None:
+        self._data = dict(row._mapping)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def keys(self):
+        return self._data.keys()
+
+
+class _SqlAlchemyResult:
+    def __init__(self, result: Any) -> None:
+        self._result = result
+
+    def fetchone(self) -> _SqlAlchemyRow | None:
+        row = self._result.fetchone()
+        return _SqlAlchemyRow(row) if row is not None else None
+
+    def fetchall(self) -> list[_SqlAlchemyRow]:
+        return [_SqlAlchemyRow(row) for row in self._result.fetchall()]
+
+
+class _SqlAlchemyConnection:
+    """Compatibility layer for the small sqlite API surface used by PredictionLedger."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._connection: Connection = engine.connect()
+        self.total_changes = 0
+
+    @staticmethod
+    def _prepare(statement: str, params: Any = None) -> tuple[str, dict[str, Any]]:
+        sql = statement.strip()
+        if sql.upper().startswith("INSERT OR IGNORE INTO"):
+            sql = "INSERT INTO" + sql[len("INSERT OR IGNORE INTO") :]
+            sql = f"{sql} ON CONFLICT DO NOTHING"
+
+        if params is None:
+            return sql, {}
+        if isinstance(params, dict):
+            return sql, params
+
+        values = tuple(params)
+        placeholders = sql.count("?")
+        if placeholders != len(values):
+            raise ValueError(
+                f"SQL placeholder count ({placeholders}) does not match parameter count ({len(values)})."
+            )
+
+        pieces = sql.split("?")
+        rebuilt: list[str] = [pieces[0]]
+        bindings: dict[str, Any] = {}
+        for index, value in enumerate(values):
+            name = f"p{index}"
+            rebuilt.append(f":{name}")
+            rebuilt.append(pieces[index + 1])
+            bindings[name] = value
+        return "".join(rebuilt), bindings
+
+    def execute(self, statement: str, params: Any = None) -> _SqlAlchemyResult:
+        sql, bindings = self._prepare(statement, params)
+        result = self._connection.execute(sql_text(sql), bindings)
+        command = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+        if command in {"INSERT", "UPDATE", "DELETE"} and result.rowcount and result.rowcount > 0:
+            self.total_changes += int(result.rowcount)
+        return _SqlAlchemyResult(result)
+
+    def executescript(self, script: str) -> None:
+        for statement in script.split(";"):
+            statement = statement.strip()
+            if statement:
+                self.execute(statement)
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
 class PredictionLedger:
     def __init__(
         self,
@@ -146,6 +237,32 @@ class PredictionLedger:
         auto_backup: bool = True,
     ) -> None:
         self.db_path = db_path
+        configured_database_url = (
+            os.getenv("LEDGER_DATABASE_URL", "").strip()
+            or os.getenv("TERMINAL_DATABASE_URL", "").strip()
+        )
+        self._database_url: str | None = None
+        self._engine: Engine | None = None
+
+        # The legacy caller still passes /tmp/tag_prediction_ledger.sqlite3.
+        # When PostgreSQL is configured for TAG Terminal, use that durable database
+        # for the ledger instead of temporary container storage.
+        normalized_path = os.path.abspath(db_path)
+        if configured_database_url and (
+            normalized_path.startswith("/tmp/") or normalized_path == "/tmp"
+        ):
+            database_url = configured_database_url
+            if database_url.startswith("postgres://"):
+                database_url = "postgresql+psycopg://" + database_url[len("postgres://") :]
+            elif database_url.startswith("postgresql://"):
+                database_url = "postgresql+psycopg://" + database_url[len("postgresql://") :]
+            self._database_url = database_url
+            self._engine = create_engine(
+                database_url,
+                pool_pre_ping=True,
+                future=True,
+            )
+
         self.deadband_pct = max(0.1, float(deadband_pct))
         self.max_records = max(100, int(max_records))
         self.backup_path = (backup_path or f"{db_path}.backup.json").strip()
@@ -157,15 +274,21 @@ class PredictionLedger:
 
     @property
     def persistent_hint(self) -> str:
+        if self._database_url:
+            return "The ledger is stored durably in PostgreSQL through TERMINAL_DATABASE_URL."
         normalized = os.path.abspath(self.db_path)
         if normalized.startswith("/tmp/") or normalized == "/tmp":
             return (
                 "The ledger is using temporary container storage. It can be lost after a Render "
-                "restart or redeploy. Use LEDGER_DB_PATH on a persistent disk for durable memory."
+                "restart or redeploy. Use LEDGER_DB_PATH on a persistent disk or configure "
+                "TERMINAL_DATABASE_URL for durable memory."
             )
         return "The ledger is stored at the configured LEDGER_DB_PATH."
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> sqlite3.Connection | _SqlAlchemyConnection:
+        if self._engine is not None:
+            return _SqlAlchemyConnection(self._engine)
+
         parent = os.path.dirname(os.path.abspath(self.db_path))
         os.makedirs(parent, exist_ok=True)
         connection = sqlite3.connect(self.db_path, timeout=10.0)
@@ -1115,11 +1238,32 @@ class PredictionLedger:
             return {"restored": False, "reason": "restore_failed", "error": f"{type(exc).__name__}: {exc}"}
 
     def storage_status(self) -> dict[str, Any]:
-        db_path = os.path.abspath(self.db_path)
         backup_path = os.path.abspath(self.backup_path) if self.backup_path else None
-        db_exists = os.path.exists(db_path)
         backup_exists = bool(backup_path and os.path.exists(backup_path))
+
+        if self._database_url:
+            return {
+                "backend": "postgresql",
+                "dbPath": "PostgreSQL via TERMINAL_DATABASE_URL",
+                "dbExists": True,
+                "dbBytes": 0,
+                "backupPath": self.backup_path,
+                "backupExists": backup_exists,
+                "backupBytes": os.path.getsize(backup_path) if backup_exists and backup_path else 0,
+                "autoBackup": self.auto_backup,
+                "lastBackupAt": self._last_backup_at,
+                "lastBackupError": self._last_backup_error,
+                "startupRestore": self._last_restore,
+                "predictionCount": self.prediction_count(),
+                "persistentHint": self.persistent_hint,
+                "durableServerStorage": True,
+                "recoveryReady": True,
+            }
+
+        db_path = os.path.abspath(self.db_path)
+        db_exists = os.path.exists(db_path)
         return {
+            "backend": "sqlite",
             "dbPath": self.db_path,
             "dbExists": db_exists,
             "dbBytes": os.path.getsize(db_path) if db_exists else 0,
@@ -1135,3 +1279,4 @@ class PredictionLedger:
             "durableServerStorage": not db_path.startswith("/tmp/"),
             "recoveryReady": backup_exists or not db_path.startswith("/tmp/"),
         }
+
