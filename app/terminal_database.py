@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     select,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -114,7 +116,7 @@ class TakerMinute(Base):
     __table_args__ = (UniqueConstraint("minute_ms", name="uq_taker_minute"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    minute_ms: Mapped[int] = mapped_column(Integer, index=True)
+    minute_ms: Mapped[int] = mapped_column(BigInteger, index=True)
     buy_notional_usd: Mapped[float] = mapped_column(Float, default=0.0)
     sell_notional_usd: Mapped[float] = mapped_column(Float, default=0.0)
     buy_quantity: Mapped[float] = mapped_column(Float, default=0.0)
@@ -135,7 +137,7 @@ class LiquidationEvent(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    event_time_ms: Mapped[int] = mapped_column(Integer, index=True)
+    event_time_ms: Mapped[int] = mapped_column(BigInteger, index=True)
     side: Mapped[str] = mapped_column(String(10), index=True)
     price: Mapped[float] = mapped_column(Float)
     quantity: Mapped[float] = mapped_column(Float)
@@ -217,7 +219,7 @@ class VisionRow(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     dataset: Mapped[str] = mapped_column(String(50), index=True)
-    event_time_ms: Mapped[int] = mapped_column(Integer, index=True)
+    event_time_ms: Mapped[int] = mapped_column(BigInteger, index=True)
     interval: Mapped[str] = mapped_column(String(20), default="")
     open_price: Mapped[float | None] = mapped_column(Float)
     high_price: Mapped[float | None] = mapped_column(Float)
@@ -242,8 +244,24 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
+def _migrate_postgres_timestamp_columns() -> None:
+    """Upgrade millisecond epoch columns to BIGINT on existing PostgreSQL databases."""
+    if engine.dialect.name != "postgresql":
+        return
+
+    statements = (
+        "ALTER TABLE taker_minutes ALTER COLUMN minute_ms TYPE BIGINT USING minute_ms::bigint",
+        "ALTER TABLE liquidation_events ALTER COLUMN event_time_ms TYPE BIGINT USING event_time_ms::bigint",
+        "ALTER TABLE vision_rows ALTER COLUMN event_time_ms TYPE BIGINT USING event_time_ms::bigint",
+    )
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
 def init_db() -> None:
     Base.metadata.create_all(engine)
+    _migrate_postgres_timestamp_columns()
 
 
 @contextmanager
