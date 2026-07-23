@@ -1,4 +1,4 @@
-# TAG Terminal Relay 2.6.0 RC1
+# TAG Terminal Relay 2.6.0 RC3
 
 This is an **additive upgrade built directly on Relay 2.5.0 Durable Intelligence**.
 It does not replace the existing Chad analysis, prediction ledger, calibration,
@@ -37,11 +37,7 @@ freshness controls, decision-change history, backup/export, or automatic grading
 
 ## Storage
 
-`TERMINAL_DATABASE_URL` defaults to SQLite in `/tmp` for testing. That is not durable
-on a free ephemeral service. Use PostgreSQL or a persistent disk before relying on
-long-term history. The original v2.5 prediction ledger still uses `LEDGER_DB_PATH`;
-configure that path on persistent storage separately.
-
+``TERMINAL_DATABASE_URL` or Render's `DATABASE_URL` should point to PostgreSQL for durable storage. When PostgreSQL is configured, both TAG Terminal history and Chad's prediction ledger use durable server storage and survive service restarts and redeploys. SQLite under `/tmp` remains a temporary local or test fallback only.
 ## Test
 
 ```bash
