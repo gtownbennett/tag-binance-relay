@@ -37,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.6.0-rc2"
+SERVICE_VERSION = "2.6.0-rc3"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
