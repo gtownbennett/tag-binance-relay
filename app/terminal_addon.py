@@ -21,6 +21,11 @@ from .terminal_database import (
     OrderBookSnapshot,
     SpotSnapshotRow,
     VisionRow,
+    AlertTimelineRow,
+    PaperAccountRow,
+    PaperTradeRow,
+    SocialCallRow,
+    SocialCallerRow,
     init_db,
     json_dumps,
     session_scope,
@@ -39,6 +44,16 @@ from .terminal_intelligence import (
 )
 from .terminal_multi_exchange import multi_exchange_service
 from .terminal_vision import backfill_day, backfill_month, backfill_recent
+from .terminal_paper_social import (
+    alert_timeline,
+    enrich_social_calls_with_cmc_quotes,
+    evaluate_paper_orders,
+    grade_social_calls,
+    paper_ledger,
+    poll_cmc_social_calls,
+    social_ledger,
+    update_caller_stats,
+)
 
 
 def _parse_datetime(value: Any) -> datetime:
@@ -119,6 +134,13 @@ class TerminalAddon:
                 report = build_chad_report(store=True)
                 evaluate_alerts(report)
                 prediction_ledger(limit=5)
+                evaluate_paper_orders()
+                grade_social_calls()
+                update_caller_stats()
+                # CMC polling is optional and exact timestamps are accepted only
+                # when the official API supplies post_time. No time is inferred.
+                await poll_cmc_social_calls()
+                await enrich_social_calls_with_cmc_quotes(limit=3)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -315,6 +337,11 @@ class TerminalAddon:
                 "forecasts": session.scalar(select(func.count(ForecastRecordRow.id))) or 0,
                 "alerts": session.scalar(select(func.count(AlertEventRow.id))) or 0,
                 "vision": session.scalar(select(func.count(VisionRow.id))) or 0,
+                "alertTimeline": session.scalar(select(func.count(AlertTimelineRow.id))) or 0,
+                "paperAccounts": session.scalar(select(func.count(PaperAccountRow.id))) or 0,
+                "paperTrades": session.scalar(select(func.count(PaperTradeRow.id))) or 0,
+                "socialCallers": session.scalar(select(func.count(SocialCallerRow.id))) or 0,
+                "socialCalls": session.scalar(select(func.count(SocialCallRow.id))) or 0,
             }
 
     @staticmethod
@@ -330,6 +357,9 @@ class TerminalAddon:
             "chadHistory": chad_history(30).get("history", []),
             "predictions": prediction_ledger(60),
             "alerts": alert_feed(20).get("alerts", []),
+            "alertTimeline": alert_timeline(120),
+            "paper": paper_ledger(150),
+            "social": social_ledger(150),
         }
 
 

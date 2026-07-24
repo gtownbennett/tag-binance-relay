@@ -24,6 +24,7 @@ from .terminal_database import (
     session_scope,
     utc_now,
 )
+from .terminal_paper_social import record_alert_timeline
 
 MODEL_ID = "champion-rules-v1.0"
 CHALLENGER_ID = "challenger-shadow-v1.0"
@@ -1043,24 +1044,137 @@ def evaluate_alerts(report: dict[str, Any] | None = None) -> int:
     confidence = _num(report.get("confidence"))
     created = 0
 
+    evidence = {
+        "price": price,
+        "marketCap": market_cap,
+        "price1hPct": price1h,
+        "price24hPct": price24h,
+        "fundingPct": funding,
+        "oi1hPct": oi1h,
+        "takerBuySellRatio": taker,
+        "spotBuys1h": buys,
+        "spotSells1h": sells,
+        "confidence": confidence,
+        "dataQuality": report.get("dataQuality"),
+        "generatedAt": report.get("generatedAt"),
+    }
+
+    # Persist the pre-alert path, not only the final notification. This lets the
+    # app show exactly when Chad first saw, promoted, confirmed, or invalidated a setup.
+    funding_stage = "invalidated"
+    if funding is not None and funding > 0.015:
+        funding_stage = "candidate" if funding > 0.02 else "observed"
+    record_alert_timeline(
+        state_key="funding-danger", stage=funding_stage, alert_type="EARLY_WATCH",
+        severity="warning" if funding_stage != "invalidated" else "info",
+        title="Funding danger",
+        message=(f"OI-weighted funding is {funding:.5f}%." if funding is not None else "Funding is unavailable."),
+        price=price, market_cap=market_cap, confidence=confidence, payload=evidence,
+    )
     if funding is not None and funding > 0.02:
         created += int(_insert_alert("EARLY_WATCH", "warning", "funding-danger", "Funding danger", f"OI-weighted funding reached {funding:.5f}%. Long crowding risk is elevated.", price, market_cap, confidence, report))
-    if oi1h is not None and oi1h > 1.0 and (price1h or 0) <= 0 and (taker is None or taker < 1):
+
+    oi_setup = oi1h is not None and oi1h > 0.5 and (price1h or 0) <= 0 and (taker is None or taker < 1.05)
+    oi_confirmed = oi1h is not None and oi1h > 1.0 and (price1h or 0) <= 0 and (taker is None or taker < 1.0)
+    oi_stage = "confirmed" if oi_confirmed else "candidate" if oi_setup else "invalidated"
+    record_alert_timeline(
+        state_key="oi-without-spot", stage=oi_stage, alert_type="EARLY_WATCH",
+        severity="warning" if oi_stage != "invalidated" else "info",
+        title="Leverage building without spot confirmation",
+        message=(f"Aggregate OI {oi1h:+.2f}% / price {price1h:+.2f}% / taker {taker:.3f}." if None not in (oi1h, price1h, taker) else "Waiting for complete OI, price and taker evidence."),
+        price=price, market_cap=market_cap, confidence=confidence, payload=evidence,
+    )
+    if oi_confirmed:
         created += int(_insert_alert("EARLY_WATCH", "warning", "oi-without-spot", "Leverage building without confirmation", f"Aggregate OI rose {oi1h:+.2f}% while spot/taker confirmation remained weak.", price, market_cap, confidence, report))
-    if price1h is not None and (abs(price1h) >= 5 or (price24h is not None and abs(price24h) >= 20)):
+
+    huge = price1h is not None and (abs(price1h) >= 5 or (price24h is not None and abs(price24h) >= 20))
+    huge_stage = "confirmed" if huge else "invalidated"
+    record_alert_timeline(
+        state_key="huge-movement", stage=huge_stage, alert_type="HUGE_MOVEMENT",
+        severity="critical" if huge else "info", title="Huge TAG movement",
+        message=(f"TAG moved {price1h:+.2f}% in one hour." if price1h is not None else "One-hour move unavailable."),
+        price=price, market_cap=market_cap, confidence=confidence, payload=evidence, dedupe=timedelta(minutes=10),
+    )
+    if huge:
         created += int(_insert_alert("HUGE_MOVEMENT", "critical", f"huge-{1 if price1h > 0 else -1}", "Huge TAG movement", f"TAG moved {price1h:+.2f}% in one hour and {price24h:+.2f}% in 24 hours." if price24h is not None else f"TAG moved {price1h:+.2f}% in one hour.", price, market_cap, confidence, report, timedelta(minutes=20)))
+
     if market_cap is not None:
         for level in (112_000_000, 120_000_000, 125_000_000, 135_000_000, 140_000_000):
-            if market_cap >= level and (price1h or 0) > 0 and (buys > sells or (taker or 0) > 1):
-                created += int(_insert_alert("CONFIRMED_BREAKOUT", "critical", f"breakout-{level}", "Confirmed market-cap reclaim", f"TAG is above ${level/1_000_000:.0f}M with positive price and spot/taker confirmation.", price, market_cap, confidence, report, timedelta(hours=4)))
+            near = market_cap >= level * 0.985
+            above = market_cap >= level
+            confirmed = above and (price1h or 0) > 0 and (buys > sells or (taker or 0) > 1)
+            stage = "confirmed" if confirmed else "candidate" if above else "observed" if near else "invalidated"
+            state_key = f"breakout-{level}"
+            record_alert_timeline(
+                state_key=state_key, stage=stage, alert_type="CONFIRMED_BREAKOUT",
+                severity="critical" if confirmed else "warning" if stage in {"observed", "candidate"} else "info",
+                title=f"${level/1_000_000:.0f}M reclaim",
+                message=f"TAG market cap is ${market_cap/1_000_000:.2f}M; stage {stage}. Spot buys/sells {buys}/{sells}; taker {taker if taker is not None else '—'}.",
+                price=price, market_cap=market_cap, confidence=confidence, payload=evidence,
+            )
+            if confirmed:
+                created += int(_insert_alert("CONFIRMED_BREAKOUT", "critical", state_key, "Confirmed market-cap reclaim", f"TAG is above ${level/1_000_000:.0f}M with positive price and spot/taker confirmation.", price, market_cap, confidence, report, timedelta(hours=4)))
+
         for level in (105_000_000, 100_000_000):
-            if market_cap < level and (price1h or 0) < 0 and (oi1h or 0) >= 0:
-                created += int(_insert_alert("CONFIRMED_BREAKDOWN", "critical", f"breakdown-{level}", "Confirmed market-cap breakdown", f"TAG is below ${level/1_000_000:.0f}M while price is falling and leverage is not clearing.", price, market_cap, confidence, report, timedelta(hours=4)))
+            near = market_cap <= level * 1.015
+            below = market_cap < level
+            confirmed = below and (price1h or 0) < 0 and (oi1h or 0) >= 0
+            stage = "confirmed" if confirmed else "candidate" if below else "observed" if near else "invalidated"
+            state_key = f"breakdown-{level}"
+            record_alert_timeline(
+                state_key=state_key, stage=stage, alert_type="CONFIRMED_BREAKDOWN",
+                severity="critical" if confirmed else "warning" if stage in {"observed", "candidate"} else "info",
+                title=f"${level/1_000_000:.0f}M danger line",
+                message=f"TAG market cap is ${market_cap/1_000_000:.2f}M; stage {stage}. Price 1h {price1h if price1h is not None else '—'}%; OI 1h {oi1h if oi1h is not None else '—'}%.",
+                price=price, market_cap=market_cap, confidence=confidence, payload=evidence,
+            )
+            if confirmed:
+                created += int(_insert_alert("CONFIRMED_BREAKDOWN", "critical", state_key, "Confirmed market-cap breakdown", f"TAG is below ${level/1_000_000:.0f}M while price is falling and leverage is not clearing.", price, market_cap, confidence, report, timedelta(hours=4)))
+
+        ath_stage = "confirmed" if market_cap >= 220_000_000 else "observed" if market_cap >= 200_000_000 else "invalidated"
+        record_alert_timeline(
+            state_key="extreme-ath", stage=ath_stage, alert_type="EXTREME_ATH",
+            severity="critical" if ath_stage == "confirmed" else "warning" if ath_stage == "observed" else "info",
+            title="Extreme / ATH region",
+            message=f"TAG market cap is ${market_cap/1_000_000:.2f}M; prior ATH risk stage {ath_stage}.",
+            price=price, market_cap=market_cap, confidence=confidence, payload=evidence,
+        )
         if market_cap >= 220_000_000:
             created += int(_insert_alert("EXTREME_ATH", "critical", "extreme-ath", "Extreme / ATH region", "TAG entered the prior ATH region. Slippage, distribution and exit depth require immediate attention.", price, market_cap, confidence, report, timedelta(hours=6)))
-    if report.get("attentionLevel") == "INTERRUPT":
+
+    interrupt = report.get("attentionLevel") == "INTERRUPT"
+    record_alert_timeline(
+        state_key=f"interrupt-{report.get('regime')}", stage="confirmed" if interrupt else "invalidated",
+        alert_type="CHAD_INTERRUPT", severity="critical" if interrupt else "info", title="Chad interrupt",
+        message=str(report.get("attentionMessage") or "No active Chad interrupt."), price=price, market_cap=market_cap,
+        confidence=confidence, payload=evidence,
+    )
+    if interrupt:
         created += int(_insert_alert("CHAD_INTERRUPT", "critical", f"interrupt-{report.get('regime')}", "Chad interrupt", str(report.get("attentionMessage")), price, market_cap, confidence, report, timedelta(minutes=30)))
     return created
+
+
+def insert_test_alert() -> dict[str, Any]:
+    report = build_chad_report(store=False)
+    spot, _, _ = _latest_market()
+    price = _num(spot.get("priceUsd"))
+    market_cap = _num(spot.get("marketCap"))
+    confidence = _num(report.get("confidence"))
+    payload = {"test": True, "generatedAt": utc_now().isoformat(), "reportState": report.get("regime")}
+    _insert_alert(
+        "TEST_NOTIFICATION", "warning", f"test-{int(utc_now().timestamp())}",
+        "TAG Terminal test notification",
+        "Notification delivery is working. This is a test only and is not a market signal.",
+        price, market_cap, confidence, payload, timedelta(seconds=0),
+    )
+    record_alert_timeline(
+        state_key=f"test-{int(utc_now().timestamp())}", stage="confirmed", alert_type="TEST_NOTIFICATION",
+        severity="warning", title="TAG Terminal test notification",
+        message="Notification delivery is working. This is a test only and is not a market signal.",
+        price=price, market_cap=market_cap, confidence=confidence, payload=payload, source="user-triggered diagnostic",
+        dedupe=timedelta(seconds=0),
+    )
+    return alert_feed(1).get("alerts", [{}])[0]
 
 
 def alert_feed(limit: int = 30) -> dict[str, Any]:

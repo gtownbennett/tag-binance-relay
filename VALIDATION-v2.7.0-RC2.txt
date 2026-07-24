@@ -1,0 +1,17 @@
+TAG RELAY 2.7.0 RC2 — VALIDATION REPORT
+
+COMPLETED IN PACKAGE ENVIRONMENT
+- Python syntax compilation: PASS for app/*.py
+- Unit tests: PASS — 16 tests
+- OpenAPI schema generation: PASS — 41 paths
+- New route presence: PASS for unified predictions, alert timeline, test alert, paper and social routes
+- Paper/social tests cover: 5x cap, isolated paper market trade, close/equity, exact CMC post_time, no guessed timestamp/entry, timestamp research and alert-stage history
+
+NOT COMPLETED HERE
+- Live Render deployment
+- Live PostgreSQL migration against the user's production database
+- Live Binance/CMC/OpenAI calls
+- End-to-end Android-to-Render test
+
+RELEASE GATE
+Do not merge to live main until the RC2 branch passes GitHub/Render checks and live endpoint verification. Preserve the current deployed branch for rollback.

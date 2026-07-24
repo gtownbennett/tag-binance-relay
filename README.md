@@ -1,49 +1,59 @@
-# TAG Terminal Relay 2.6.0 RC3
+# TAG Terminal Relay 2.7.0 RC2 — Paper, Social Calls and Alert History
 
-This is an **additive upgrade built directly on Relay 2.5.0 Durable Intelligence**.
-It does not replace the existing Chad analysis, prediction ledger, calibration,
-freshness controls, decision-change history, backup/export, or automatic grading.
+This is an additive release candidate built on the verified durable TAG relay. It preserves the existing five-exchange market collector, PostgreSQL history, Chad analysis, prediction grading, freshness rules, Binance Vision import and protected relay connection.
 
-## Preserved v2.5 endpoints
+## RC2 additions
 
-- `/v1/chad/analyze`
-- `/v1/chad/ledger` and `/v1/chad/ledger/export`
-- `/v1/chad/performance`
-- `/v1/chad/calibration`
-- `/v1/chad/changes`
-- `/v1/tag/freshness`
-- `/v1/tag/snapshot`, `/v1/tag/spot`, `/v1/tag/history`, `/v1/tag/liquidations`
+- Persistent alert timeline: first seen → candidate → confirmed → invalidated/resolved.
+- Dedicated TAG paper-futures simulator with a $10,000 paper-USDT account.
+- PAPER / NO REAL FUNDS enforcement; no exchange login, trading key, wallet or real order route.
+- Isolated-margin Market, Limit and Trigger paper orders with transparent estimated fees, funding and liquidation risk.
+- Paper positions, pending orders, realized/unrealized P/L, equity curve, grades and post-mortems.
+- Persistent social-caller and social-call scorecards with exact-time provenance and no guessed timestamps or entries.
+- Optional official CoinMarketCap Content API ingestion and historical quote comparison.
+- Stored DEX/exchange evidence around each social call, including OI, funding, taker flow and source status.
+- Consolidated forecast read model that displays both the OpenAI Chad ledger and deterministic Terminal ledger, preserves their source labels and grades due outcomes automatically.
+- Server-created test alert for Android notification diagnostics.
 
-## New additive terminal endpoints
+## Main TAG Terminal endpoints
 
-- `/v1/tag/market` — server-normalized five-exchange market view
-- `/v1/tag/client-snapshot` — accepts the phone's validated snapshot
-- `/v1/tag/terminal` — one payload for Chad, forecast, pattern, heatmap and alerts
-- `/v1/tag/heatmap` — stored visible order-book persistence heatmap
-- `/v1/tag/forecast` and `/v1/tag/patterns`
-- `/v1/tag/alerts` and `/v1/tag/share-report`
-- `/v1/admin/binance-vision/backfill` — protected historical import
+- `GET /v1/tag/terminal` — complete Android payload, including unified grading, alerts, paper and social ledgers.
+- `GET /v1/tag/predictions/unified` — source-labelled consolidated forecast record.
+- `GET /v1/tag/alert-timeline` — alert-stage history and active alert paths.
+- `POST /v1/tag/alerts/test` — protected diagnostic alert; not a market signal.
+- `GET /v1/tag/paper` — paper account, trades and equity history.
+- `POST /v1/tag/paper/orders` — paper-only Market/Limit/Trigger order.
+- `POST /v1/tag/paper/trades/{id}/close` and `/v1/tag/paper/orders/{id}/cancel`.
+- `GET /v1/tag/social` — callers, calls, grades, returns and evidence provenance.
+- Admin-only social import/research endpoints under `/v1/admin/social/`.
 
-## Accuracy rules
+Existing `/v1/chad/*`, market, heatmap, liquidations, forecast, patterns, Binance Vision and history endpoints remain available.
 
-- Exact Binance taker B/S uses timestamped aggregate trades from the same trailing
-  60-minute window. Until the relay has a complete uninterrupted hour, the API
-  labels the value `binance-5m-history` or `warming-up`; it is never called exact.
-- Missing/stale/contradictory data reduces confidence and stays visibly labeled.
-- The internal heatmap is visible stored order-book liquidity, not a guaranteed
-  exchange liquidation map.
-- Binance liquidation data contains only forced-order snapshots observed while the
-  relay is connected.
+## Social-call timestamp rules
+
+An exact post time is accepted only from source metadata such as the official CMC `post_time`, ISO metadata, JSON-LD or an explicit `<time datetime>` value. Relative labels such as “2h ago” are never converted into an invented timestamp. An entry is aligned only when a stored DEX snapshot or optional CMC historical quote is sufficiently close to that exact post time.
+
+Automatic CMC polling requires `CMC_PRO_API_KEY`. `CMC_TAG_ID` enables supplemental historical quote comparisons. Without those variables, the ledger stays operational for verified manual/admin imports and explicitly reports that CMC automation is not configured.
+
+## Accuracy and safety
+
+- Missing, stale or contradictory values stay missing and reduce confidence.
+- Exact Binance taker B/S uses the same timestamped trailing 60-minute window.
+- The internal heatmap is stored visible order-book liquidity, not a guaranteed liquidation map.
+- Paper liquidation, funding and fees are educational estimates, never exchange guarantees.
+- No automatic real orders can be created by this service.
 
 ## Storage
 
-``TERMINAL_DATABASE_URL` or Render's `DATABASE_URL` should point to PostgreSQL for durable storage. When PostgreSQL is configured, both TAG Terminal history and Chad's prediction ledger use durable server storage and survive service restarts and redeploys. SQLite under `/tmp` remains a temporary local or test fallback only.
-## Test
+Set `TERMINAL_DATABASE_URL` or Render's `DATABASE_URL` to PostgreSQL. New SQLAlchemy tables are created additively; the upgrade does not drop prior history. SQLite under `/tmp` is only a temporary local/test fallback.
+
+## Validation
 
 ```bash
 pip install -r requirements.txt
-python -m compileall -q app
+python -m py_compile app/*.py
 python -m unittest discover -s tests -v
+python -c "from app.main import app; print(len(app.openapi()['paths']))"
 ```
 
-See `00-START-HERE-v2.6.0-RC1.txt` and `PRESERVATION-AUDIT.md`.
+See `START-HERE-v2.7.0-RC2.txt` and `VALIDATION-v2.7.0-RC2.txt` before deployment.

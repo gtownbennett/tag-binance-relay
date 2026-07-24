@@ -1,0 +1,20 @@
+TAG RELAY 2.7.0 RC2
+
+ADDED
+- Persistent alert-stage timeline and first-seen history.
+- $10,000 isolated-margin TAG paper-futures ledger.
+- Market, Limit and Trigger paper orders; 5x maximum leverage.
+- Estimated liquidation, fees, funding, SL/TP, P/L, equity curve and post-mortems.
+- Social callers/calls, exact timestamp provenance, entry alignment, grading and caller scorecards.
+- Official CMC post polling and optional historical-quote enrichment when credentials are configured.
+- Stored DEX and multi-exchange derivatives evidence for social-call research.
+- Consolidated source-labelled forecast ledger and automatic grading status.
+- Protected test-alert endpoint.
+
+PRESERVED
+- Five-exchange TAG market collection.
+- PostgreSQL history, Chad analysis, Future Paths, Pattern Engine and existing prediction ledgers.
+- No-guessed-values, freshness, taker-window and heatmap-labeling safeguards.
+
+SAFETY
+- Paper-only. No exchange login, trading key, wallet signing or real order execution.

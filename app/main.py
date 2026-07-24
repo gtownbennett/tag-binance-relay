@@ -28,6 +28,20 @@ from app.terminal_addon import (
     share_report_text as terminal_share_report_text,
     terminal_addon,
 )
+from app.terminal_intelligence import insert_test_alert
+from app.terminal_paper_social import (
+    alert_timeline as terminal_alert_timeline,
+    cancel_paper_trade,
+    close_paper_trade,
+    enrich_social_calls_with_cmc_quotes,
+    ingest_cmc_posts_response,
+    ingest_social_call,
+    paper_ledger as terminal_paper_ledger,
+    place_paper_order,
+    poll_cmc_social_calls,
+    research_timestamp,
+    social_ledger as terminal_social_ledger,
+)
 
 
 import httpx
@@ -37,7 +51,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.6.0-rc3"
+SERVICE_VERSION = "2.7.0-rc2"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -1768,7 +1782,9 @@ app = FastAPI(
     version=SERVICE_VERSION,
     description=(
         "Read-only relay for public Binance USDⓈ-M futures data, primary-pair DEX spot data, "
-        "a protected server-side Chad analysis endpoint, and a durable/recoverable prediction ledger with background outcome grading, calibration and decision-change history. No account, trading, wallet, or order functionality."
+        "a protected server-side Chad analysis endpoint, durable forecast grading, alert-state history, "
+        "a paper-only isolated-margin simulator, and a verified-timestamp social-call ledger. "
+        "There is no exchange login, wallet access, real-money execution, or live order routing."
     ),
     lifespan=lifespan,
 )
@@ -1788,7 +1804,9 @@ async def root() -> dict[str, Any]:
         "service": "TAG Market Data Relay",
         "version": SERVICE_VERSION,
         "symbol": SYMBOL,
-        "readOnly": True,
+        "marketDataReadOnly": True,
+        "paperSimulationOnly": True,
+        "realTradingEnabled": False,
         "docs": "/docs",
         "health": "/health",
         "snapshot": "/v1/tag/snapshot",
@@ -1807,6 +1825,10 @@ async def root() -> dict[str, Any]:
         "heatmap": "/v1/tag/heatmap",
         "liquidations": "/v1/tag/liquidations",
         "alerts": "/v1/tag/alerts",
+        "alertTimeline": "/v1/tag/alert-timeline",
+        "testNotification": "/v1/tag/alerts/test",
+        "paper": "/v1/tag/paper",
+        "social": "/v1/tag/social",
         "forecast": "/v1/tag/forecast",
         "patterns": "/v1/tag/patterns",
         "shareReport": "/v1/tag/share-report",
@@ -2274,6 +2296,136 @@ async def terminal_heatmap_endpoint(
     return terminal_heatmap(hours, bins)
 
 
+async def build_unified_forecast_ledger(limit: int = 200) -> dict[str, Any]:
+    """Consolidate the deterministic Terminal ledger and OpenAI Chad ledger.
+
+    The underlying stores remain independently auditable, while this read model
+    prevents the Android app from presenting partial counts as the whole record.
+    """
+    safe_limit = min(max(int(limit), 1), 500)
+    ledger_warning: str | None = None
+    if LEDGER_ENABLED:
+        try:
+            prediction_ledger.initialize()
+            grading = await grade_due_ledger_predictions(limit=500)
+        except Exception as exc:
+            ledger_warning = f"OpenAI Chad ledger unavailable: {type(exc).__name__}: {exc}"
+            grading = {"enabled": True, "graded": 0, "pendingDue": 0, "errors": [ledger_warning]}
+    else:
+        grading = {"enabled": False, "graded": 0, "pendingDue": 0, "errors": []}
+    terminal = terminal_prediction_ledger(safe_limit)
+    terminal_records = []
+    for row in terminal.get("reports", []):
+        if not isinstance(row, dict):
+            continue
+        terminal_records.append({
+            "source": "deterministic-terminal",
+            "predictionId": None,
+            "time": row.get("time"),
+            "horizon": row.get("horizon"),
+            "scenario": row.get("scenario"),
+            "probability": row.get("probability"),
+            "targetLow": row.get("targetLow"),
+            "targetHigh": row.get("targetHigh"),
+            "status": row.get("status"),
+            "correct": row.get("correct"),
+            "score": 100.0 if row.get("correct") is True else 0.0 if row.get("correct") is False else None,
+            "outcome": row.get("outcome"),
+            "postMortem": None,
+        })
+
+    try:
+        openai_predictions = (
+            prediction_ledger.list_predictions(limit=safe_limit, status="all", include_analysis=False)
+            if LEDGER_ENABLED and ledger_warning is None
+            else []
+        )
+    except Exception as exc:
+        ledger_warning = ledger_warning or f"OpenAI Chad ledger unavailable: {type(exc).__name__}: {exc}"
+        openai_predictions = []
+    openai_records = []
+    for prediction in openai_predictions:
+        if not isinstance(prediction, dict):
+            continue
+        for horizon in prediction.get("horizons", []):
+            if not isinstance(horizon, dict):
+                continue
+            openai_records.append({
+                "source": "openai-chad",
+                "predictionId": prediction.get("predictionId"),
+                "time": prediction.get("createdAt"),
+                "horizon": horizon.get("horizon"),
+                "scenario": horizon.get("predictedDirection"),
+                "probability": horizon.get("probability"),
+                "targetLow": horizon.get("targetLowUsd"),
+                "targetHigh": horizon.get("targetHighUsd"),
+                "status": horizon.get("status"),
+                "correct": horizon.get("directionCorrect"),
+                "score": horizon.get("score"),
+                "outcome": horizon.get("actualDirection"),
+                "postMortem": horizon.get("postMortem"),
+            })
+
+    records = terminal_records + openai_records
+    records.sort(key=lambda row: str(row.get("time") or ""), reverse=True)
+    graded_records = [row for row in records if row.get("correct") is not None]
+    pending_records = [row for row in records if str(row.get("status") or "").lower() in {"pending", "candidate"}]
+    by_horizon: dict[str, dict[str, Any]] = {}
+    for label in sorted({str(row.get("horizon")) for row in records if row.get("horizon")}):
+        matching = [row for row in records if str(row.get("horizon")) == label]
+        graded = [row for row in matching if row.get("correct") is not None]
+        correct = [row for row in graded if row.get("correct") is True]
+        scores = [float(row["score"]) for row in graded if isinstance(row.get("score"), (int, float))]
+        by_horizon[label] = {
+            "records": len(matching),
+            "graded": len(graded),
+            "correct": len(correct),
+            "accuracyPct": round(len(correct) / len(graded) * 100.0, 1) if graded else None,
+            "averageScore": round(sum(scores) / len(scores), 1) if scores else None,
+            "calibrated": len(graded) >= 25,
+        }
+
+    try:
+        openai_performance = prediction_ledger.performance_summary() if LEDGER_ENABLED and ledger_warning is None else {}
+    except Exception as exc:
+        ledger_warning = ledger_warning or f"OpenAI Chad ledger unavailable: {type(exc).__name__}: {exc}"
+        openai_performance = {}
+    return {
+        "generatedAt": utc_iso(),
+        "status": "consolidated",
+        "predictionCount": (
+            int(openai_performance.get("predictionCount") or 0)
+            + len({(row.get("time"), row.get("source")) for row in terminal_records})
+        ),
+        "horizonRecordCount": len(records),
+        "gradedCount": len(graded_records),
+        "pendingCount": len(pending_records),
+        "learningReady": len(graded_records) >= 8,
+        "sourceCounts": {
+            "openaiChadPredictions": int(openai_performance.get("predictionCount") or 0),
+            "openaiChadHorizons": len(openai_records),
+            "deterministicTerminalHorizons": len(terminal_records),
+        },
+        "byHorizon": by_horizon,
+        "automaticGrader": grading,
+        "records": records[:safe_limit],
+        "warning": ledger_warning,
+        "note": (
+            "Both durable forecast stores are shown together and graded automatically from timestamped market history. "
+            "They remain source-labelled so duplicate or incompatible records are never silently merged."
+        ),
+    }
+
+
+@app.get("/v1/tag/predictions/unified")
+async def terminal_unified_predictions_endpoint(
+    limit: int = Query(200, ge=1, le=500),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return await build_unified_forecast_ledger(limit)
+
+
 @app.get("/v1/tag/predictions")
 async def terminal_predictions_endpoint(
     limit: int = Query(50, ge=1, le=300),
@@ -2295,6 +2447,134 @@ async def terminal_alerts_endpoint(
         report = build_terminal_chad_report(store=True)
         evaluate_terminal_alerts(report)
     return terminal_alert_feed(limit)
+
+
+@app.get("/v1/tag/alert-timeline")
+async def terminal_alert_timeline_endpoint(
+    limit: int = Query(100, ge=1, le=500),
+    state_key: str | None = Query(default=None),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return terminal_alert_timeline(limit=limit, state_key=state_key)
+
+
+@app.post("/v1/tag/alerts/test")
+async def terminal_test_alert_endpoint(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    alert = insert_test_alert()
+    return {
+        "ok": True,
+        "testOnly": True,
+        "message": "A test alert was inserted. The Android background worker should deliver it on its next check.",
+        "alert": alert,
+    }
+
+
+@app.get("/v1/tag/paper")
+async def terminal_paper_endpoint(
+    limit: int = Query(100, ge=1, le=500),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return terminal_paper_ledger(limit=limit)
+
+
+@app.post("/v1/tag/paper/orders")
+async def terminal_paper_order_endpoint(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    try:
+        return place_paper_order(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/tag/paper/trades/{trade_id}/close")
+async def terminal_paper_close_endpoint(
+    trade_id: int,
+    payload: dict[str, Any] | None = Body(default=None),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    reason = str((payload or {}).get("reason") or "manual close")[:60]
+    try:
+        return close_paper_trade(trade_id, reason=reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/tag/paper/orders/{trade_id}/cancel")
+async def terminal_paper_cancel_endpoint(
+    trade_id: int,
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    try:
+        return cancel_paper_trade(trade_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/tag/social")
+async def terminal_social_endpoint(
+    limit: int = Query(100, ge=1, le=500),
+    caller_id: int | None = Query(default=None),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return terminal_social_ledger(limit=limit, caller_id=caller_id)
+
+
+@app.post("/v1/admin/social/calls/import")
+async def terminal_social_import_endpoint(
+    payload: dict[str, Any] = Body(...),
+    x_admin_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_terminal_admin(x_admin_key)
+    try:
+        return {"ok": True, "call": ingest_social_call(payload)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/admin/social/cmc/import")
+async def terminal_social_cmc_import_endpoint(
+    payload: dict[str, Any] = Body(...),
+    x_admin_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_terminal_admin(x_admin_key)
+    return {"ok": True, **ingest_cmc_posts_response(payload)}
+
+
+@app.post("/v1/admin/social/research-timestamp")
+async def terminal_social_timestamp_endpoint(
+    payload: dict[str, Any] = Body(...),
+    x_admin_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_terminal_admin(x_admin_key)
+    return {"ok": True, **research_timestamp(payload)}
+
+
+@app.post("/v1/admin/social/cmc/history-enrich")
+async def terminal_social_cmc_history_endpoint(
+    limit: int = Query(5, ge=1, le=20),
+    x_admin_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_terminal_admin(x_admin_key)
+    return {"ok": True, **(await enrich_social_calls_with_cmc_quotes(limit=limit))}
+
+
+@app.post("/v1/admin/social/cmc/poll")
+async def terminal_social_cmc_poll_endpoint(
+    x_admin_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_terminal_admin(x_admin_key)
+    return {"ok": True, **(await poll_cmc_social_calls(force=True))}
 
 
 @app.get("/v1/tag/chad")
@@ -2377,12 +2657,14 @@ async def terminal_bundle_endpoint(
     require_relay_key(x_relay_key)
     market = await collect_terminal_market()
     terminal = terminal_addon.build_terminal_payload()
+    unified_predictions = await build_unified_forecast_ledger(300)
     return {
         "generatedAt": terminal.get("generatedAt"),
         "spot": market.get("spot"),
         "futures": market.get("futures"),
         "binance": market.get("binance"),
         **terminal,
+        "unifiedPredictions": unified_predictions,
     }
 
 

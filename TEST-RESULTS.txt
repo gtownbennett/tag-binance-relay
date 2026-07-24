@@ -3,12 +3,20 @@ test_calibration_waits_for_minimum_sample (test_ledger.PredictionLedgerDurabilit
 test_decision_delta_reports_state_and_confidence_change (test_ledger.PredictionLedgerDurabilityTests.test_decision_delta_reports_state_and_confidence_change) ... ok
 test_export_import_restores_prediction (test_ledger.PredictionLedgerDurabilityTests.test_export_import_restores_prediction) ... ok
 test_save_creates_atomic_backup (test_ledger.PredictionLedgerDurabilityTests.test_save_creates_atomic_backup) ... ok
+test_alert_timeline_keeps_first_seen_and_stage_history (test_paper_social.PaperSocialTests.test_alert_timeline_keeps_first_seen_and_stage_history) ... ok
+test_alert_timeline_stores_transitions_not_refresh_noise (test_paper_social.PaperSocialTests.test_alert_timeline_stores_transitions_not_refresh_noise) ... ok
+test_cmc_post_time_is_stored_as_verified_exact_timestamp (test_paper_social.PaperSocialTests.test_cmc_post_time_is_stored_as_verified_exact_timestamp) ... ok
+test_first_twenty_trade_leverage_cap_is_five (test_paper_social.PaperSocialTests.test_first_twenty_trade_leverage_cap_is_five) ... ok
+test_paper_market_trade_uses_isolated_margin_and_closes (test_paper_social.PaperSocialTests.test_paper_market_trade_uses_isolated_margin_and_closes) ... ok
+test_social_call_without_timestamp_never_invents_entry (test_paper_social.PaperSocialTests.test_social_call_without_timestamp_never_invents_entry) ... ok
+test_timestamp_research_uses_metadata_and_never_relative_time (test_paper_social.PaperSocialTests.test_timestamp_research_uses_metadata_and_never_relative_time) ... ok
 test_binance_normalisation (test_terminal_addon.TerminalAddonTests.test_binance_normalisation) ... ok
 test_exact_trailing_hour_taker_ratio_uses_same_window (test_terminal_addon.TerminalAddonTests.test_exact_trailing_hour_taker_ratio_uses_same_window) ... ok
 test_funding_parser (test_terminal_addon.TerminalAddonTests.test_funding_parser) ... ok
 test_history_heatmap_liquidations_and_chad (test_terminal_addon.TerminalAddonTests.test_history_heatmap_liquidations_and_chad) ... ok
 
 ----------------------------------------------------------------------
-Ran 9 tests in 0.111s
+Ran 16 tests
 
 OK
+OpenAPI generation: PASS — 41 paths
