@@ -679,27 +679,63 @@ def update_caller_stats() -> int:
     updated = 0
     with session_scope() as session:
         callers = session.scalars(select(SocialCallerRow)).all()
+
         for caller in callers:
-            calls = session.scalars(select(SocialCallRow).where(SocialCallRow.caller_id == caller.id)).all()
-            graded_returns = [
-                value
-                for call in calls
-                for value in [call.return_24h_pct if call.return_24h_pct is not None else call.return_4h_pct]
-                if value is not None
-            ]
+            calls = session.scalars(
+                select(SocialCallRow).where(
+                    SocialCallRow.caller_id == caller.id
+                )
+            ).all()
+
+            graded_returns = []
+
+            for call in calls:
+                value = (
+                    call.return_24h_pct
+                    if call.return_24h_pct is not None
+                    else call.return_4h_pct
+                    if call.return_4h_pct is not None
+                    else call.return_1h_pct
+                )
+
+                if value is not None:
+                    graded_returns.append(value)
+
             wins = sum(1 for value in graded_returns if value > 0)
             losses = sum(1 for value in graded_returns if value < 0)
+
             caller.call_count = len(calls)
             caller.graded_count = len(graded_returns)
             caller.wins = wins
             caller.losses = losses
-            caller.win_rate_pct = round(wins / len(graded_returns) * 100.0, 1) if graded_returns else None
-            caller.average_return_pct = round(sum(graded_returns) / len(graded_returns), 3) if graded_returns else None
-            caller.total_return_pct = round(sum(graded_returns), 3) if graded_returns else None
-            caller.best_return_pct = max(graded_returns) if graded_returns else None
-            caller.worst_return_pct = min(graded_returns) if graded_returns else None
-            caller.grade = _friendly_caller_grade(caller.win_rate_pct, caller.average_return_pct, caller.graded_count)
+            caller.win_rate_pct = (
+                round(wins / len(graded_returns) * 100.0, 1)
+                if graded_returns
+                else None
+            )
+            caller.average_return_pct = (
+                round(sum(graded_returns) / len(graded_returns), 3)
+                if graded_returns
+                else None
+            )
+            caller.total_return_pct = (
+                round(sum(graded_returns), 3)
+                if graded_returns
+                else None
+            )
+            caller.best_return_pct = (
+                max(graded_returns) if graded_returns else None
+            )
+            caller.worst_return_pct = (
+                min(graded_returns) if graded_returns else None
+            )
+            caller.grade = _friendly_caller_grade(
+                caller.win_rate_pct,
+                caller.average_return_pct,
+                caller.graded_count,
+            )
             updated += 1
+
     return updated
 
 
