@@ -1,0 +1,16 @@
+TAG RELAY 2.8.1 RC4 — VALIDATION
+
+[ ] Relay unit suite reports 23/23 passed.
+[ ] Python compilation succeeds.
+[ ] GitHub image is v2.8.1-rc4-manual-live.
+[ ] /health reports version 2.8.1-rc4 and side effects none.
+[ ] REPAIR_MODE is true.
+[ ] LIVE_COLLECTORS_ENABLED is false.
+[ ] BACKFILL_ENABLED is false.
+[ ] OPENAI_AUTOMATIC_ENABLED is false.
+[ ] PUSH_ENABLED is false.
+[ ] Stored-only terminal read contacts no external source.
+[ ] One manual=true call returns price and bounded exchange coverage.
+[ ] A repeated manual=true call inside five minutes is a cache hit.
+[ ] Manual packet reports databaseWrites=0 and automaticWorkStarted=false.
+[ ] Neon query/egress does not climb without a user refresh.

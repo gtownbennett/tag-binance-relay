@@ -1,0 +1,10 @@
+TAG RELAY 2.8.1 RC4
+
+- Added a protected manual=true terminal packet for one explicit public-data read.
+- Kept stored-only terminal reads completely offline.
+- Added five-minute manual packet caching and request coalescing.
+- Added separate 25/day and 500/month manual-read circuit limits.
+- Added point-in-time Binance REST mark, ticker and depth data while WebSockets stay off.
+- Preserved zero database writes, zero OpenAI, zero grading and zero background work.
+- Core market data survives optional stored-intelligence/schema failures.
+- Added four regressions; total relay suite is 23 tests.

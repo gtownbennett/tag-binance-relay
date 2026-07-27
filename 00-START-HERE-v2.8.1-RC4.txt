@@ -1,0 +1,16 @@
+TAG RELAY 2.8.1 RC4 — START HERE
+
+Purpose
+- Repair the blank RC3 first-run packet without re-enabling monitoring.
+- Keep every automatic, paid and mutating path off.
+
+Safe release order
+1. Publish branch v2.8.1-rc4-manual-live from RC3.
+2. Wait for all 23 relay tests and the image build to pass.
+3. Point only tag-binance-relay-rc2-preview at:
+   ghcr.io/gtownbennett/tag-binance-relay:v2.8.1-rc4-manual-live
+4. Keep REPAIR_MODE=true and all four automatic-work flags false.
+5. Deploy the preview and verify /health reports 2.8.1-rc4.
+6. Build/install Android 0.6.1 RC4 only after the relay preview passes.
+
+Never merge to main or change production during this preview validation.

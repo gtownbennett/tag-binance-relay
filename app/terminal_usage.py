@@ -69,6 +69,10 @@ class UsageGovernor:
                 env_int("EXPENSIVE_ROUTE_DAILY_LIMIT", 250),
                 env_int("EXPENSIVE_ROUTE_MONTHLY_LIMIT", 5_000),
             ),
+            "manual_market_read": (
+                env_int("MANUAL_REFRESH_DAILY_LIMIT", 25),
+                env_int("MANUAL_REFRESH_MONTHLY_LIMIT", 500),
+            ),
             "database_query": (
                 env_int("DATABASE_DAILY_QUERY_LIMIT", 10_000),
                 env_int("DATABASE_MONTHLY_QUERY_LIMIT", 200_000),
@@ -189,4 +193,3 @@ def operating_status(service_version: str) -> dict[str, Any]:
         ),
         "usage": usage_governor.summary(),
     }
-

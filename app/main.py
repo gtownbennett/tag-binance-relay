@@ -68,7 +68,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.8.0-rc3"
+SERVICE_VERSION = "2.8.1-rc4"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -118,7 +118,10 @@ http_client: httpx.AsyncClient | None = None
 openai_client: httpx.AsyncClient | None = None
 snapshot_cache: dict[str, Any] = {"time": 0.0, "value": None}
 spot_cache: dict[str, Any] = {"time": 0.0, "value": None}
-terminal_response_cache: dict[str, Any] = {"time": 0.0, "value": None}
+terminal_response_cache: dict[str, dict[str, Any]] = {
+    "stored": {"time": 0.0, "value": None},
+    "manual": {"time": 0.0, "value": None},
+}
 cache_lock = asyncio.Lock()
 spot_cache_lock = asyncio.Lock()
 terminal_response_lock = asyncio.Lock()
@@ -1366,7 +1369,7 @@ async def liquidation_summary() -> dict[str, Any]:
     }
 
 
-async def collect_snapshot() -> dict[str, Any]:
+async def collect_snapshot(*, include_rest_state: bool = False) -> dict[str, Any]:
     errors: list[str] = []
 
     # These /futures/data endpoints are working from the current Render relay.
@@ -1396,6 +1399,21 @@ async def collect_snapshot() -> dict[str, Any]:
             {"symbol": SYMBOL, "period": "5m", "limit": 12},
         ),
     }
+    if include_rest_state:
+        # Repair mode keeps WebSockets off. An explicit manual refresh therefore
+        # obtains the missing point-in-time mark, ticker and book through three
+        # bounded public REST reads. Nothing here writes to the database or
+        # starts a background loop.
+        calls.update(
+            {
+                "premium": get_json("/fapi/v1/premiumIndex", {"symbol": SYMBOL}),
+                "ticker": get_json("/fapi/v1/ticker/24hr", {"symbol": SYMBOL}),
+                "depth": get_json(
+                    "/fapi/v1/depth",
+                    {"symbol": SYMBOL, "limit": 20},
+                ),
+            }
+        )
 
     names = list(calls.keys())
     results = await asyncio.gather(*calls.values(), return_exceptions=True)
@@ -1411,10 +1429,27 @@ async def collect_snapshot() -> dict[str, Any]:
     async with stream_lock:
         live = dict(stream_state)
 
-    mark_price = as_float(live.get("markPrice"))
-    index_price = as_float(live.get("indexPrice"))
+    premium = data.get("premium") if isinstance(data.get("premium"), dict) else {}
+    ticker = data.get("ticker") if isinstance(data.get("ticker"), dict) else {}
+    depth = data.get("depth") if isinstance(data.get("depth"), dict) else {}
+
+    def preferred_float(primary: Any, fallback: Any) -> float | None:
+        value = as_float(primary)
+        return value if value is not None else as_float(fallback)
+
+    def preferred_int(primary: Any, fallback: Any) -> int | None:
+        value = as_int(primary)
+        return value if value is not None else as_int(fallback)
+
+    mark_price = preferred_float(live.get("markPrice"), premium.get("markPrice"))
+    index_price = preferred_float(live.get("indexPrice"), premium.get("indexPrice"))
     funding_rate = as_float(live.get("fundingRate"))
-    next_funding_time = as_int(live.get("nextFundingTime"))
+    if funding_rate is None:
+        funding_rate = as_float(premium.get("lastFundingRate"))
+    next_funding_time = preferred_int(
+        live.get("nextFundingTime"),
+        premium.get("nextFundingTime")
+    )
 
     oi_history = data.get("oi_hist") if isinstance(data.get("oi_hist"), list) else []
     oi_history = [row for row in oi_history if isinstance(row, dict)]
@@ -1453,8 +1488,8 @@ async def collect_snapshot() -> dict[str, Any]:
     if mark_price is not None and index_price not in (None, 0):
         basis_bps = ((mark_price - index_price) / index_price) * 10_000.0
 
-    order_book = book_metrics(live.get("depth"), mark_price)
-    raw_depth = live.get("depth") if isinstance(live.get("depth"), dict) else {}
+    raw_depth = live.get("depth") if isinstance(live.get("depth"), dict) else depth
+    order_book = book_metrics(raw_depth, mark_price)
     def normalized_levels(rows: Any) -> list[list[float]]:
         output: list[list[float]] = []
         if not isinstance(rows, list):
@@ -1473,11 +1508,11 @@ async def collect_snapshot() -> dict[str, Any]:
     }
     liquidations = await liquidation_summary()
 
-    if not live.get("connected"):
+    if not live.get("connected") and not include_rest_state:
         errors.append("Binance market WebSocket is reconnecting.")
     if mark_price is None:
         errors.append("Mark-price stream has not produced a value yet.")
-    if live.get("depth") is None:
+    if not raw_depth:
         detail = live.get("depthLastError")
         errors.append(
             "Depth stream has not produced a value yet."
@@ -1555,10 +1590,32 @@ async def collect_snapshot() -> dict[str, Any]:
         "takerBuyVolumeContracts5m": as_float(taker.get("buyVol")),
         "takerSellVolumeContracts5m": as_float(taker.get("sellVol")),
         "depthLevels": depth_levels,
-        "futuresPriceChange24hPct": as_float(live.get("priceChange24hPct")),
-        "futuresVolume24hContracts": as_float(live.get("volume24hContracts")),
-        "futuresQuoteVolume24hUsd": as_float(live.get("quoteVolume24hUsd")),
-        "futuresTradeCount24h": as_int(live.get("tradeCount24h")),
+        "futuresPriceChange24hPct": (
+            preferred_float(
+                live.get("priceChange24hPct"),
+                ticker.get("priceChangePercent"),
+            )
+        ),
+        "futuresVolume24hContracts": (
+            preferred_float(
+                live.get("volume24hContracts"),
+                ticker.get("volume"),
+            )
+        ),
+        "futuresQuoteVolume24hUsd": (
+            preferred_float(
+                live.get("quoteVolume24hUsd"),
+                ticker.get("quoteVolume"),
+            )
+        ),
+        "futuresTradeCount24h": (
+            preferred_int(
+                live.get("tradeCount24h"),
+                ticker.get("count"),
+            )
+        ),
+        "sourceStatus": "manual-live" if include_rest_state else None,
+        "manualPointInTime": include_rest_state,
         **order_book,
         **liquidations,
         "errors": errors,
@@ -1592,7 +1649,7 @@ async def cached_snapshot(
             return cached
 
         usage_governor.cache(False)
-        value = await collect_snapshot()
+        value = await collect_snapshot(include_rest_state=allow_repair_override)
         snapshot_cache["time"] = time.monotonic()
         snapshot_cache["value"] = value
         return value
@@ -2504,12 +2561,22 @@ async def chad_analyze(
 # These are additive. All v2.5 Durable Intelligence routes above remain intact.
 # ---------------------------------------------------------------------------
 
-async def collect_terminal_market(force: bool = False) -> dict[str, Any]:
-    if REPAIR_MODE:
+async def collect_terminal_market(
+    force: bool = False,
+    *,
+    manual_live: bool = False,
+) -> dict[str, Any]:
+    if REPAIR_MODE and not manual_live:
         return terminal_addon.stored_market()
     binance, spot = await asyncio.gather(
-        cached_snapshot(force=force),
-        cached_spot(force=force),
+        cached_snapshot(
+            force=force,
+            allow_repair_override=REPAIR_MODE and manual_live,
+        ),
+        cached_spot(
+            force=force,
+            allow_repair_override=REPAIR_MODE and manual_live,
+        ),
     )
     return await terminal_addon.collect_market(
         binance,
@@ -2976,26 +3043,37 @@ async def terminal_share_report_endpoint(
 
 @app.get("/v1/tag/terminal")
 async def terminal_bundle_endpoint(
+    manual: bool = Query(False),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
+    cache_key = "manual" if REPAIR_MODE and manual else "stored"
+    cache_entry = terminal_response_cache[cache_key]
     now = time.monotonic()
-    cached = terminal_response_cache.get("value")
+    cached = cache_entry.get("value")
     if (
         cached is not None
-        and now - terminal_response_cache["time"] < TERMINAL_RESPONSE_CACHE_SECONDS
+        and now - cache_entry["time"] < TERMINAL_RESPONSE_CACHE_SECONDS
     ):
         usage_governor.cache(True)
         return cached
     async with terminal_response_lock:
+        cache_entry = terminal_response_cache[cache_key]
         now = time.monotonic()
-        cached = terminal_response_cache.get("value")
+        cached = cache_entry.get("value")
         if (
             cached is not None
-            and now - terminal_response_cache["time"] < TERMINAL_RESPONSE_CACHE_SECONDS
+            and now - cache_entry["time"] < TERMINAL_RESPONSE_CACHE_SECONDS
         ):
             usage_governor.cache(True)
             return cached
+        if REPAIR_MODE and manual:
+            allowed, reason = usage_governor.authorize("manual_market_read")
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Manual market-read circuit is open ({reason}).",
+                )
         allowed, reason = usage_governor.authorize("expensive_route")
         if not allowed and cached is not None:
             return cached
@@ -3005,15 +3083,64 @@ async def terminal_bundle_endpoint(
                 detail=f"Terminal response circuit is open ({reason}).",
             )
         usage_governor.cache(False)
-        market = await collect_terminal_market()
-        terminal = terminal_addon.build_terminal_payload(
-            store=False,
-            evaluate=False,
-        )
-        unified_predictions = await build_unified_forecast_ledger(
-            60,
-            grade=False,
-        )
+        market = await collect_terminal_market(manual_live=manual)
+        packet_warnings: list[str] = []
+        try:
+            terminal = terminal_addon.build_terminal_payload(
+                store=False,
+                evaluate=False,
+            )
+        except Exception as exc:
+            packet_warnings.append(
+                "Stored intelligence is temporarily unavailable; the core manual "
+                f"market snapshot is still valid ({type(exc).__name__})."
+            )
+            terminal = {
+                "generatedAt": utc_iso(),
+                "serverOiHistory": market.get("serverOiHistory") or {},
+                "heatmap": {},
+                "liquidations": {},
+                "chad": {
+                    "regime": "MANUAL MARKET SNAPSHOT",
+                    "summary": (
+                        "Core spot and leverage data loaded. Stored forecasting, "
+                        "alerts and history remain isolated while repair mode is active."
+                    ),
+                    "recommendedPosture": "WAIT FOR COMPLETE CONFIRMATION",
+                    "dataWarnings": list(packet_warnings),
+                },
+                "chadHistory": [],
+                "predictions": {},
+                "alerts": [],
+                "alertTimeline": {},
+                "paper": {},
+                "social": {},
+            }
+        try:
+            unified_predictions = await build_unified_forecast_ledger(
+                60,
+                grade=False,
+            )
+        except Exception as exc:
+            packet_warnings.append(
+                "Stored forecast ledger is temporarily unavailable "
+                f"({type(exc).__name__})."
+            )
+            unified_predictions = {}
+        if packet_warnings and isinstance(terminal.get("chad"), dict):
+            chad_warnings = terminal["chad"].get("dataWarnings")
+            terminal["chad"]["dataWarnings"] = list(
+                dict.fromkeys(
+                    [
+                        *(
+                            chad_warnings
+                            if isinstance(chad_warnings, list)
+                            else []
+                        ),
+                        *packet_warnings,
+                    ]
+                )
+            )
         result = {
             "generatedAt": terminal.get("generatedAt"),
             "spot": market.get("spot"),
@@ -3022,9 +3149,14 @@ async def terminal_bundle_endpoint(
             **terminal,
             "unifiedPredictions": unified_predictions,
             "operatingStatus": operating_status(SERVICE_VERSION),
+            "manualLiveRead": bool(REPAIR_MODE and manual),
+            "readOnly": True,
+            "databaseWrites": 0,
+            "automaticWorkStarted": False,
+            "packetWarnings": packet_warnings,
         }
-        terminal_response_cache["time"] = time.monotonic()
-        terminal_response_cache["value"] = result
+        cache_entry["time"] = time.monotonic()
+        cache_entry["value"] = result
         return result
 
 

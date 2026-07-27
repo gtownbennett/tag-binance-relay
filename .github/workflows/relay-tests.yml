@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - v2.8.0-rc3-cost-safe
+      - v2.8.1-rc4-manual-live
   pull_request:
   workflow_dispatch:
 

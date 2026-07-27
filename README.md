@@ -1,6 +1,6 @@
-# TAG Terminal Relay 2.8.0 RC3 — Cost-Safe Repair Release
+# TAG Terminal Relay 2.8.1 RC4 — Bounded Manual-Live Repair
 
-This release contains the RC2 paper/social system and an emergency repair mode designed to stop uncontrolled Neon, Render, and OpenAI usage.
+This release retains RC3 cost containment and repairs the blank first-run packet seen when the preview database has no stored market snapshot.
 
 ## Safe defaults
 
@@ -17,7 +17,11 @@ The Render blueprint sets the same values explicitly. Provider spending limits r
 ## Cost repairs
 
 - `/health` uses memory only; it never queries Neon or pings an exchange.
-- `GET /v1/tag/terminal` is read-only, bounded, cached for five minutes in repair mode, and coalesces concurrent refreshes.
+- `GET /v1/tag/terminal?manual=true` performs one user-requested public market read, is cached for five minutes, and coalesces concurrent refreshes.
+- Manual reads never write snapshots, start a collector, call OpenAI, grade ledgers, poll social sources, or send notifications.
+- Manual reads have separate daily/monthly circuit limits.
+- `GET /v1/tag/terminal` without `manual=true` remains stored-evidence-only and cannot contact exchanges.
+- Core spot/leverage data still returns if an optional stored-intelligence table is unavailable.
 - GET/read routes no longer create Chad reports, forecasts, grades, alerts, paper accounts, or social-grade writes.
 - Client snapshot ingestion, paper/social mutations, history collection, backfills, collectors, WebSockets, CMC polling, grading, and all OpenAI are blocked in repair mode.
 - After repair mode is deliberately disabled, an OpenAI call still requires an authenticated explicit request with `allowPaidCall=true`; results are cached by stable evidence hash.
@@ -45,6 +49,6 @@ REPAIR_MODE=true \
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Expected: 19 tests pass.
+Expected: 23 tests pass.
 
-Read `00-START-HERE-v2.8.0-RC3.txt` and `VALIDATION-v2.8.0-RC3.txt`. Older release files are history only.
+Read `00-START-HERE-v2.8.1-RC4.txt` and `VALIDATION-v2.8.1-RC4.txt`. Older release files are history only.

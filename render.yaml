@@ -17,3 +17,7 @@ services:
         value: "false"
       - key: PUSH_ENABLED
         value: "false"
+      - key: MANUAL_REFRESH_DAILY_LIMIT
+        value: "25"
+      - key: MANUAL_REFRESH_MONTHLY_LIMIT
+        value: "500"

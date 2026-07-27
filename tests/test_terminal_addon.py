@@ -4,7 +4,7 @@ import json
 import time
 import unittest
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 from sqlalchemy import delete, func, select
@@ -300,6 +300,176 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException) as caught:
                 await call
             self.assertEqual(caught.exception.status_code, 423)
+
+    async def test_repair_stored_read_never_calls_live_sources(self) -> None:
+        stored = {
+            "spot": {},
+            "futures": {},
+            "readOnlyStoredEvidence": True,
+        }
+        with (
+            patch.object(terminal_addon, "stored_market", return_value=stored),
+            patch.object(
+                main,
+                "cached_snapshot",
+                new=AsyncMock(side_effect=AssertionError("futures source called")),
+            ),
+            patch.object(
+                main,
+                "cached_spot",
+                new=AsyncMock(side_effect=AssertionError("spot source called")),
+            ),
+        ):
+            result = await main.collect_terminal_market()
+        self.assertIs(result, stored)
+
+    async def test_manual_market_read_is_bounded_and_never_persists(self) -> None:
+        binance = {"markPrice": 0.001, "sourceStatus": "manual-live"}
+        spot = {"priceUsd": 0.001, "available": True}
+        market = {
+            "spot": {"priceUsd": 0.001},
+            "futures": {"activeExchangeCount": 5},
+            "binance": binance,
+        }
+        collect = AsyncMock(return_value=market)
+        with (
+            patch.object(main, "cached_snapshot", new=AsyncMock(return_value=binance)) as futures_read,
+            patch.object(main, "cached_spot", new=AsyncMock(return_value=spot)) as spot_read,
+            patch.object(terminal_addon, "collect_market", new=collect),
+        ):
+            result = await main.collect_terminal_market(manual_live=True)
+
+        self.assertEqual(result, market)
+        futures_read.assert_awaited_once_with(
+            force=False,
+            allow_repair_override=True,
+        )
+        spot_read.assert_awaited_once_with(
+            force=False,
+            allow_repair_override=True,
+        )
+        collect.assert_awaited_once_with(
+            binance,
+            spot,
+            force=False,
+            persist=False,
+        )
+
+    async def test_manual_binance_snapshot_uses_point_in_time_rest_state(self) -> None:
+        async def public_response(path: str, params: dict | None = None) -> object:
+            if path.endswith("openInterestHist"):
+                return [
+                    {
+                        "timestamp": 1_800_000_000_000,
+                        "sumOpenInterest": "1000000000",
+                        "sumOpenInterestValue": "1000000",
+                    }
+                ]
+            if path.endswith("premiumIndex"):
+                return {
+                    "markPrice": "0.001",
+                    "indexPrice": "0.000999",
+                    "lastFundingRate": "0.0001",
+                    "nextFundingTime": "1800003600000",
+                }
+            if path.endswith("ticker/24hr"):
+                return {
+                    "priceChangePercent": "2.5",
+                    "volume": "100000000",
+                    "quoteVolume": "100000",
+                    "count": 500,
+                }
+            if path.endswith("/depth"):
+                return {
+                    "bids": [["0.000995", "1000000"]],
+                    "asks": [["0.001005", "900000"]],
+                }
+            if path.endswith("takerlongshortRatio"):
+                return [{"buyVol": "600", "sellVol": "400", "buySellRatio": "1.5"}]
+            return [{"longShortRatio": "1.0", "longAccount": "0.5", "shortAccount": "0.5"}]
+
+        empty_stream = {
+            "connected": False,
+            "depthConnected": False,
+            "depth": None,
+        }
+        with (
+            patch.dict(main.stream_state, empty_stream, clear=True),
+            patch.object(main, "get_json", new=AsyncMock(side_effect=public_response)),
+            patch.object(
+                main,
+                "rolling_taker_1h",
+                new=AsyncMock(
+                    return_value={
+                        "quality": "warming-up",
+                        "buyUsd": None,
+                        "sellUsd": None,
+                        "ratio": None,
+                        "coverageSeconds": 0,
+                        "windowStartMs": None,
+                        "windowEndMs": None,
+                    }
+                ),
+            ),
+            patch.object(
+                main,
+                "liquidation_summary",
+                new=AsyncMock(
+                    return_value={
+                        "longLiquidation1hUsd": 0.0,
+                        "shortLiquidation1hUsd": 0.0,
+                    }
+                ),
+            ),
+        ):
+            snapshot = await main.collect_snapshot(include_rest_state=True)
+
+        self.assertEqual(snapshot["markPrice"], 0.001)
+        self.assertEqual(snapshot["indexPrice"], 0.000999)
+        self.assertEqual(snapshot["fundingRate"], 0.0001)
+        self.assertEqual(snapshot["futuresPriceChange24hPct"], 2.5)
+        self.assertGreater(snapshot["bidDepthUsdWithin1Pct"], 0)
+        self.assertGreater(snapshot["askDepthUsdWithin1Pct"], 0)
+        self.assertTrue(snapshot["manualPointInTime"])
+        self.assertEqual(snapshot["sourceStatus"], "manual-live")
+        self.assertFalse(snapshot["marketStreamConnected"])
+
+    async def test_manual_terminal_packet_keeps_core_market_when_optional_history_fails(self) -> None:
+        for entry in main.terminal_response_cache.values():
+            entry["time"] = 0.0
+            entry["value"] = None
+        market = {
+            "spot": {"priceUsd": 0.001, "marketCap": 108_404_572.59},
+            "futures": {"activeExchangeCount": 4, "requestedExchangeCount": 5},
+            "binance": {"markPrice": 0.001},
+            "serverOiHistory": {},
+        }
+        with (
+            patch.object(main, "collect_terminal_market", new=AsyncMock(return_value=market)),
+            patch.object(
+                terminal_addon,
+                "build_terminal_payload",
+                side_effect=RuntimeError("old optional schema"),
+            ),
+            patch.object(
+                main,
+                "build_unified_forecast_ledger",
+                new=AsyncMock(side_effect=RuntimeError("old ledger schema")),
+            ),
+        ):
+            result = await main.terminal_bundle_endpoint(
+                manual=True,
+                x_relay_key=None,
+            )
+
+        self.assertEqual(result["spot"]["priceUsd"], 0.001)
+        self.assertEqual(result["futures"]["activeExchangeCount"], 4)
+        self.assertEqual(result["chad"]["regime"], "MANUAL MARKET SNAPSHOT")
+        self.assertTrue(result["manualLiveRead"])
+        self.assertTrue(result["readOnly"])
+        self.assertEqual(result["databaseWrites"], 0)
+        self.assertFalse(result["automaticWorkStarted"])
+        self.assertEqual(len(result["packetWarnings"]), 2)
 
     def test_binance_normalisation(self) -> None:
         service = MultiExchangeService()
