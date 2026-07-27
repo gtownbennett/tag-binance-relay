@@ -1,6 +1,6 @@
-# TAG Terminal Relay 2.8.2 RC5 — Fast Manual-Live Repair
+# TAG Terminal Relay 2.8.3 RC6 — Bounded Neon Intelligence
 
-This release retains RC3/RC4 cost containment and fixes the RC4 phone timeout. Public market sources now run concurrently, each non-Binance venue has a 12-second overall deadline, and the repair-mode manual packet returns without waiting for Neon.
+This release keeps RC5's fast live market packet and restores a compact, read-only slice of the existing Neon intelligence. Market and Neon work start concurrently, the database slice has an eight-second wait limit inside a 24-second total response budget, and a slow database can never discard an otherwise valid live packet.
 
 ## Safe defaults
 
@@ -19,9 +19,14 @@ The Render blueprint sets the same values explicitly. Provider spending limits r
 - `/health` uses memory only; it never queries Neon or pings an exchange.
 - `GET /v1/tag/terminal?manual=true` performs one user-requested public market read, is cached for five minutes, and coalesces concurrent refreshes.
 - Binance, DEX Screener, Bitget, MEXC, Gate, and BingX are requested in one concurrent window instead of two sequential phases.
-- The repair-mode manual packet does not query Neon; stored history and intelligence are deliberately deferred until a separate bounded history path is validated.
+- The manual packet can perform one separately governed, read-only Neon intelligence slice with at most twelve fixed `SELECT` statements.
+- Neon returns only selected Chad JSON fields rather than complete stored report blobs. On the protected production branch, the newest eight report fields measured 6,627 bytes instead of 132,715 bytes for the full blobs.
+- Stored results are capped at eight Chad history entries, 42 forecast records, 12 alerts, 80 alert transitions, 30 paper trades, 60 paper-equity points, 12 social callers, and 24 social calls.
+- The compact intelligence payload has a 240,000-byte ceiling and never selects snapshot-table payload blobs.
+- The Neon read starts concurrently with public market collection, waits no more than eight seconds, and cannot push the complete terminal route beyond its 24-second response budget.
+- If Neon is unavailable or slow, the already-validated RC5 live market packet still returns.
 - Manual reads never write snapshots, start a collector, call OpenAI, grade ledgers, poll social sources, or send notifications.
-- Manual reads have separate daily/monthly circuit limits.
+- Manual market and bounded-intelligence reads have separate daily/monthly circuit limits.
 - `GET /v1/tag/terminal` without `manual=true` remains stored-evidence-only and cannot contact exchanges.
 - Core spot/leverage data still returns if an optional stored-intelligence table is unavailable.
 - GET/read routes no longer create Chad reports, forecasts, grades, alerts, paper accounts, or social-grade writes.
@@ -29,6 +34,15 @@ The Render blueprint sets the same values explicitly. Provider spending limits r
 - After repair mode is deliberately disabled, an OpenAI call still requires an authenticated explicit request with `allowPaidCall=true`; results are cached by stable evidence hash.
 - Database reads use narrow columns, bounded windows, composite indexes, and a two-connection PostgreSQL pool.
 - Daily/monthly in-process circuit breakers and usage/cache telemetry are exposed through `operatingStatus`.
+
+## Restored read-only intelligence
+
+- Chad history is restored as timestamped archive entries.
+- Deterministic forecast records, grades, calibration counts, and unified performance are restored without running a grader.
+- Alerts and alert-stage history are restored with visible `Stored` labels so old states are not presented as newly evaluated alerts.
+- Paper-trading history and a bounded equity curve are restored without creating an account or changing a trade.
+- Verified social callers and calls are restored without polling or grading.
+- The current Chad card shows live market data quality and a deterministic specialist evidence summary, while clearly marking new analysis and Future Paths as deferred.
 
 ## Accuracy repairs
 
@@ -51,6 +65,6 @@ REPAIR_MODE=true \
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Expected: 25 tests pass.
+Expected: 30 tests pass.
 
-Read `00-START-HERE-v2.8.2-RC5.txt` and `VALIDATION-v2.8.2-RC5.txt`. Older release files are history only.
+Read `00-START-HERE-v2.8.3-RC6.txt` and `VALIDATION-v2.8.3-RC6.txt`. Older release files are history only.

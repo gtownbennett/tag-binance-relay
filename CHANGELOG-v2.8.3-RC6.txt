@@ -1,0 +1,14 @@
+TAG RELAY 2.8.3 RC6
+
+- Keeps RC5's concurrent six-source manual market packet and Android compatibility.
+- Restores compact read-only Neon history, forecasts, grades, alerts, paper records and social records.
+- Starts market and Neon work concurrently.
+- Limits the Neon slice to twelve fixed SELECT statements and a separate 25/day, 500/month circuit.
+- Uses database-side JSON extraction instead of transferring complete Chad report blobs.
+- Caps every returned record list and the compact payload at 240,000 bytes.
+- Waits at most eight seconds for Neon inside a 24-second total route budget.
+- Falls back to the valid RC5 market packet when Neon is slow or unavailable.
+- Adds visible Stored labels so archived alert state is never misrepresented as a new evaluation.
+- Keeps collectors, database writes, grading, OpenAI, backfills, polling and notifications off.
+- Reuses the installed Android 0.6.1 RC4 app; no APK change is required for this relay stage.
+- Adds five bounded-intelligence regressions; total relay suite is 30 tests.

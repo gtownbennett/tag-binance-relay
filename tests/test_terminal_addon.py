@@ -578,14 +578,17 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["spot"]["priceUsd"], 0.001)
         self.assertEqual(result["futures"]["activeExchangeCount"], 4)
-        self.assertEqual(result["chad"]["regime"], "MANUAL MARKET SNAPSHOT")
+        self.assertEqual(
+            result["chad"]["regime"],
+            "MANUAL LIVE SNAPSHOT — ANALYSIS DEFERRED",
+        )
         self.assertTrue(result["manualLiveRead"])
         self.assertTrue(result["readOnly"])
         self.assertEqual(result["databaseWrites"], 0)
         self.assertFalse(result["automaticWorkStarted"])
-        self.assertEqual(len(result["packetWarnings"]), 1)
-        self.assertIn("without database transfer", result["packetWarnings"][0])
-        self.assertEqual(result["chad"]["dataWarnings"], [])
+        self.assertEqual(result["packetWarnings"], [])
+        self.assertGreater(result["chad"]["dataQuality"], 0)
+        self.assertTrue(result["chad"]["specialistConsensus"])
 
     def test_binance_normalisation(self) -> None:
         service = MultiExchangeService()

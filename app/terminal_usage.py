@@ -73,6 +73,10 @@ class UsageGovernor:
                 env_int("MANUAL_REFRESH_DAILY_LIMIT", 25),
                 env_int("MANUAL_REFRESH_MONTHLY_LIMIT", 500),
             ),
+            "bounded_intelligence_read": (
+                env_int("INTELLIGENCE_READ_DAILY_LIMIT", 25),
+                env_int("INTELLIGENCE_READ_MONTHLY_LIMIT", 500),
+            ),
             "database_query": (
                 env_int("DATABASE_DAILY_QUERY_LIMIT", 10_000),
                 env_int("DATABASE_MONTHLY_QUERY_LIMIT", 200_000),

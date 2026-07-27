@@ -30,6 +30,10 @@ from app.terminal_addon import (
     terminal_addon,
 )
 from app.terminal_intelligence import insert_test_alert
+from app.terminal_compact import (
+    build_compact_terminal_payload,
+    merge_compact_intelligence,
+)
 from app.terminal_multi_exchange import multi_exchange_service
 from app.terminal_database import (
     OpenAIAnalysisCacheRow,
@@ -69,7 +73,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.8.2-rc5"
+SERVICE_VERSION = "2.8.3-rc6"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -81,6 +85,14 @@ CACHE_SECONDS = max(5, int(os.getenv("CACHE_SECONDS", "15")))
 TERMINAL_RESPONSE_CACHE_SECONDS = max(
     60,
     int(os.getenv("TERMINAL_RESPONSE_CACHE_SECONDS", "300" if REPAIR_MODE else "60")),
+)
+INTELLIGENCE_READ_TIMEOUT_SECONDS = min(
+    12,
+    max(2, int(os.getenv("INTELLIGENCE_READ_TIMEOUT_SECONDS", "8"))),
+)
+MANUAL_RESPONSE_BUDGET_SECONDS = min(
+    26,
+    max(15, int(os.getenv("MANUAL_RESPONSE_BUDGET_SECONDS", "24"))),
 )
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -3099,36 +3111,91 @@ async def terminal_bundle_endpoint(
                 detail=f"Terminal response circuit is open ({reason}).",
             )
         usage_governor.cache(False)
-        market = await collect_terminal_market(manual_live=manual)
+        compact_task: asyncio.Task[dict[str, Any]] | None = None
+        compact_block_reason: str | None = None
+        manual_request_started = time.monotonic()
+        if REPAIR_MODE and manual:
+            compact_allowed, compact_block_reason = usage_governor.authorize(
+                "bounded_intelligence_read"
+            )
+            if compact_allowed:
+                compact_task = asyncio.create_task(
+                    asyncio.to_thread(build_compact_terminal_payload),
+                    name="bounded-neon-intelligence",
+                )
+        try:
+            market = await collect_terminal_market(manual_live=manual)
+        except Exception:
+            if compact_task is not None and not compact_task.done():
+                compact_task.cancel()
+            raise
         packet_warnings: list[str] = []
         if REPAIR_MODE and manual:
-            packet_warnings.append(
-                "Stored Neon intelligence is deferred in repair mode so the "
-                "core manual market snapshot can return quickly and without "
-                "database transfer."
-            )
-            terminal = {
-                "generatedAt": utc_iso(),
-                "serverOiHistory": market.get("serverOiHistory") or {},
-                "heatmap": {},
-                "liquidations": {},
-                "chad": {
-                    "regime": "MANUAL MARKET SNAPSHOT",
-                    "summary": (
-                        "Core spot and leverage data loaded. Stored forecasting, "
-                        "alerts and history remain isolated while repair mode is active."
-                    ),
-                    "recommendedPosture": "WAIT FOR COMPLETE CONFIRMATION",
-                    "dataWarnings": [],
-                },
-                "chadHistory": [],
-                "predictions": {},
-                "alerts": [],
-                "alertTimeline": {},
-                "paper": {},
-                "social": {},
-            }
-            unified_predictions: dict[str, Any] = {}
+            compact_payload: dict[str, Any] | None = None
+            if compact_task is not None:
+                try:
+                    if compact_task.done():
+                        compact_payload = compact_task.result()
+                    else:
+                        remaining = (
+                            MANUAL_RESPONSE_BUDGET_SECONDS
+                            - (time.monotonic() - manual_request_started)
+                        )
+                        if remaining <= 0:
+                            compact_task.cancel()
+                            raise TimeoutError
+                        compact_payload = await asyncio.wait_for(
+                            compact_task,
+                            timeout=min(
+                                INTELLIGENCE_READ_TIMEOUT_SECONDS,
+                                remaining,
+                            ),
+                        )
+                except TimeoutError:
+                    packet_warnings.append(
+                        "The bounded read-only intelligence slice exceeded its "
+                        "time limit; live market data remains valid."
+                    )
+                except Exception as exc:
+                    packet_warnings.append(
+                        "The bounded read-only intelligence slice is temporarily "
+                        f"unavailable ({type(exc).__name__}); live market data remains valid."
+                    )
+            else:
+                packet_warnings.append(
+                    "The bounded read-only intelligence circuit is open "
+                    f"({compact_block_reason or 'limit'}); live market data remains valid."
+                )
+            if compact_payload is not None:
+                terminal = merge_compact_intelligence(compact_payload, market)
+                unified_predictions = (
+                    terminal.pop("unifiedPredictions")
+                    if isinstance(terminal.get("unifiedPredictions"), dict)
+                    else {}
+                )
+            else:
+                terminal = {
+                    "generatedAt": utc_iso(),
+                    "serverOiHistory": market.get("serverOiHistory") or {},
+                    "heatmap": {},
+                    "liquidations": {},
+                    "chad": {
+                        "regime": "MANUAL MARKET SNAPSHOT",
+                        "summary": (
+                            "Core spot and leverage data loaded. Stored forecasting, "
+                            "alerts and history were deferred by the bounded read circuit."
+                        ),
+                        "recommendedPosture": "WAIT FOR COMPLETE CONFIRMATION",
+                        "dataWarnings": list(packet_warnings),
+                    },
+                    "chadHistory": [],
+                    "predictions": {},
+                    "alerts": [],
+                    "alertTimeline": {},
+                    "paper": {},
+                    "social": {},
+                }
+                unified_predictions = {}
         else:
             try:
                 terminal = terminal_addon.build_terminal_payload(

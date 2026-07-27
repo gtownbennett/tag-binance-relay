@@ -1,0 +1,25 @@
+TAG RELAY 2.8.3 RC6 — START HERE
+
+Purpose
+- Keep RC5's working live TAG market packet.
+- Restore a small read-only slice of existing Neon intelligence.
+- Prevent wide-row overfetch, duplicate reads, route timeouts and database writes.
+
+Safe release order
+1. Publish branch v2.8.3-rc6-bounded-neon from the isolated RC6 package.
+2. Wait for all 30 relay tests and the image build to pass.
+3. Suspend only tag-binance-relay-rc2-preview.
+4. Point only that preview at:
+   ghcr.io/gtownbennett/tag-binance-relay:v2.8.3-rc6-bounded-neon
+5. Keep REPAIR_MODE=true and all four automatic-work flags false.
+6. Keep the existing 25/day and 500/month manual limits.
+7. No additional environment variables are required; RC6 defaults are cost-safe.
+8. Deploy the preview and verify /health reports 2.8.3-rc6.
+9. Reuse the installed Android 0.6.1 RC4 app for one controlled refresh.
+
+Expected phone result
+- Live DEX and five-exchange market data remain available.
+- Chad history, forecasts, grades, stored alerts, paper history and social history return.
+- New Chad probability paths, grading, alert evaluation and automatic work remain deferred.
+
+Never merge to main or change production during this preview validation.

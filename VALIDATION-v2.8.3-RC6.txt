@@ -1,0 +1,26 @@
+TAG RELAY 2.8.3 RC6 — VALIDATION
+
+[ ] Relay unit suite reports 30/30 passed.
+[ ] Python compilation succeeds.
+[ ] Git diff whitespace check succeeds.
+[ ] GitHub image is v2.8.3-rc6-bounded-neon.
+[ ] /health reports version 2.8.3-rc6 and side effects none.
+[ ] REPAIR_MODE is true.
+[ ] LIVE_COLLECTORS_ENABLED is false.
+[ ] BACKFILL_ENABLED is false.
+[ ] OPENAI_AUTOMATIC_ENABLED is false.
+[ ] PUSH_ENABLED is false.
+[ ] Stored-only terminal read contacts no external source.
+[ ] One manual=true call returns inside Android's 30-second deadline.
+[ ] Market and bounded Neon reads start concurrently.
+[ ] The Neon slice executes only fixed SELECT statements and no mutations.
+[ ] The compact response is at or below 240,000 bytes.
+[ ] Chad history is limited to 8 rows and forecasts to 42 rows.
+[ ] Alerts are limited to 12 and alert transitions to 80.
+[ ] Paper trades/equity are limited to 30/60.
+[ ] Social callers/calls are limited to 12/24.
+[ ] A slow Neon read falls back to the valid live market packet.
+[ ] A repeated manual=true call inside five minutes is a cache hit.
+[ ] Manual packet reports databaseWrites=0 and automaticWorkStarted=false.
+[ ] Stored alerts are visibly labelled and not presented as newly evaluated.
+[ ] Neon transfer remains flat between user refreshes.
