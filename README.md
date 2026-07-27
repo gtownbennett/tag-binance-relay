@@ -1,6 +1,6 @@
-# TAG Terminal Relay 2.8.1 RC4 — Bounded Manual-Live Repair
+# TAG Terminal Relay 2.8.2 RC5 — Fast Manual-Live Repair
 
-This release retains RC3 cost containment and repairs the blank first-run packet seen when the preview database has no stored market snapshot.
+This release retains RC3/RC4 cost containment and fixes the RC4 phone timeout. Public market sources now run concurrently, each non-Binance venue has a 12-second overall deadline, and the repair-mode manual packet returns without waiting for Neon.
 
 ## Safe defaults
 
@@ -18,6 +18,8 @@ The Render blueprint sets the same values explicitly. Provider spending limits r
 
 - `/health` uses memory only; it never queries Neon or pings an exchange.
 - `GET /v1/tag/terminal?manual=true` performs one user-requested public market read, is cached for five minutes, and coalesces concurrent refreshes.
+- Binance, DEX Screener, Bitget, MEXC, Gate, and BingX are requested in one concurrent window instead of two sequential phases.
+- The repair-mode manual packet does not query Neon; stored history and intelligence are deliberately deferred until a separate bounded history path is validated.
 - Manual reads never write snapshots, start a collector, call OpenAI, grade ledgers, poll social sources, or send notifications.
 - Manual reads have separate daily/monthly circuit limits.
 - `GET /v1/tag/terminal` without `manual=true` remains stored-evidence-only and cannot contact exchanges.
@@ -49,6 +51,6 @@ REPAIR_MODE=true \
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Expected: 23 tests pass.
+Expected: 25 tests pass.
 
-Read `00-START-HERE-v2.8.1-RC4.txt` and `VALIDATION-v2.8.1-RC4.txt`. Older release files are history only.
+Read `00-START-HERE-v2.8.2-RC5.txt` and `VALIDATION-v2.8.2-RC5.txt`. Older release files are history only.

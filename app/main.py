@@ -30,6 +30,7 @@ from app.terminal_addon import (
     terminal_addon,
 )
 from app.terminal_intelligence import insert_test_alert
+from app.terminal_multi_exchange import multi_exchange_service
 from app.terminal_database import (
     OpenAIAnalysisCacheRow,
     json_dumps as terminal_json_dumps,
@@ -68,7 +69,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.8.1-rc4"
+SERVICE_VERSION = "2.8.2-rc5"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -2568,7 +2569,14 @@ async def collect_terminal_market(
 ) -> dict[str, Any]:
     if REPAIR_MODE and not manual_live:
         return terminal_addon.stored_market()
-    binance, spot = await asyncio.gather(
+    independent_task: asyncio.Task[list[Any]] | None = None
+    if REPAIR_MODE and manual_live:
+        await terminal_addon.ensure_external_clients()
+        independent_task = asyncio.create_task(
+            multi_exchange_service.collect_independent(),
+            name="manual-independent-exchanges",
+        )
+    source_reads: list[Any] = [
         cached_snapshot(
             force=force,
             allow_repair_override=REPAIR_MODE and manual_live,
@@ -2577,12 +2585,20 @@ async def collect_terminal_market(
             force=force,
             allow_repair_override=REPAIR_MODE and manual_live,
         ),
-    )
+    ]
+    if independent_task is not None:
+        source_reads.append(independent_task)
+    source_results = await asyncio.gather(*source_reads)
+    binance = source_results[0]
+    spot = source_results[1]
+    independent_results = source_results[2] if len(source_results) > 2 else None
     return await terminal_addon.collect_market(
         binance,
         spot,
         force=force,
         persist=False,
+        independent_results=independent_results,
+        include_server_history=not (REPAIR_MODE and manual_live),
     )
 
 
@@ -3085,15 +3101,11 @@ async def terminal_bundle_endpoint(
         usage_governor.cache(False)
         market = await collect_terminal_market(manual_live=manual)
         packet_warnings: list[str] = []
-        try:
-            terminal = terminal_addon.build_terminal_payload(
-                store=False,
-                evaluate=False,
-            )
-        except Exception as exc:
+        if REPAIR_MODE and manual:
             packet_warnings.append(
-                "Stored intelligence is temporarily unavailable; the core manual "
-                f"market snapshot is still valid ({type(exc).__name__})."
+                "Stored Neon intelligence is deferred in repair mode so the "
+                "core manual market snapshot can return quickly and without "
+                "database transfer."
             )
             terminal = {
                 "generatedAt": utc_iso(),
@@ -3107,7 +3119,7 @@ async def terminal_bundle_endpoint(
                         "alerts and history remain isolated while repair mode is active."
                     ),
                     "recommendedPosture": "WAIT FOR COMPLETE CONFIRMATION",
-                    "dataWarnings": list(packet_warnings),
+                    "dataWarnings": [],
                 },
                 "chadHistory": [],
                 "predictions": {},
@@ -3116,18 +3128,56 @@ async def terminal_bundle_endpoint(
                 "paper": {},
                 "social": {},
             }
-        try:
-            unified_predictions = await build_unified_forecast_ledger(
-                60,
-                grade=False,
-            )
-        except Exception as exc:
-            packet_warnings.append(
-                "Stored forecast ledger is temporarily unavailable "
-                f"({type(exc).__name__})."
-            )
-            unified_predictions = {}
-        if packet_warnings and isinstance(terminal.get("chad"), dict):
+            unified_predictions: dict[str, Any] = {}
+        else:
+            try:
+                terminal = terminal_addon.build_terminal_payload(
+                    store=False,
+                    evaluate=False,
+                )
+            except Exception as exc:
+                packet_warnings.append(
+                    "Stored intelligence is temporarily unavailable; the core "
+                    "market snapshot is still valid "
+                    f"({type(exc).__name__})."
+                )
+                terminal = {
+                    "generatedAt": utc_iso(),
+                    "serverOiHistory": market.get("serverOiHistory") or {},
+                    "heatmap": {},
+                    "liquidations": {},
+                    "chad": {
+                        "regime": "MANUAL MARKET SNAPSHOT",
+                        "summary": (
+                            "Core spot and leverage data loaded. Stored forecasting, "
+                            "alerts and history remain isolated while repair mode is active."
+                        ),
+                        "recommendedPosture": "WAIT FOR COMPLETE CONFIRMATION",
+                        "dataWarnings": list(packet_warnings),
+                    },
+                    "chadHistory": [],
+                    "predictions": {},
+                    "alerts": [],
+                    "alertTimeline": {},
+                    "paper": {},
+                    "social": {},
+                }
+            try:
+                unified_predictions = await build_unified_forecast_ledger(
+                    60,
+                    grade=False,
+                )
+            except Exception as exc:
+                packet_warnings.append(
+                    "Stored forecast ledger is temporarily unavailable "
+                    f"({type(exc).__name__})."
+                )
+                unified_predictions = {}
+        if (
+            packet_warnings
+            and not (REPAIR_MODE and manual)
+            and isinstance(terminal.get("chad"), dict)
+        ):
             chad_warnings = terminal["chad"].get("dataWarnings")
             terminal["chad"]["dataWarnings"] = list(
                 dict.fromkeys(

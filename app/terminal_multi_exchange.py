@@ -457,9 +457,41 @@ class MultiExchangeService:
                 payload["sourceStatus"] = requested_status
         return payload
 
-    async def collect(self, binance_payload: dict[str, Any]) -> dict[str, Any]:
-        tasks = [self.bitget(), self.mexc(), self.gate(), self.bingx()]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    async def collect_independent(
+        self,
+        *,
+        timeout_seconds: float = 12.0,
+    ) -> list[Any]:
+        """Read the four non-Binance venues within one shared time window.
+
+        A manual repair-mode packet must finish before the Android client's
+        30-second deadline. Each venue may make several requests, so bounding
+        the entire venue coroutine prevents one slow host from holding the
+        otherwise usable packet open.
+        """
+
+        async def bounded(coroutine: Any) -> Any:
+            return await asyncio.wait_for(coroutine, timeout=timeout_seconds)
+
+        tasks = [
+            bounded(self.bitget()),
+            bounded(self.mexc()),
+            bounded(self.gate()),
+            bounded(self.bingx()),
+        ]
+        return list(await asyncio.gather(*tasks, return_exceptions=True))
+
+    async def collect(
+        self,
+        binance_payload: dict[str, Any],
+        *,
+        independent_results: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        results = (
+            independent_results
+            if independent_results is not None
+            else await self.collect_independent()
+        )
         exchanges: list[dict[str, Any]] = []
         errors: list[str] = []
         names = ["Bitget", "MEXC", "Gate", "BingX"]

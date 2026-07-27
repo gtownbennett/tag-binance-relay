@@ -173,6 +173,8 @@ class TerminalAddon:
         *,
         force: bool = False,
         persist: bool = False,
+        independent_results: list[Any] | None = None,
+        include_server_history: bool = True,
     ) -> dict[str, Any]:
         now = time.monotonic()
         cached = self.market_cache.get("value")
@@ -203,12 +205,26 @@ class TerminalAddon:
                 "recordedAt": spot.get("generatedAt"),
             }
             await self.ensure_external_clients()
-            futures = await multi_exchange_service.collect(binance)
+            futures = await multi_exchange_service.collect(
+                binance,
+                independent_results=independent_results,
+            )
             if persist:
                 self.persist_spot(spot_compat)
                 self.persist_binance(binance)
                 multi_exchange_service.persist(futures, spot_compat)
-            history = server_oi_history()
+            history = (
+                server_oi_history()
+                if include_server_history
+                else {
+                    "status": (
+                        "Stored OI history is deferred so the bounded manual "
+                        "market packet can return without querying Neon."
+                    ),
+                    "readOnly": True,
+                    "deferred": True,
+                }
+            )
             futures = {
                 **futures,
                 "oiChange5m": history.get("change5mPct"),

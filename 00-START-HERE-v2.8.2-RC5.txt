@@ -1,0 +1,18 @@
+TAG RELAY 2.8.2 RC5 — START HERE
+
+Purpose
+- Fix the RC4 Android 30-second timeout.
+- Return one fast live market packet without querying or writing Neon.
+- Keep every automatic, paid and mutating path off.
+
+Safe release order
+1. Publish branch v2.8.2-rc5-fast-manual from RC4.
+2. Wait for all 25 relay tests and the image build to pass.
+3. Point only tag-binance-relay-rc2-preview at:
+   ghcr.io/gtownbennett/tag-binance-relay:v2.8.2-rc5-fast-manual
+4. Keep REPAIR_MODE=true and all four automatic-work flags false.
+5. Keep the existing 25/day and 500/month manual limits.
+6. Deploy the preview and verify /health reports 2.8.2-rc5.
+7. Reuse the installed Android 0.6.1 RC4 app for one controlled refresh.
+
+Never merge to main or change production during this preview validation.

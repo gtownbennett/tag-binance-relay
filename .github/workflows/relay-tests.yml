@@ -6,6 +6,7 @@ on:
       - main
       - v2.8.0-rc3-cost-safe
       - v2.8.1-rc4-manual-live
+      - v2.8.2-rc5-fast-manual
   pull_request:
   workflow_dispatch:
 

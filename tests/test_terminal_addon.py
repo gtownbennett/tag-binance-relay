@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import unittest
@@ -332,7 +333,18 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
             "binance": binance,
         }
         collect = AsyncMock(return_value=market)
+        independent = [{"exchange": "mock"}]
         with (
+            patch.object(
+                terminal_addon,
+                "ensure_external_clients",
+                new=AsyncMock(),
+            ) as ensure_clients,
+            patch.object(
+                main.multi_exchange_service,
+                "collect_independent",
+                new=AsyncMock(return_value=independent),
+            ) as independent_read,
             patch.object(main, "cached_snapshot", new=AsyncMock(return_value=binance)) as futures_read,
             patch.object(main, "cached_spot", new=AsyncMock(return_value=spot)) as spot_read,
             patch.object(terminal_addon, "collect_market", new=collect),
@@ -340,6 +352,8 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
             result = await main.collect_terminal_market(manual_live=True)
 
         self.assertEqual(result, market)
+        ensure_clients.assert_awaited_once_with()
+        independent_read.assert_awaited_once_with()
         futures_read.assert_awaited_once_with(
             force=False,
             allow_repair_override=True,
@@ -353,7 +367,105 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
             spot,
             force=False,
             persist=False,
+            independent_results=independent,
+            include_server_history=False,
         )
+
+    async def test_manual_market_assembly_never_reads_neon_history(self) -> None:
+        terminal_addon.market_cache["time"] = 0.0
+        terminal_addon.market_cache["value"] = None
+        futures = {
+            "activeExchangeCount": 3,
+            "requestedExchangeCount": 5,
+        }
+        with (
+            patch.object(
+                terminal_addon,
+                "ensure_external_clients",
+                new=AsyncMock(),
+            ),
+            patch.object(
+                main.multi_exchange_service,
+                "collect",
+                new=AsyncMock(return_value=futures),
+            ) as collect,
+            patch(
+                "app.terminal_addon.server_oi_history",
+                side_effect=AssertionError("manual market assembly queried Neon history"),
+            ),
+        ):
+            result = await terminal_addon.collect_market(
+                {"markPrice": 0.001},
+                {"priceUsd": 0.001, "available": True},
+                independent_results=[{"exchange": "mock"}],
+                include_server_history=False,
+            )
+
+        collect.assert_awaited_once_with(
+            {"markPrice": 0.001},
+            independent_results=[{"exchange": "mock"}],
+        )
+        self.assertTrue(result["serverOiHistory"]["deferred"])
+        self.assertEqual(result["futures"]["activeExchangeCount"], 3)
+
+    async def test_manual_sources_start_in_one_concurrent_window(self) -> None:
+        started: set[str] = set()
+        all_started = asyncio.Event()
+
+        async def source(name: str, value: object) -> object:
+            started.add(name)
+            if len(started) == 3:
+                all_started.set()
+            await asyncio.wait_for(all_started.wait(), timeout=0.5)
+            return value
+
+        async def futures_read(**_: object) -> object:
+            return await source("binance", {"markPrice": 0.001})
+
+        async def spot_read(**_: object) -> object:
+            return await source("spot", {"priceUsd": 0.001, "available": True})
+
+        async def independent_read() -> object:
+            return await source("independent", [])
+
+        market = {
+            "spot": {"priceUsd": 0.001},
+            "futures": {"activeExchangeCount": 1},
+        }
+        with (
+            patch.object(
+                terminal_addon,
+                "ensure_external_clients",
+                new=AsyncMock(),
+            ),
+            patch.object(
+                main,
+                "cached_snapshot",
+                new=AsyncMock(side_effect=futures_read),
+            ),
+            patch.object(
+                main,
+                "cached_spot",
+                new=AsyncMock(side_effect=spot_read),
+            ),
+            patch.object(
+                main.multi_exchange_service,
+                "collect_independent",
+                new=AsyncMock(side_effect=independent_read),
+            ),
+            patch.object(
+                terminal_addon,
+                "collect_market",
+                new=AsyncMock(return_value=market),
+            ),
+        ):
+            result = await asyncio.wait_for(
+                main.collect_terminal_market(manual_live=True),
+                timeout=1.0,
+            )
+
+        self.assertEqual(result, market)
+        self.assertEqual(started, {"binance", "spot", "independent"})
 
     async def test_manual_binance_snapshot_uses_point_in_time_rest_state(self) -> None:
         async def public_response(path: str, params: dict | None = None) -> object:
@@ -449,12 +561,14 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 terminal_addon,
                 "build_terminal_payload",
-                side_effect=RuntimeError("old optional schema"),
+                side_effect=AssertionError("manual packet queried stored intelligence"),
             ),
             patch.object(
                 main,
                 "build_unified_forecast_ledger",
-                new=AsyncMock(side_effect=RuntimeError("old ledger schema")),
+                new=AsyncMock(
+                    side_effect=AssertionError("manual packet queried stored forecasts")
+                ),
             ),
         ):
             result = await main.terminal_bundle_endpoint(
@@ -469,7 +583,9 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["readOnly"])
         self.assertEqual(result["databaseWrites"], 0)
         self.assertFalse(result["automaticWorkStarted"])
-        self.assertEqual(len(result["packetWarnings"]), 2)
+        self.assertEqual(len(result["packetWarnings"]), 1)
+        self.assertIn("without database transfer", result["packetWarnings"][0])
+        self.assertEqual(result["chad"]["dataWarnings"], [])
 
     def test_binance_normalisation(self) -> None:
         service = MultiExchangeService()

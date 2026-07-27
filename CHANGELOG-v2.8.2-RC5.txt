@@ -1,0 +1,10 @@
+TAG RELAY 2.8.2 RC5
+
+- Fixed the RC4 phone timeout caused by sequential public-source phases.
+- Runs Binance, DEX Screener, Bitget, MEXC, Gate and BingX in one concurrent window.
+- Bounds each non-Binance venue coroutine to twelve seconds.
+- Defers stored Neon intelligence during repair-mode manual refreshes.
+- Performs zero Neon reads and zero database writes for the manual market packet.
+- Preserves five-minute response caching and manual daily/monthly limits.
+- Reuses the already-installed Android 0.6.1 RC4 app; no APK change is required.
+- Added no-Neon and source-concurrency regressions; total relay suite is 25 tests.
