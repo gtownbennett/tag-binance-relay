@@ -679,92 +679,81 @@ def update_caller_stats() -> int:
     updated = 0
     with session_scope() as session:
         callers = session.scalars(select(SocialCallerRow)).all()
-
         for caller in callers:
-            calls = session.scalars(
-                select(SocialCallRow).where(
-                    SocialCallRow.caller_id == caller.id
-                )
-            ).all()
-
-            graded_returns = []
-
-            for call in calls:
-                value = (
-                    call.return_24h_pct
-                    if call.return_24h_pct is not None
-                    else call.return_4h_pct
-                    if call.return_4h_pct is not None
-                    else call.return_1h_pct
-                )
-
-                if value is not None:
-                    graded_returns.append(value)
-
+            calls = session.scalars(select(SocialCallRow).where(SocialCallRow.caller_id == caller.id)).all()
+            graded_returns = [
+                value
+                for call in calls
+                for value in [call.return_24h_pct if call.return_24h_pct is not None else call.return_4h_pct]
+                if value is not None
+            ]
             wins = sum(1 for value in graded_returns if value > 0)
             losses = sum(1 for value in graded_returns if value < 0)
-
             caller.call_count = len(calls)
             caller.graded_count = len(graded_returns)
             caller.wins = wins
             caller.losses = losses
-            caller.win_rate_pct = (
-                round(wins / len(graded_returns) * 100.0, 1)
-                if graded_returns
-                else None
-            )
-            caller.average_return_pct = (
-                round(sum(graded_returns) / len(graded_returns), 3)
-                if graded_returns
-                else None
-            )
-            caller.total_return_pct = (
-                round(sum(graded_returns), 3)
-                if graded_returns
-                else None
-            )
-            caller.best_return_pct = (
-                max(graded_returns) if graded_returns else None
-            )
-            caller.worst_return_pct = (
-                min(graded_returns) if graded_returns else None
-            )
-            caller.grade = _friendly_caller_grade(
-                caller.win_rate_pct,
-                caller.average_return_pct,
-                caller.graded_count,
-            )
+            caller.win_rate_pct = round(wins / len(graded_returns) * 100.0, 1) if graded_returns else None
+            caller.average_return_pct = round(sum(graded_returns) / len(graded_returns), 3) if graded_returns else None
+            caller.total_return_pct = round(sum(graded_returns), 3) if graded_returns else None
+            caller.best_return_pct = max(graded_returns) if graded_returns else None
+            caller.worst_return_pct = min(graded_returns) if graded_returns else None
+            caller.grade = _friendly_caller_grade(caller.win_rate_pct, caller.average_return_pct, caller.graded_count)
             updated += 1
-
     return updated
 
 
-def social_ledger(limit: int = 100, caller_id: int | None = None) -> dict[str, Any]:
-    grade_social_calls()
-    update_caller_stats()
+def social_ledger(
+    limit: int = 100,
+    caller_id: int | None = None,
+    *,
+    refresh_grades: bool = True,
+) -> dict[str, Any]:
+    if refresh_grades:
+        grade_social_calls()
+        update_caller_stats()
     limit = min(max(limit, 1), 500)
     with session_scope() as session:
         callers = session.scalars(
-            select(SocialCallerRow).order_by(
+            select(SocialCallerRow)
+            .where(
+                func.lower(SocialCallerRow.display_name).not_like("%test caller%"),
+                func.lower(SocialCallerRow.handle).not_like("%test%caller%"),
+            )
+            .order_by(
                 SocialCallerRow.graded_count.desc(),
                 SocialCallerRow.win_rate_pct.desc(),
                 SocialCallerRow.last_seen_at.desc(),
             )
+            .limit(100)
         ).all()
-        query = select(SocialCallRow).order_by(SocialCallRow.discovered_at.desc()).limit(limit)
+        real_caller_ids = [row.id for row in callers]
+        query = (
+            select(SocialCallRow)
+            .where(SocialCallRow.caller_id.in_(real_caller_ids or [-1]))
+            .order_by(SocialCallRow.discovered_at.desc())
+            .limit(limit)
+        )
         if caller_id is not None:
             query = query.where(SocialCallRow.caller_id == caller_id)
         calls = session.scalars(query).all()
         caller_map = {row.id: row for row in callers}
+        graded_count = sum(1 for row in calls if row.grade_score is not None)
         return {
-            "status": "active" if callers else "warming",
+            "status": (
+                "active"
+                if callers
+                else "source-unavailable"
+                if not CMC_PRO_API_KEY
+                else "warming"
+            ),
             "timestampRule": "Exact social post times are stored only when supplied by an official API, page metadata, or user-provided evidence. Times are never inferred from relative labels.",
             "callers": [_caller_payload(row) for row in callers],
             "calls": [_call_payload(row, caller_map.get(row.caller_id)) for row in calls],
             "counts": {
                 "callers": len(callers),
-                "calls": session.scalar(select(func.count(SocialCallRow.id))) or 0,
-                "graded": session.scalar(select(func.count(SocialCallRow.id)).where(SocialCallRow.grade_score.is_not(None))) or 0,
+                "calls": len(calls),
+                "graded": graded_count,
             },
             "cmcConfigured": bool(CMC_PRO_API_KEY),
             "cmcHistoricalConfigured": bool(CMC_PRO_API_KEY and CMC_TAG_ID),
@@ -1104,11 +1093,60 @@ def paper_trade_detail(trade_id: int) -> dict[str, Any]:
         return _paper_trade_payload(trade, mark)
 
 
-def paper_ledger(limit: int = 100) -> dict[str, Any]:
-    evaluate_paper_orders()
+def paper_ledger(
+    limit: int = 100,
+    *,
+    evaluate: bool = True,
+    create_account: bool = True,
+) -> dict[str, Any]:
+    if evaluate:
+        evaluate_paper_orders()
     mark, _, mark_time = _latest_spot()
     with session_scope() as session:
-        account = _paper_account(session)
+        account = session.scalar(
+            select(PaperAccountRow).where(
+                PaperAccountRow.account_key == PAPER_ACCOUNT_KEY
+            )
+        )
+        if account is None and create_account:
+            account = _paper_account(session)
+        if account is None:
+            return {
+                "paperOnly": True,
+                "noRealFunds": True,
+                "account": {
+                    "id": 0,
+                    "name": "TAG Derivatives Paper Wallet",
+                    "startingBalance": PAPER_STARTING_BALANCE,
+                    "cashBalance": PAPER_STARTING_BALANCE,
+                    "reservedMargin": 0.0,
+                    "unrealizedPnl": 0.0,
+                    "realizedPnl": 0.0,
+                    "equity": PAPER_STARTING_BALANCE,
+                    "totalFees": 0.0,
+                    "totalFunding": 0.0,
+                    "closedTrades": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "winRatePct": None,
+                    "maxLeverage": PAPER_FIRST_20_MAX_LEVERAGE,
+                    "marginMode": "ISOLATED",
+                    "markPrice": mark,
+                    "markTime": mark_time.isoformat() if mark_time else None,
+                },
+                "openPositions": [],
+                "pendingOrders": [],
+                "history": [],
+                "equityCurve": [],
+                "rules": {
+                    "startingPaperUsdt": PAPER_STARTING_BALANCE,
+                    "first20MaxLeverage": PAPER_FIRST_20_MAX_LEVERAGE,
+                    "marginMode": "ISOLATED",
+                    "feeRateBpsEachSide": PAPER_FEE_BPS,
+                    "liquidation": "estimated for education and paper risk only",
+                    "execution": "paper simulation only; no real order route",
+                },
+            }
         trades = session.scalars(
             select(PaperTradeRow)
             .where(PaperTradeRow.account_id == account.id)
@@ -1207,6 +1245,14 @@ def record_alert_timeline(
             return False
         if last and last.stage == stage:
             # Timeline rows represent state transitions, not every 60-second refresh.
+            return False
+        if (
+            last
+            and last.stage in {"confirmed", "confirmed_breakout", "confirmed_breakdown", "extreme_ath"}
+            and stage in {"observed", "candidate", "early_watch"}
+        ):
+            # Hysteresis: one noisy snapshot cannot demote a confirmed setup.
+            # The evaluator must cross the wider invalidation boundary.
             return False
         session.add(AlertTimelineRow(
             created_at=now,

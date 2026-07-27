@@ -236,6 +236,16 @@ class PaperSocialTests(unittest.TestCase):
         active = timeline["active"][0]
         self.assertEqual(active["stage"], "confirmed")
         self.assertEqual([event["stage"] for event in active["events"]], ["observed", "candidate", "confirmed"])
+        self.assertFalse(
+            record_alert_timeline(
+                stage="candidate",
+                payload={"step": 4, "singleNoisySnapshot": True},
+                dedupe=timedelta(0),
+                **base,
+            )
+        )
+        still_confirmed = alert_timeline()["active"][0]
+        self.assertEqual(still_confirmed["stage"], "confirmed")
 
 
 if __name__ == "__main__":

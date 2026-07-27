@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from datetime import datetime, timedelta, timezone
@@ -86,23 +87,92 @@ def _latest_market() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     return spot, futures if isinstance(futures, dict) else {}, binance
 
 
-def server_oi_history() -> dict[str, Any]:
+def server_oi_history(point_limit: int = 288) -> dict[str, Any]:
+    point_limit = min(max(point_limit, 24), 576)
     now = utc_now()
     cutoff = now - timedelta(days=8)
     with session_scope() as session:
-        rows = session.scalars(
-            select(AggregateSnapshotRow)
+        latest = session.execute(
+            select(
+                AggregateSnapshotRow.recorded_at,
+                AggregateSnapshotRow.coverage_key,
+                AggregateSnapshotRow.price,
+                AggregateSnapshotRow.price_change_1h,
+                AggregateSnapshotRow.aggregate_oi_usd,
+                AggregateSnapshotRow.funding_pct,
+            )
             .where(AggregateSnapshotRow.recorded_at >= cutoff)
-            .order_by(AggregateSnapshotRow.recorded_at.asc())
-        ).all()
-        if not rows:
-            legacy = session.scalars(
-                select(ClientSnapshot)
+            .order_by(AggregateSnapshotRow.recorded_at.desc())
+            .limit(1)
+        ).first()
+        model = AggregateSnapshotRow
+        if latest is None:
+            latest = session.execute(
+                select(
+                    ClientSnapshot.recorded_at,
+                    ClientSnapshot.coverage_key,
+                    ClientSnapshot.price,
+                    ClientSnapshot.price_change_1h,
+                    ClientSnapshot.aggregate_oi_usd,
+                    ClientSnapshot.funding_pct,
+                )
                 .where(ClientSnapshot.recorded_at >= cutoff)
-                .order_by(ClientSnapshot.recorded_at.asc())
-            ).all()
-            rows = legacy  # type: ignore[assignment]
-    if not rows:
+                .order_by(ClientSnapshot.recorded_at.desc())
+                .limit(1)
+            ).first()
+            model = ClientSnapshot
+        if latest is None:
+            rows: list[Any] = []
+            targets: dict[str, Any] = {}
+        else:
+            rows = list(
+                session.execute(
+                    select(
+                        model.recorded_at,
+                        model.coverage_key,
+                        model.price,
+                        model.price_change_1h,
+                        model.aggregate_oi_usd,
+                        model.funding_pct,
+                    )
+                    .where(
+                        model.recorded_at >= cutoff,
+                        model.coverage_key == latest.coverage_key,
+                        model.aggregate_oi_usd.is_not(None),
+                    )
+                    .order_by(model.recorded_at.desc())
+                    .limit(point_limit)
+                ).all()
+            )
+            rows.reverse()
+            targets = {}
+            for label, duration, tolerance in (
+                ("5m", timedelta(minutes=5), timedelta(minutes=2)),
+                ("15m", timedelta(minutes=15), timedelta(minutes=5)),
+                ("1h", timedelta(hours=1), timedelta(minutes=15)),
+                ("4h", timedelta(hours=4), timedelta(minutes=30)),
+                ("24h", timedelta(hours=24), timedelta(hours=2)),
+            ):
+                target = _aware(latest.recorded_at) - duration
+                targets[label] = session.execute(
+                    select(
+                        model.recorded_at,
+                        model.coverage_key,
+                        model.price,
+                        model.price_change_1h,
+                        model.aggregate_oi_usd,
+                        model.funding_pct,
+                    )
+                    .where(
+                        model.coverage_key == latest.coverage_key,
+                        model.aggregate_oi_usd.is_not(None),
+                        model.recorded_at >= target - tolerance,
+                        model.recorded_at <= target + tolerance,
+                    )
+                    .order_by(model.recorded_at.desc())
+                    .limit(1)
+                ).first()
+    if latest is None:
         return {
             "coverageKey": None,
             "points": [],
@@ -113,12 +183,12 @@ def server_oi_history() -> dict[str, Any]:
             "change24hPct": None,
             "status": "No comparable server snapshots have been stored yet.",
         }
-    latest = rows[-1]
-    comparable = [row for row in rows if row.coverage_key == latest.coverage_key and row.aggregate_oi_usd]
-
-    def change(duration: timedelta, tolerance: timedelta) -> float | None:
-        previous = _nearest(comparable[:-1], _aware(latest.recorded_at) - duration, tolerance)
-        return _pct_change(latest.aggregate_oi_usd, previous.aggregate_oi_usd if previous else None)
+    def change(label: str) -> float | None:
+        previous = targets.get(label)
+        return _pct_change(
+            latest.aggregate_oi_usd,
+            previous.aggregate_oi_usd if previous else None,
+        )
 
     points = [
         {
@@ -127,20 +197,20 @@ def server_oi_history() -> dict[str, Any]:
             "price": row.price,
             "coverageKey": row.coverage_key,
         }
-        for row in comparable[-900:]
+        for row in rows
     ]
-    oldest = comparable[0].recorded_at if comparable else latest.recorded_at
+    oldest = rows[0].recorded_at if rows else latest.recorded_at
     age_minutes = max(0, int((_aware(latest.recorded_at) - _aware(oldest)).total_seconds() / 60))
     return {
         "coverageKey": latest.coverage_key,
         "points": points,
-        "change5mPct": change(timedelta(minutes=5), timedelta(minutes=2)),
-        "change15mPct": change(timedelta(minutes=15), timedelta(minutes=5)),
-        "change1hPct": change(timedelta(hours=1), timedelta(minutes=15)),
-        "change4hPct": change(timedelta(hours=4), timedelta(minutes=30)),
-        "change24hPct": change(timedelta(hours=24), timedelta(hours=2)),
+        "change5mPct": change("5m"),
+        "change15mPct": change("15m"),
+        "change1hPct": change("1h"),
+        "change4hPct": change("4h"),
+        "change24hPct": change("24h"),
         "status": (
-            f"Persistent server history has {len(comparable)} comparable snapshots over about "
+            f"Persistent server history returned {len(rows)} bounded comparable points over about "
             f"{age_minutes} minutes using {latest.coverage_key.replace('|', ', ')}."
         ),
     }
@@ -156,16 +226,18 @@ def vision_context(days: int = 14) -> dict[str, Any]:
     days = min(max(days, 1), 90)
     cutoff_ms = int((utc_now() - timedelta(days=days)).timestamp() * 1000)
     with session_scope() as session:
-        rows = session.scalars(
-            select(VisionRow)
+        rows = session.execute(
+            select(VisionRow.event_time_ms, VisionRow.close_price)
             .where(
                 VisionRow.dataset == "klines",
                 VisionRow.interval == "5m",
                 VisionRow.event_time_ms >= cutoff_ms,
                 VisionRow.close_price.is_not(None),
             )
-            .order_by(VisionRow.event_time_ms.asc())
+            .order_by(VisionRow.event_time_ms.desc())
+            .limit(min(8_064, days * 288))
         ).all()
+        rows = list(reversed(rows))
     closes = [float(row.close_price) for row in rows if row.close_price and row.close_price > 0]
     if not closes:
         return {
@@ -218,31 +290,53 @@ def heatmap(hours: int = 24, bins: int = 32) -> dict[str, Any]:
     bins = min(max(bins, 12), 80)
     cutoff = utc_now() - timedelta(hours=hours)
     with session_scope() as session:
-        rows = session.scalars(
-            select(OrderBookSnapshot)
+        rows = session.execute(
+            select(
+                OrderBookSnapshot.recorded_at,
+                OrderBookSnapshot.mark_price,
+                OrderBookSnapshot.levels_json,
+            )
             .where(OrderBookSnapshot.recorded_at >= cutoff)
-            .order_by(OrderBookSnapshot.recorded_at.asc())
+            .order_by(OrderBookSnapshot.recorded_at.desc())
+            .limit(288)
         ).all()
+        rows = list(reversed(rows))
+        total_samples = session.scalar(
+            select(func.count(OrderBookSnapshot.id)).where(
+                OrderBookSnapshot.recorded_at >= cutoff
+            )
+        ) or 0
     if not rows:
         return {"hours": hours, "bins": [], "sampleCount": 0, "status": "Collecting Binance order-book history."}
     current = rows[-1].mark_price
     parsed: list[tuple[str, float, float]] = []
     prices: list[float] = []
-    for row in rows:
-        levels = _load_json(row.levels_json)
-        for side_name in ("bids", "asks"):
-            raw_levels = levels.get(side_name)
-            if not isinstance(raw_levels, list):
+    levels = _load_json(rows[-1].levels_json)
+    for side_name in ("bids", "asks"):
+        raw_levels = levels.get(side_name)
+        if not isinstance(raw_levels, list):
+            continue
+        for level in raw_levels:
+            if not isinstance(level, list) or len(level) < 3:
                 continue
-            for level in raw_levels:
-                if not isinstance(level, list) or len(level) < 3:
-                    continue
-                price, notional = _num(level[0]), _num(level[2])
-                if price and notional and notional > 0:
-                    prices.append(price)
-                    parsed.append(("BID" if side_name == "bids" else "ASK", price, notional))
+            price, notional = _num(level[0]), _num(level[2])
+            if not price or not notional or notional <= 0 or current is None:
+                continue
+            is_valid_current_side = (
+                side_name == "bids" and price < current
+            ) or (
+                side_name == "asks" and price > current
+            )
+            if is_valid_current_side:
+                prices.append(price)
+                parsed.append(("BID" if side_name == "bids" else "ASK", price, notional))
     if not prices or current is None:
-        return {"hours": hours, "bins": [], "sampleCount": len(rows), "status": "Saved depth samples did not contain usable levels."}
+        return {
+            "hours": hours,
+            "bins": [],
+            "sampleCount": int(total_samples),
+            "status": "Latest saved depth did not contain a valid current bid-below/ask-above book.",
+        }
     low, high = min(prices), max(prices)
     if high <= low:
         high = low * 1.001
@@ -267,12 +361,16 @@ def heatmap(hours: int = 24, bins: int = 32) -> dict[str, Any]:
         row["askScore"] = row["askIntensity"] / maximum if maximum else 0.0
     return {
         "hours": hours,
-        "sampleCount": len(rows),
+        "sampleCount": int(total_samples),
         "currentPrice": current,
         "bins": output,
         "strongestBidZones": sorted(output, key=lambda row: row["bidIntensity"], reverse=True)[:4],
         "strongestAskZones": sorted(output, key=lambda row: row["askIntensity"], reverse=True)[:4],
-        "status": f"Internal heatmap built from {len(rows)} stored Binance depth snapshots.",
+        "historyNotMergedIntoCurrentBook": True,
+        "status": (
+            f"Current visible Binance book from the latest snapshot. "
+            f"{int(total_samples)} historical samples are retained separately and are not relabeled against today's price."
+        ),
     }
 
 
@@ -352,21 +450,25 @@ def _observed_levels(price: float | None) -> list[dict[str, Any]]:
     with session_scope() as session:
         cutoff = utc_now() - timedelta(days=7)
         cutoff_ms = int(cutoff.timestamp() * 1000)
-        rows = session.scalars(
-            select(SpotSnapshotRow)
+        rows = session.execute(
+            select(SpotSnapshotRow.recorded_at, SpotSnapshotRow.price)
             .where(SpotSnapshotRow.recorded_at >= cutoff, SpotSnapshotRow.price.is_not(None))
-            .order_by(SpotSnapshotRow.recorded_at.asc())
+            .order_by(SpotSnapshotRow.recorded_at.desc())
+            .limit(2_016)
         ).all()
-        vision_rows = session.scalars(
-            select(VisionRow)
+        rows = list(reversed(rows))
+        vision_rows = session.execute(
+            select(VisionRow.event_time_ms, VisionRow.close_price)
             .where(
                 VisionRow.dataset == "klines",
                 VisionRow.interval == "5m",
                 VisionRow.event_time_ms >= cutoff_ms,
                 VisionRow.close_price.is_not(None),
             )
-            .order_by(VisionRow.event_time_ms.asc())
+            .order_by(VisionRow.event_time_ms.desc())
+            .limit(2_016)
         ).all()
+        vision_rows = list(reversed(vision_rows))
     prices = [row.price for row in rows if row.price and row.price > 0]
     prices += [row.close_price for row in vision_rows if row.close_price and row.close_price > 0]
     dynamic: list[tuple[str, float, str, str]] = []
@@ -409,11 +511,19 @@ def _historical_analogs(current: dict[str, Any], limit: int = 5) -> list[dict[st
         return []
     cutoff = utc_now() - timedelta(days=30)
     with session_scope() as session:
-        rows = session.scalars(
-            select(AggregateSnapshotRow)
+        rows = session.execute(
+            select(
+                AggregateSnapshotRow.recorded_at,
+                AggregateSnapshotRow.price,
+                AggregateSnapshotRow.price_change_1h,
+                AggregateSnapshotRow.aggregate_oi_usd,
+                AggregateSnapshotRow.funding_pct,
+            )
             .where(AggregateSnapshotRow.recorded_at >= cutoff, AggregateSnapshotRow.price.is_not(None))
-            .order_by(AggregateSnapshotRow.recorded_at.asc())
+            .order_by(AggregateSnapshotRow.recorded_at.desc())
+            .limit(2_000)
         ).all()
+        rows = list(reversed(rows))
     candidates: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
         if _aware(row.recorded_at) > utc_now() - timedelta(hours=24):
@@ -449,7 +559,23 @@ def _historical_analogs(current: dict[str, Any], limit: int = 5) -> list[dict[st
                 else "Outcome window incomplete"
             ),
         })
-    return sorted(candidates, key=lambda row: row["similarity"], reverse=True)[:limit]
+    # Neighboring minutes from one move are one event, not independent proof.
+    independent: list[dict[str, Any]] = []
+    minimum_separation = timedelta(hours=6)
+    for candidate in sorted(candidates, key=lambda row: row["similarity"], reverse=True):
+        candidate_time = datetime.fromisoformat(str(candidate["time"]).replace("Z", "+00:00"))
+        if any(
+            abs(candidate_time - datetime.fromisoformat(str(row["time"]).replace("Z", "+00:00")))
+            < minimum_separation
+            for row in independent
+        ):
+            continue
+        candidate["independentEvent"] = True
+        candidate["independenceRule"] = "At least six hours from every other displayed analog."
+        independent.append(candidate)
+        if len(independent) >= limit:
+            break
+    return independent
 
 
 def _specialists(
@@ -730,7 +856,7 @@ def build_chad_report(store: bool = True) -> dict[str, Any]:
         elif price1h > 0.35 and oi1h < -0.5:
             regime = "SHORT COVERING"
         else:
-            regime = "MIXED / REPAIR"
+            regime = "CONFLICTING SIGNALS — WAIT"
     else:
         regime = "COLLECTING HISTORY"
 
@@ -788,7 +914,7 @@ def build_chad_report(store: bool = True) -> dict[str, Any]:
     if data_quality < 55:
         attention = "DATA WARNING"
         attention_message = "Important inputs are missing or still warming up, so Chad is refusing a high-confidence call."
-    elif confidence >= 72 and regime not in {"MIXED / REPAIR", "COLLECTING HISTORY"}:
+    elif confidence >= 72 and regime not in {"CONFLICTING SIGNALS — WAIT", "COLLECTING HISTORY"}:
         attention = "WATCH"
         attention_message = f"{regime} is becoming actionable, but confirmation and invalidation still matter."
     if price1h is not None and abs(price1h) >= 4:
@@ -801,8 +927,8 @@ def build_chad_report(store: bool = True) -> dict[str, Any]:
         "product": "TAG Terminal — Intelligence by Chad",
         "tagline": "Know what TAG is doing—and why.",
         "modelId": MODEL_ID,
-        "challengerModelId": CHALLENGER_ID,
-        "challengerStatus": "shadow-mode until enough graded forecasts exist",
+        "challengerModelId": None,
+        "challengerStatus": "planned; no independent challenger forecasts exist yet",
         "regime": regime,
         "confidence": confidence,
         "dataQuality": data_quality,
@@ -847,7 +973,7 @@ def build_chad_report(store: bool = True) -> dict[str, Any]:
         },
         "learning": {
             "champion": MODEL_ID,
-            "challenger": CHALLENGER_ID,
+            "challenger": "",
             "promotionRule": "A challenger cannot replace the champion until it has enough graded outcomes and improves calibration without increasing risk.",
             "latestLesson": "Source quality and exact-window labels are preserved; incomplete windows are excluded from high-confidence conclusions.",
         },
@@ -862,7 +988,10 @@ def build_chad_report(store: bool = True) -> dict[str, Any]:
             "binanceVision": vision.get("status"),
             "catalystFeed": "not-connected; excluded from confidence",
             "whaleOnChainFeed": "not-connected; excluded from confidence",
-            "challenger": "shadow-mode",
+            "coinGlass": "planned; not connected",
+            "bscScanOnChain": "planned; not connected",
+            "officialTaggerCatalysts": "planned; not connected",
+            "challenger": "planned; no independent model",
         },
     }
     if taker_quality != "live-exact":
@@ -883,9 +1012,40 @@ def build_chad_report(store: bool = True) -> dict[str, Any]:
 
 def _store_report_and_forecasts(report: dict[str, Any], price: float | None) -> None:
     now = utc_now()
+    evidence_signature = {
+        "regime": report.get("regime"),
+        "confidence": round(float(report.get("confidence") or 0), 0),
+        "dataQuality": round(float(report.get("dataQuality") or 0), 0),
+        "futurePaths": [
+            {
+                "id": row.get("id"),
+                "probability": row.get("probability"),
+                "targetLow": row.get("targetLow"),
+                "targetHigh": row.get("targetHigh"),
+            }
+            for row in report.get("futurePaths") or []
+            if isinstance(row, dict)
+        ],
+        "whatChanged": report.get("whatChanged"),
+    }
+    evidence_hash = hashlib.sha256(
+        json_dumps(evidence_signature).encode("utf-8")
+    ).hexdigest()[:24]
+    report["evidenceHash"] = evidence_hash
     with session_scope() as session:
         last = session.scalar(select(ChadReportRow).order_by(ChadReportRow.created_at.desc()).limit(1))
-        should_store = not last or (now - _aware(last.created_at) >= timedelta(minutes=5)) or last.regime != report.get("regime")
+        previous_payload = _load_json(last.payload_json if last else None)
+        material_change = (
+            not last
+            or previous_payload.get("evidenceHash") != evidence_hash
+            or last.regime != report.get("regime")
+        )
+        minimum_cadence_met = not last or now - _aware(last.created_at) >= timedelta(minutes=15)
+        should_store = bool(
+            not last
+            or last.regime != report.get("regime")
+            or (material_change and minimum_cadence_met)
+        )
         if not should_store:
             return
         paths = report.get("futurePaths") or []
@@ -910,6 +1070,23 @@ def _store_report_and_forecasts(report: dict[str, Any], price: float | None) -> 
                 or forecast.get("minutes") is None
                 or forecast.get("probability") is None
                 or float(report.get("dataQuality") or 0) < 60
+            ):
+                continue
+            latest_equivalent = session.scalar(
+                select(ForecastRecordRow)
+                .where(
+                    ForecastRecordRow.model_id == MODEL_ID,
+                    ForecastRecordRow.horizon_label == str(forecast.get("label")),
+                    ForecastRecordRow.status == "candidate",
+                )
+                .order_by(ForecastRecordRow.created_at.desc())
+                .limit(1)
+            )
+            if (
+                latest_equivalent
+                and latest_equivalent.scenario == forecast.get("scenario")
+                and abs((latest_equivalent.probability or 0) - float(forecast.get("probability") or 0)) < 3
+                and now - _aware(latest_equivalent.created_at) < timedelta(hours=6)
             ):
                 continue
             session.add(ForecastRecordRow(
@@ -941,19 +1118,26 @@ def grade_forecasts() -> int:
             select(ForecastRecordRow)
             .where(ForecastRecordRow.correct.is_(None), ForecastRecordRow.baseline_price.is_not(None))
             .order_by(ForecastRecordRow.created_at.asc())
-            .limit(1000)
-        ).all()
-        prices = session.scalars(
-            select(AggregateSnapshotRow)
-            .where(AggregateSnapshotRow.price.is_not(None))
-            .order_by(AggregateSnapshotRow.recorded_at.asc())
+            .limit(100)
         ).all()
         for record in rows:
             target_time = _aware(record.created_at) + timedelta(minutes=record.horizon_minutes)
             if now < target_time:
                 continue
             tolerance = timedelta(minutes=max(10, min(240, record.horizon_minutes // 4)))
-            candidate = _nearest(prices, target_time, tolerance)
+            candidate = session.execute(
+                select(
+                    AggregateSnapshotRow.recorded_at,
+                    AggregateSnapshotRow.price,
+                )
+                .where(
+                    AggregateSnapshotRow.price.is_not(None),
+                    AggregateSnapshotRow.recorded_at >= target_time - tolerance,
+                    AggregateSnapshotRow.recorded_at <= target_time + tolerance,
+                )
+                .order_by(AggregateSnapshotRow.recorded_at.desc())
+                .limit(1)
+            ).first()
             if not candidate or not candidate.price or not record.baseline_price:
                 continue
             change = _pct_change(candidate.price, record.baseline_price) or 0.0
@@ -965,8 +1149,10 @@ def grade_forecasts() -> int:
     return updated
 
 
-def prediction_ledger(limit: int = 50) -> dict[str, Any]:
-    grade_forecasts()
+def prediction_ledger(limit: int = 50, *, grade: bool = True) -> dict[str, Any]:
+    if grade:
+        grade_forecasts()
+    limit = min(max(limit, 1), 200)
     with session_scope() as session:
         rows = session.scalars(
             select(ForecastRecordRow).order_by(ForecastRecordRow.created_at.desc()).limit(limit * 7)

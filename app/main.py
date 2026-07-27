@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -29,6 +30,12 @@ from app.terminal_addon import (
     terminal_addon,
 )
 from app.terminal_intelligence import insert_test_alert
+from app.terminal_database import (
+    OpenAIAnalysisCacheRow,
+    json_dumps as terminal_json_dumps,
+    session_scope,
+    utc_now as terminal_utc_now,
+)
 from app.terminal_paper_social import (
     alert_timeline as terminal_alert_timeline,
     cancel_paper_trade,
@@ -42,6 +49,16 @@ from app.terminal_paper_social import (
     research_timestamp,
     social_ledger as terminal_social_ledger,
 )
+from app.terminal_usage import (
+    BACKFILL_ENABLED,
+    BUILD_ID,
+    LIVE_COLLECTORS_ENABLED,
+    OPENAI_AUTOMATIC_ENABLED,
+    PUSH_ENABLED,
+    REPAIR_MODE,
+    operating_status,
+    usage_governor,
+)
 
 
 import httpx
@@ -51,7 +68,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.7.0-rc2"
+SERVICE_VERSION = "2.8.0-rc3"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -60,6 +77,10 @@ WS_BASES = [
 ]
 RELAY_TOKEN = os.getenv("RELAY_TOKEN", "").strip()
 CACHE_SECONDS = max(5, int(os.getenv("CACHE_SECONDS", "15")))
+TERMINAL_RESPONSE_CACHE_SECONDS = max(
+    60,
+    int(os.getenv("TERMINAL_RESPONSE_CACHE_SECONDS", "300" if REPAIR_MODE else "60")),
+)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
@@ -97,8 +118,10 @@ http_client: httpx.AsyncClient | None = None
 openai_client: httpx.AsyncClient | None = None
 snapshot_cache: dict[str, Any] = {"time": 0.0, "value": None}
 spot_cache: dict[str, Any] = {"time": 0.0, "value": None}
+terminal_response_cache: dict[str, Any] = {"time": 0.0, "value": None}
 cache_lock = asyncio.Lock()
 spot_cache_lock = asyncio.Lock()
+terminal_response_lock = asyncio.Lock()
 ledger_lock = asyncio.Lock()
 grader_state: dict[str, Any] = {
     "running": False,
@@ -144,6 +167,11 @@ class ChadAnalyzeRequest(BaseModel):
     averageEntryUsd: float | None = Field(default=None, ge=0)
     forceFresh: bool = Field(default=True)
     includeRawHistory: bool = Field(default=False)
+    allowPaidCall: bool = Field(
+        default=False,
+        description="Must be true for an explicit user-approved paid analysis after repair mode is disabled.",
+    )
+    trigger: str = Field(default="explicit-user-request", max_length=80)
 
 
 CHAD_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -555,9 +583,20 @@ def require_chad_access(x_relay_key: str | None) -> None:
         raise HTTPException(status_code=503, detail="OpenAI client has not started.")
 
 
+def require_repair_writes_unlocked(action: str) -> None:
+    if REPAIR_MODE:
+        raise HTTPException(
+            status_code=423,
+            detail=f"Repair mode is active; {action} is paused.",
+        )
+
+
 async def get_json(path: str, params: dict[str, Any] | None = None) -> Any:
     if http_client is None:
         raise RuntimeError("HTTP client has not started.")
+    allowed, reason = usage_governor.authorize("external_request")
+    if not allowed:
+        raise RuntimeError(f"External request circuit is open ({reason}).")
 
     response = await http_client.get(f"{REST_BASE}{path}", params=params)
 
@@ -576,6 +615,9 @@ async def get_json(path: str, params: dict[str, Any] | None = None) -> Any:
 async def get_dex_json(path: str) -> Any:
     if http_client is None:
         raise RuntimeError("HTTP client has not started.")
+    allowed, reason = usage_governor.authorize("external_request")
+    if not allowed:
+        raise RuntimeError(f"External request circuit is open ({reason}).")
 
     response = await http_client.get(f"{DEXSCREENER_BASE}{path}")
     response.raise_for_status()
@@ -716,18 +758,33 @@ async def collect_spot_data() -> dict[str, Any]:
     }
 
 
-async def cached_spot(force: bool = False) -> dict[str, Any]:
+async def cached_spot(
+    force: bool = False,
+    *,
+    allow_repair_override: bool = False,
+) -> dict[str, Any]:
     now = time.monotonic()
     cached = spot_cache.get("value")
+    if REPAIR_MODE and not allow_repair_override:
+        if cached is not None:
+            usage_governor.cache(True)
+            return cached
+        raise HTTPException(
+            status_code=423,
+            detail="Repair mode is active; fresh spot collection is paused.",
+        )
     if not force and cached is not None and now - spot_cache["time"] < CACHE_SECONDS:
+        usage_governor.cache(True)
         return cached
 
     async with spot_cache_lock:
         now = time.monotonic()
         cached = spot_cache.get("value")
         if not force and cached is not None and now - spot_cache["time"] < CACHE_SECONDS:
+            usage_governor.cache(True)
             return cached
 
+        usage_governor.cache(False)
         value = await collect_spot_data()
         spot_cache["time"] = time.monotonic()
         spot_cache["value"] = value
@@ -972,6 +1029,116 @@ def openai_error_detail(response: httpx.Response) -> str:
     if isinstance(message, str) and message.strip():
         return message.strip()[:500]
     return f"OpenAI request failed with HTTP {response.status_code}."
+
+
+def _stable_evidence(value: Any) -> Any:
+    volatile = {
+        "generatedat",
+        "relaygeneratedat",
+        "updatedat",
+        "lastmessageat",
+        "servicetime",
+        "windowstartms",
+        "windowendms",
+        "time",
+        "timestamp",
+    }
+    if isinstance(value, dict):
+        return {
+            str(key): _stable_evidence(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key).lower() not in volatile
+        }
+    if isinstance(value, list):
+        return [_stable_evidence(item) for item in value]
+    if isinstance(value, float):
+        return round(value, 10)
+    return value
+
+
+def _analysis_evidence_hash(
+    *,
+    question: str,
+    snapshot: dict[str, Any],
+    history: dict[str, Any],
+    liquidation_data: dict[str, Any],
+    spot: dict[str, Any],
+) -> str:
+    material = {
+        "question": " ".join(question.lower().split()),
+        "snapshot": snapshot,
+        "history": compact_history_for_chad(history),
+        "liquidations": liquidation_data,
+        "spot": spot,
+    }
+    normalized = json.dumps(
+        _stable_evidence(material),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _cached_openai_analysis(
+    evidence_hash: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    with session_scope() as session:
+        row = session.get(OpenAIAnalysisCacheRow, evidence_hash)
+        if row is None:
+            return None
+        payload = json.loads(row.response_json)
+        analysis = payload.get("analysis")
+        if not isinstance(analysis, dict):
+            return None
+        row.cache_hit_count += 1
+        raw = {
+            "id": row.request_id,
+            "model": row.model,
+            "usage": {
+                "input_tokens": row.input_tokens,
+                "output_tokens": row.output_tokens,
+            },
+            "cacheHit": True,
+            "evidenceHash": evidence_hash,
+        }
+        return analysis, raw
+
+
+def _store_openai_analysis(
+    *,
+    evidence_hash: str,
+    trigger: str,
+    analysis: dict[str, Any],
+    raw: dict[str, Any],
+) -> None:
+    usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+    input_tokens = int(usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    input_rate = float(os.getenv("OPENAI_INPUT_USD_PER_1M", "0") or 0)
+    output_rate = float(os.getenv("OPENAI_OUTPUT_USD_PER_1M", "0") or 0)
+    estimated_cost = (
+        input_tokens * input_rate / 1_000_000
+        + output_tokens * output_rate / 1_000_000
+    )
+    with session_scope() as session:
+        existing = session.get(OpenAIAnalysisCacheRow, evidence_hash)
+        if existing is not None:
+            return
+        session.add(
+            OpenAIAnalysisCacheRow(
+                evidence_hash=evidence_hash,
+                created_at=terminal_utc_now(),
+                model=str(raw.get("model") or OPENAI_MODEL),
+                trigger=trigger[:80],
+                request_id=str(raw.get("id") or "") or None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                estimated_cost_usd=estimated_cost if input_rate or output_rate else None,
+                cache_hit_count=0,
+                response_json=terminal_json_dumps({"analysis": analysis}),
+            )
+        )
 
 
 async def request_chad_analysis(
@@ -1398,18 +1565,33 @@ async def collect_snapshot() -> dict[str, Any]:
     }
 
 
-async def cached_snapshot(force: bool = False) -> dict[str, Any]:
+async def cached_snapshot(
+    force: bool = False,
+    *,
+    allow_repair_override: bool = False,
+) -> dict[str, Any]:
     now = time.monotonic()
     cached = snapshot_cache.get("value")
+    if REPAIR_MODE and not allow_repair_override:
+        if cached is not None:
+            usage_governor.cache(True)
+            return cached
+        raise HTTPException(
+            status_code=423,
+            detail="Repair mode is active; fresh futures collection is paused.",
+        )
     if not force and cached is not None and now - snapshot_cache["time"] < CACHE_SECONDS:
+        usage_governor.cache(True)
         return cached
 
     async with cache_lock:
         now = time.monotonic()
         cached = snapshot_cache.get("value")
         if not force and cached is not None and now - snapshot_cache["time"] < CACHE_SECONDS:
+            usage_governor.cache(True)
             return cached
 
+        usage_governor.cache(False)
         value = await collect_snapshot()
         snapshot_cache["time"] = time.monotonic()
         snapshot_cache["value"] = value
@@ -1742,29 +1924,48 @@ async def lifespan(_: FastAPI):
     )
     if LEDGER_ENABLED:
         prediction_ledger.initialize()
-    await terminal_addon.start()
+    automatic_live_work = not REPAIR_MODE and LIVE_COLLECTORS_ENABLED
+    await terminal_addon.start(enable_external_clients=automatic_live_work)
 
     openai_client = httpx.AsyncClient(
         timeout=httpx.Timeout(float(OPENAI_TIMEOUT_SECONDS), connect=15.0),
         headers={"User-Agent": f"TAG-Terminal-Chad/{SERVICE_VERSION}"},
         follow_redirects=True,
     )
-    market_task = asyncio.create_task(market_stream_listener())
-    depth_task = asyncio.create_task(depth_stream_listener())
-    grader_task = asyncio.create_task(ledger_grader_loop()) if LEDGER_ENABLED else None
-    terminal_addon.start_collector(cached_snapshot, cached_spot)
+    market_task = (
+        asyncio.create_task(market_stream_listener())
+        if automatic_live_work
+        else None
+    )
+    depth_task = (
+        asyncio.create_task(depth_stream_listener())
+        if automatic_live_work
+        else None
+    )
+    grader_task = (
+        asyncio.create_task(ledger_grader_loop())
+        if LEDGER_ENABLED and automatic_live_work
+        else None
+    )
+    if automatic_live_work:
+        terminal_addon.start_collector(cached_snapshot, cached_spot)
 
     try:
         yield
     finally:
-        market_task.cancel()
-        depth_task.cancel()
+        if market_task is not None:
+            market_task.cancel()
+        if depth_task is not None:
+            depth_task.cancel()
         if grader_task is not None:
             grader_task.cancel()
+        tasks = [
+            task
+            for task in (market_task, depth_task, grader_task)
+            if task is not None
+        ]
         await asyncio.gather(
-            market_task,
-            depth_task,
-            *( [grader_task] if grader_task is not None else [] ),
+            *tasks,
             return_exceptions=True,
         )
 
@@ -1833,35 +2034,18 @@ async def root() -> dict[str, Any]:
         "patterns": "/v1/tag/patterns",
         "shareReport": "/v1/tag/share-report",
         "visionBackfill": "/v1/admin/binance-vision/backfill",
+        "operatingStatus": operating_status(SERVICE_VERSION),
     }
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    ping_error = None
-    binance_rest_reachable = False
-
-    try:
-        await get_json("/fapi/v1/ping")
-        binance_rest_reachable = True
-    except Exception as exc:
-        ping_error = str(exc)
-
     async with stream_lock:
         connected = bool(stream_state["connected"])
-        stream_error = stream_state["lastError"]
         last_message = stream_state["lastMessageAt"]
         depth_connected = bool(stream_state["depthConnected"])
-        depth_error = stream_state["depthLastError"]
         depth_message = stream_state["depthLastMessageAt"]
         depth_mode = stream_state["depthMode"]
-
-    try:
-        terminal_counts = terminal_addon.counts()
-        terminal_storage_error = None
-    except Exception as exc:
-        terminal_counts = None
-        terminal_storage_error = f"{type(exc).__name__}: {exc}"
 
     terminal_storage_persistent = (
         TERMINAL_DATABASE_URL.startswith("postgresql+")
@@ -1872,37 +2056,45 @@ async def health() -> dict[str, Any]:
     )
 
     return {
-        "ok": connected and depth_connected and terminal_storage_error is None,
+        # Render health checks must never wake Neon or ping paid/external
+        # sources. Component health is exposed from in-memory state only.
+        "ok": True if REPAIR_MODE else connected and depth_connected,
         "serviceTime": utc_iso(),
         "version": SERVICE_VERSION,
+        "buildId": BUILD_ID,
         "symbol": SYMBOL,
-        "binanceRestPingReachable": binance_rest_reachable,
-        "binanceRestPingError": ping_error,
+        "operatingStatus": operating_status(SERVICE_VERSION),
+        "healthCheckSideEffects": "none",
+        "binanceRestPingReachable": None,
+        "binanceRestPingError": None,
         "marketStreamConnected": connected,
         "marketStreamLastMessageAt": last_message,
-        "marketStreamLastError": stream_error,
+        "marketStreamLastError": None,
         "depthStreamConnected": depth_connected,
         "depthStreamLastMessageAt": depth_message,
         "depthStreamMode": depth_mode,
-        "depthStreamLastError": depth_error,
+        "depthStreamLastError": None,
         "chadConfigured": bool(OPENAI_API_KEY and RELAY_TOKEN),
         "chadProtected": bool(RELAY_TOKEN),
         "openAIModel": OPENAI_MODEL,
         "predictionLedgerEnabled": LEDGER_ENABLED,
         "predictionLedgerPath": LEDGER_DB_PATH if LEDGER_ENABLED else None,
         "predictionLedgerStorageWarning": prediction_ledger.persistent_hint if LEDGER_ENABLED else None,
-        "predictionLedgerStorage": prediction_ledger.storage_status() if LEDGER_ENABLED else None,
+        "predictionLedgerStorage": {
+            "configured": LEDGER_ENABLED,
+            "checkedByHealthRoute": False,
+        },
         "automaticGrader": dict(grader_state) if LEDGER_ENABLED else None,
         "terminalAddonVersion": TERMINAL_ADDON_VERSION,
         "terminalCollectorRunning": bool(terminal_addon.collector_task and not terminal_addon.collector_task.done()),
-        "terminalHistoryCounts": terminal_counts,
+        "terminalHistoryCounts": None,
         "terminalStoragePersistent": terminal_storage_persistent,
         "terminalStorageWarning": (
             None
             if terminal_storage_persistent
             else "Terminal history uses ephemeral/default storage. Configure TERMINAL_DATABASE_URL with PostgreSQL or a persistent disk before treating history as durable."
         ),
-        "terminalStorageError": terminal_storage_error,
+        "terminalStorageError": None,
     }
 
 
@@ -1948,6 +2140,11 @@ async def tag_history(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
+    if REPAIR_MODE:
+        raise HTTPException(
+            status_code=423,
+            detail="Repair mode is active; external history collection is paused.",
+        )
     return await collect_history_data(period=period, limit=limit)
 
 
@@ -1971,11 +2168,11 @@ async def tag_liquidations(
 
 @app.get("/v1/chad/calibration")
 async def chad_calibration(
-    gradeDue: bool = Query(True),
+    gradeDue: bool = Query(False),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_chad_access(x_relay_key)
-    grading = await grade_due_ledger_predictions(limit=200) if gradeDue else None
+    grading = await grade_due_ledger_predictions(limit=200) if gradeDue and not REPAIR_MODE else None
     return {
         "ok": True,
         "generatedAt": utc_iso(),
@@ -2004,6 +2201,7 @@ async def chad_ledger_import(
     merge: bool = Query(True, description="Merge with current records. Set false to replace the ledger."),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    require_repair_writes_unlocked("ledger imports")
     require_chad_access(x_relay_key)
     try:
         imported = prediction_ledger.import_data(payload, merge=merge)
@@ -2022,6 +2220,7 @@ async def chad_ledger_import(
 async def chad_ledger_backup(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    require_repair_writes_unlocked("ledger backups")
     require_chad_access(x_relay_key)
     try:
         backup = prediction_ledger.backup_now()
@@ -2039,6 +2238,7 @@ async def chad_ledger_grade(
     limit: int = Query(50, ge=1, le=200),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    require_repair_writes_unlocked("forecast grading")
     require_chad_access(x_relay_key)
     result = await grade_due_ledger_predictions(limit=limit)
     result["performance"] = prediction_ledger.performance_summary()
@@ -2047,11 +2247,11 @@ async def chad_ledger_grade(
 
 @app.get("/v1/chad/performance")
 async def chad_performance(
-    gradeDue: bool = Query(True, description="Grade due forecasts before returning performance."),
+    gradeDue: bool = Query(False, description="Grade due forecasts before returning performance."),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_chad_access(x_relay_key)
-    grading = await grade_due_ledger_predictions(limit=100) if gradeDue else None
+    grading = await grade_due_ledger_predictions(limit=100) if gradeDue and not REPAIR_MODE else None
     return {
         "ok": True,
         "generatedAt": utc_iso(),
@@ -2068,11 +2268,11 @@ async def chad_ledger(
     limit: int = Query(50, ge=1, le=500),
     status: str = Query("all", pattern="^(all|pending|graded)$"),
     includeAnalysis: bool = Query(False),
-    gradeDue: bool = Query(True),
+    gradeDue: bool = Query(False),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_chad_access(x_relay_key)
-    grading = await grade_due_ledger_predictions(limit=100) if gradeDue else None
+    grading = await grade_due_ledger_predictions(limit=100) if gradeDue and not REPAIR_MODE else None
     return {
         "ok": True,
         "generatedAt": utc_iso(),
@@ -2094,8 +2294,9 @@ async def chad_ledger_export(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_chad_access(x_relay_key)
-    await grade_due_ledger_predictions(limit=200)
-    return prediction_ledger.export_data(limit=limit)
+    if not REPAIR_MODE:
+        await grade_due_ledger_predictions(limit=200)
+    return prediction_ledger.export_data(limit=min(limit, 200) if REPAIR_MODE else limit)
 
 
 @app.post("/v1/chad/analyze")
@@ -2103,7 +2304,16 @@ async def chad_analyze(
     request: ChadAnalyzeRequest,
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    require_repair_writes_unlocked("paid OpenAI analysis")
     require_chad_access(x_relay_key)
+    if not request.allowPaidCall:
+        raise HTTPException(
+            status_code=423,
+            detail=(
+                "Paid Chad analysis requires allowPaidCall=true outside repair mode; "
+                "routine refreshes never call OpenAI."
+            ),
+        )
 
     if request.historyPeriod not in VALID_PERIODS:
         raise HTTPException(
@@ -2112,9 +2322,15 @@ async def chad_analyze(
         )
 
     snapshot, history, spot = await asyncio.gather(
-        cached_snapshot(force=request.forceFresh),
+        cached_snapshot(
+            force=request.forceFresh,
+            allow_repair_override=True,
+        ),
         collect_history_data(request.historyPeriod, request.historyLimit),
-        cached_spot(force=request.forceFresh),
+        cached_spot(
+            force=request.forceFresh,
+            allow_repair_override=True,
+        ),
     )
 
     async with liquidation_lock:
@@ -2124,6 +2340,13 @@ async def chad_analyze(
         "summary": await liquidation_summary(),
         "recentEvents": recent_events,
     }
+    evidence_hash = _analysis_evidence_hash(
+        question=request.question,
+        snapshot=snapshot,
+        history=history,
+        liquidation_data=liquidation_data,
+        spot=spot,
+    )
 
     grading_before = await grade_due_ledger_predictions(limit=100)
     features = current_market_features(snapshot, spot)
@@ -2145,19 +2368,38 @@ async def chad_analyze(
         else []
     )
 
-    analysis, raw_response = await request_chad_analysis(
-        question=request.question,
-        snapshot=snapshot,
-        history=history,
-        liquidation_data=liquidation_data,
-        spot_data=spot,
-        position_tag=request.positionTag,
-        average_entry_usd=request.averageEntryUsd,
-        ledger_performance=ledger_performance,
-        calibration_profile=calibration_profile,
-        similar_setups=similar_setups,
-        freshness=freshness,
-    )
+    cached_analysis = _cached_openai_analysis(evidence_hash)
+    if cached_analysis is not None:
+        usage_governor.cache(True)
+        analysis, raw_response = cached_analysis
+    else:
+        usage_governor.cache(False)
+        allowed, reason = usage_governor.authorize("openai_call")
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"OpenAI cost circuit is open ({reason}).",
+            )
+        usage_governor.mark_bounded_test()
+        analysis, raw_response = await request_chad_analysis(
+            question=request.question,
+            snapshot=snapshot,
+            history=history,
+            liquidation_data=liquidation_data,
+            spot_data=spot,
+            position_tag=request.positionTag,
+            average_entry_usd=request.averageEntryUsd,
+            ledger_performance=ledger_performance,
+            calibration_profile=calibration_profile,
+            similar_setups=similar_setups,
+            freshness=freshness,
+        )
+        _store_openai_analysis(
+            evidence_hash=evidence_hash,
+            trigger=request.trigger,
+            analysis=analysis,
+            raw=raw_response,
+        )
     analysis = apply_confidence_controls(analysis, freshness=freshness, calibration=calibration_profile)
     decision_change = (
         prediction_ledger.decision_delta(
@@ -2175,7 +2417,13 @@ async def chad_analyze(
     forecast_ledger = analysis.get("forecastLedger") if isinstance(analysis, dict) else None
     start_price = as_float(spot.get("priceUsd")) or as_float(snapshot.get("markPrice"))
 
-    if LEDGER_ENABLED and isinstance(forecast_ledger, dict) and start_price is not None:
+    cache_hit = bool(raw_response.get("cacheHit"))
+    if (
+        LEDGER_ENABLED
+        and not cache_hit
+        and isinstance(forecast_ledger, dict)
+        and start_price is not None
+    ):
         try:
             ledger_prediction_id = prediction_ledger.save_prediction(
                 model=str(raw_response.get("model", OPENAI_MODEL)),
@@ -2204,7 +2452,11 @@ async def chad_analyze(
         except Exception as exc:
             ledger_error = str(exc)
     elif LEDGER_ENABLED:
-        ledger_error = "Prediction was not saved because forecastLedger or a valid start price was missing."
+        ledger_error = (
+            "Unchanged evidence reused the original locked forecast; no duplicate was created."
+            if cache_hit
+            else "Prediction was not saved because forecastLedger or a valid start price was missing."
+        )
 
     result: dict[str, Any] = {
         "ok": True,
@@ -2212,6 +2464,8 @@ async def chad_analyze(
         "symbol": SYMBOL,
         "model": raw_response.get("model", OPENAI_MODEL),
         "openAIResponseId": raw_response.get("id"),
+        "cacheHit": cache_hit,
+        "evidenceHash": evidence_hash,
         "analysis": analysis,
         "decisionChange": decision_change,
         "freshness": freshness,
@@ -2251,11 +2505,18 @@ async def chad_analyze(
 # ---------------------------------------------------------------------------
 
 async def collect_terminal_market(force: bool = False) -> dict[str, Any]:
+    if REPAIR_MODE:
+        return terminal_addon.stored_market()
     binance, spot = await asyncio.gather(
         cached_snapshot(force=force),
         cached_spot(force=force),
     )
-    return await terminal_addon.collect_market(binance, spot, force=force)
+    return await terminal_addon.collect_market(
+        binance,
+        spot,
+        force=force,
+        persist=False,
+    )
 
 
 def require_terminal_admin(x_admin_key: str | None) -> None:
@@ -2283,6 +2544,12 @@ async def terminal_client_snapshot(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
+    if REPAIR_MODE:
+        return {
+            "accepted": False,
+            "repairMode": True,
+            "message": "Repair mode is active; refreshes do not create database snapshots.",
+        }
     return terminal_addon.accept_client_snapshot(payload)
 
 
@@ -2296,7 +2563,11 @@ async def terminal_heatmap_endpoint(
     return terminal_heatmap(hours, bins)
 
 
-async def build_unified_forecast_ledger(limit: int = 200) -> dict[str, Any]:
+async def build_unified_forecast_ledger(
+    limit: int = 200,
+    *,
+    grade: bool = False,
+) -> dict[str, Any]:
     """Consolidate the deterministic Terminal ledger and OpenAI Chad ledger.
 
     The underlying stores remain independently auditable, while this read model
@@ -2306,14 +2577,25 @@ async def build_unified_forecast_ledger(limit: int = 200) -> dict[str, Any]:
     ledger_warning: str | None = None
     if LEDGER_ENABLED:
         try:
-            prediction_ledger.initialize()
-            grading = await grade_due_ledger_predictions(limit=500)
+            if grade:
+                prediction_ledger.initialize()
+            grading = (
+                await grade_due_ledger_predictions(limit=100)
+                if grade
+                else {
+                    "enabled": True,
+                    "graded": 0,
+                    "pendingDue": 0,
+                    "errors": [],
+                    "status": "read-only; grading runs only in the enabled collector or an explicit grade action",
+                }
+            )
         except Exception as exc:
             ledger_warning = f"OpenAI Chad ledger unavailable: {type(exc).__name__}: {exc}"
             grading = {"enabled": True, "graded": 0, "pendingDue": 0, "errors": [ledger_warning]}
     else:
         grading = {"enabled": False, "graded": 0, "pendingDue": 0, "errors": []}
-    terminal = terminal_prediction_ledger(safe_limit)
+    terminal = terminal_prediction_ledger(safe_limit, grade=grade)
     terminal_records = []
     for row in terminal.get("reports", []):
         if not isinstance(row, dict):
@@ -2390,9 +2672,25 @@ async def build_unified_forecast_ledger(limit: int = 200) -> dict[str, Any]:
     except Exception as exc:
         ledger_warning = ledger_warning or f"OpenAI Chad ledger unavailable: {type(exc).__name__}: {exc}"
         openai_performance = {}
+    required_ready_horizons = {"1h", "4h", "1d", "7d", "30d", "3mo"}
+    calibrated_horizons = {
+        label
+        for label, value in by_horizon.items()
+        if bool(value.get("calibrated"))
+    }
+    learning_ready = required_ready_horizons.issubset(calibrated_horizons)
+    learning_status = (
+        "READY"
+        if learning_ready
+        else "PARTIALLY CALIBRATED"
+        if calibrated_horizons
+        else "WARMING"
+        if graded_records
+        else "COLLECTING"
+    )
     return {
         "generatedAt": utc_iso(),
-        "status": "consolidated",
+        "status": learning_status,
         "predictionCount": (
             int(openai_performance.get("predictionCount") or 0)
             + len({(row.get("time"), row.get("source")) for row in terminal_records})
@@ -2400,7 +2698,7 @@ async def build_unified_forecast_ledger(limit: int = 200) -> dict[str, Any]:
         "horizonRecordCount": len(records),
         "gradedCount": len(graded_records),
         "pendingCount": len(pending_records),
-        "learningReady": len(graded_records) >= 8,
+        "learningReady": learning_ready,
         "sourceCounts": {
             "openaiChadPredictions": int(openai_performance.get("predictionCount") or 0),
             "openaiChadHorizons": len(openai_records),
@@ -2432,16 +2730,21 @@ async def terminal_predictions_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    return terminal_prediction_ledger(limit)
+    return terminal_prediction_ledger(limit, grade=False)
 
 
 @app.get("/v1/tag/alerts")
 async def terminal_alerts_endpoint(
     limit: int = Query(30, ge=1, le=200),
-    evaluate: bool = Query(True),
+    evaluate: bool = Query(False),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
+    if evaluate and REPAIR_MODE:
+        raise HTTPException(
+            status_code=423,
+            detail="Repair mode is active; alert evaluation is paused.",
+        )
     if evaluate:
         await collect_terminal_market()
         report = build_terminal_chad_report(store=True)
@@ -2464,6 +2767,7 @@ async def terminal_test_alert_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("test-alert writes")
     alert = insert_test_alert()
     return {
         "ok": True,
@@ -2479,7 +2783,11 @@ async def terminal_paper_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    return terminal_paper_ledger(limit=limit)
+    return terminal_paper_ledger(
+        limit=limit,
+        evaluate=False,
+        create_account=False,
+    )
 
 
 @app.post("/v1/tag/paper/orders")
@@ -2488,6 +2796,7 @@ async def terminal_paper_order_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("paper-order writes")
     try:
         return place_paper_order(payload)
     except ValueError as exc:
@@ -2501,6 +2810,7 @@ async def terminal_paper_close_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("paper-trade writes")
     reason = str((payload or {}).get("reason") or "manual close")[:60]
     try:
         return close_paper_trade(trade_id, reason=reason)
@@ -2514,6 +2824,7 @@ async def terminal_paper_cancel_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("paper-order writes")
     try:
         return cancel_paper_trade(trade_id)
     except ValueError as exc:
@@ -2527,7 +2838,11 @@ async def terminal_social_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    return terminal_social_ledger(limit=limit, caller_id=caller_id)
+    return terminal_social_ledger(
+        limit=limit,
+        caller_id=caller_id,
+        refresh_grades=False,
+    )
 
 
 @app.post("/v1/admin/social/calls/import")
@@ -2536,6 +2851,7 @@ async def terminal_social_import_endpoint(
     x_admin_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_terminal_admin(x_admin_key)
+    require_repair_writes_unlocked("social-call imports")
     try:
         return {"ok": True, "call": ingest_social_call(payload)}
     except ValueError as exc:
@@ -2548,6 +2864,7 @@ async def terminal_social_cmc_import_endpoint(
     x_admin_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_terminal_admin(x_admin_key)
+    require_repair_writes_unlocked("social-call imports")
     return {"ok": True, **ingest_cmc_posts_response(payload)}
 
 
@@ -2557,6 +2874,7 @@ async def terminal_social_timestamp_endpoint(
     x_admin_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_terminal_admin(x_admin_key)
+    require_repair_writes_unlocked("social timestamp research")
     return {"ok": True, **research_timestamp(payload)}
 
 
@@ -2566,6 +2884,11 @@ async def terminal_social_cmc_history_endpoint(
     x_admin_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_terminal_admin(x_admin_key)
+    if REPAIR_MODE:
+        raise HTTPException(
+            status_code=423,
+            detail="Repair mode is active; paid social enrichment is paused.",
+        )
     return {"ok": True, **(await enrich_social_calls_with_cmc_quotes(limit=limit))}
 
 
@@ -2574,6 +2897,11 @@ async def terminal_social_cmc_poll_endpoint(
     x_admin_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_terminal_admin(x_admin_key)
+    if REPAIR_MODE:
+        raise HTTPException(
+            status_code=423,
+            detail="Repair mode is active; social polling is paused.",
+        )
     return {"ok": True, **(await poll_cmc_social_calls(force=True))}
 
 
@@ -2582,8 +2910,7 @@ async def terminal_chad_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    await collect_terminal_market()
-    return build_terminal_chad_report(store=True)
+    return build_terminal_chad_report(store=False)
 
 
 @app.get("/v1/tag/chad/history")
@@ -2600,14 +2927,13 @@ async def terminal_forecast_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    await collect_terminal_market()
-    report = build_terminal_chad_report(store=True)
+    report = build_terminal_chad_report(store=False)
     return {
         "generatedAt": report.get("generatedAt"),
         "futurePaths": report.get("futurePaths", []),
         "horizons": report.get("forecastHorizons", []),
         "opportunities": report.get("opportunities", []),
-        "ledger": terminal_prediction_ledger(60),
+        "ledger": terminal_prediction_ledger(30, grade=False),
         "dataQuality": report.get("dataQuality"),
         "warnings": report.get("dataWarnings", []),
     }
@@ -2618,7 +2944,6 @@ async def terminal_patterns_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    await collect_terminal_market()
     report = build_terminal_chad_report(store=False)
     specialists = report.get("specialistConsensus") if isinstance(report.get("specialistConsensus"), list) else []
     return {
@@ -2646,7 +2971,6 @@ async def terminal_share_report_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> str:
     require_relay_key(x_relay_key)
-    await collect_terminal_market()
     return terminal_share_report_text(build_terminal_chad_report(store=False))
 
 
@@ -2655,17 +2979,53 @@ async def terminal_bundle_endpoint(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    market = await collect_terminal_market()
-    terminal = terminal_addon.build_terminal_payload()
-    unified_predictions = await build_unified_forecast_ledger(300)
-    return {
-        "generatedAt": terminal.get("generatedAt"),
-        "spot": market.get("spot"),
-        "futures": market.get("futures"),
-        "binance": market.get("binance"),
-        **terminal,
-        "unifiedPredictions": unified_predictions,
-    }
+    now = time.monotonic()
+    cached = terminal_response_cache.get("value")
+    if (
+        cached is not None
+        and now - terminal_response_cache["time"] < TERMINAL_RESPONSE_CACHE_SECONDS
+    ):
+        usage_governor.cache(True)
+        return cached
+    async with terminal_response_lock:
+        now = time.monotonic()
+        cached = terminal_response_cache.get("value")
+        if (
+            cached is not None
+            and now - terminal_response_cache["time"] < TERMINAL_RESPONSE_CACHE_SECONDS
+        ):
+            usage_governor.cache(True)
+            return cached
+        allowed, reason = usage_governor.authorize("expensive_route")
+        if not allowed and cached is not None:
+            return cached
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Terminal response circuit is open ({reason}).",
+            )
+        usage_governor.cache(False)
+        market = await collect_terminal_market()
+        terminal = terminal_addon.build_terminal_payload(
+            store=False,
+            evaluate=False,
+        )
+        unified_predictions = await build_unified_forecast_ledger(
+            60,
+            grade=False,
+        )
+        result = {
+            "generatedAt": terminal.get("generatedAt"),
+            "spot": market.get("spot"),
+            "futures": market.get("futures"),
+            "binance": market.get("binance"),
+            **terminal,
+            "unifiedPredictions": unified_predictions,
+            "operatingStatus": operating_status(SERVICE_VERSION),
+        }
+        terminal_response_cache["time"] = time.monotonic()
+        terminal_response_cache["value"] = result
+        return result
 
 
 @app.post("/v1/admin/binance-vision/backfill")
@@ -2677,6 +3037,11 @@ async def terminal_backfill_endpoint(
     x_admin_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_terminal_admin(x_admin_key)
+    if REPAIR_MODE or not BACKFILL_ENABLED:
+        raise HTTPException(
+            status_code=423,
+            detail="Backfills are disabled during repair mode.",
+        )
     if day and month:
         raise HTTPException(status_code=400, detail="Use day or month, not both.")
     if day:

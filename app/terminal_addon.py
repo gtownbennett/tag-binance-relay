@@ -54,6 +54,7 @@ from .terminal_paper_social import (
     social_ledger,
     update_caller_stats,
 )
+from .terminal_usage import LIVE_COLLECTORS_ENABLED, REPAIR_MODE, usage_governor
 
 
 def _parse_datetime(value: Any) -> datetime:
@@ -87,23 +88,33 @@ class TerminalAddon:
 
     def __init__(self) -> None:
         self.started = False
+        self.external_clients_started = False
         self.collector_task: asyncio.Task[Any] | None = None
         self.market_cache: dict[str, Any] = {"time": 0.0, "value": None}
         self.cache_lock = asyncio.Lock()
 
-    async def start(self) -> None:
+    async def start(self, *, enable_external_clients: bool = True) -> None:
         if self.started:
             return
         init_db()
-        await multi_exchange_service.start()
+        if enable_external_clients:
+            await multi_exchange_service.start()
+            self.external_clients_started = True
         self.started = True
+
+    async def ensure_external_clients(self) -> None:
+        if not self.external_clients_started:
+            await multi_exchange_service.start()
+            self.external_clients_started = True
 
     async def stop(self) -> None:
         if self.collector_task is not None:
             self.collector_task.cancel()
             await asyncio.gather(self.collector_task, return_exceptions=True)
             self.collector_task = None
-        await multi_exchange_service.stop()
+        if self.external_clients_started:
+            await multi_exchange_service.stop()
+            self.external_clients_started = False
         self.started = False
 
     def start_collector(
@@ -111,6 +122,8 @@ class TerminalAddon:
         snapshot_provider: Callable[..., Awaitable[dict[str, Any]]],
         spot_provider: Callable[..., Awaitable[dict[str, Any]]],
     ) -> None:
+        if REPAIR_MODE or not LIVE_COLLECTORS_ENABLED:
+            return
         if self.collector_task is not None and not self.collector_task.done():
             return
         self.collector_task = asyncio.create_task(
@@ -125,12 +138,16 @@ class TerminalAddon:
     ) -> None:
         await asyncio.sleep(5)
         while True:
+            allowed, _ = usage_governor.authorize("collector", automatic=True)
+            if not allowed:
+                await asyncio.sleep(COLLECT_SECONDS)
+                continue
             try:
                 binance, spot = await asyncio.gather(
                     snapshot_provider(force=True),
                     spot_provider(force=True),
                 )
-                await self.collect_market(binance, spot, force=True)
+                await self.collect_market(binance, spot, force=True, persist=True)
                 report = build_chad_report(store=True)
                 evaluate_alerts(report)
                 prediction_ledger(limit=5)
@@ -155,6 +172,7 @@ class TerminalAddon:
         spot: dict[str, Any],
         *,
         force: bool = False,
+        persist: bool = False,
     ) -> dict[str, Any]:
         now = time.monotonic()
         cached = self.market_cache.get("value")
@@ -184,10 +202,12 @@ class TerminalAddon:
                 "sourceStatus": "live" if spot.get("available") else "unavailable",
                 "recordedAt": spot.get("generatedAt"),
             }
+            await self.ensure_external_clients()
             futures = await multi_exchange_service.collect(binance)
-            self.persist_spot(spot_compat)
-            self.persist_binance(binance)
-            multi_exchange_service.persist(futures, spot_compat)
+            if persist:
+                self.persist_spot(spot_compat)
+                self.persist_binance(binance)
+                multi_exchange_service.persist(futures, spot_compat)
             history = server_oi_history()
             futures = {
                 **futures,
@@ -345,21 +365,66 @@ class TerminalAddon:
             }
 
     @staticmethod
-    def build_terminal_payload() -> dict[str, Any]:
-        report = build_chad_report(store=True)
-        evaluate_alerts(report)
+    def stored_market() -> dict[str, Any]:
+        """Return one compact point-in-time market packet without writing."""
+        with session_scope() as session:
+            spot_row = session.scalar(
+                select(SpotSnapshotRow)
+                .order_by(SpotSnapshotRow.recorded_at.desc())
+                .limit(1)
+            )
+            aggregate_row = session.scalar(
+                select(AggregateSnapshotRow)
+                .order_by(AggregateSnapshotRow.recorded_at.desc())
+                .limit(1)
+            )
+            binance_row = session.scalar(
+                select(BinanceSnapshot)
+                .order_by(BinanceSnapshot.recorded_at.desc())
+                .limit(1)
+            )
+        spot = json.loads(spot_row.payload_json) if spot_row else {}
+        aggregate = json.loads(aggregate_row.payload_json) if aggregate_row else {}
+        futures = (
+            aggregate.get("futures")
+            if isinstance(aggregate.get("futures"), dict)
+            else aggregate
+        )
+        binance = json.loads(binance_row.payload_json) if binance_row else {}
+        return {
+            "generatedAt": (
+                _parse_datetime(aggregate_row.recorded_at).isoformat()
+                if aggregate_row
+                else utc_now().isoformat()
+            ),
+            "spot": spot if isinstance(spot, dict) else {},
+            "futures": futures if isinstance(futures, dict) else {},
+            "binance": binance if isinstance(binance, dict) else {},
+            "serverOiHistory": server_oi_history(),
+            "readOnlyStoredEvidence": True,
+        }
+
+    @staticmethod
+    def build_terminal_payload(
+        *,
+        store: bool = False,
+        evaluate: bool = False,
+    ) -> dict[str, Any]:
+        report = build_chad_report(store=store)
+        if evaluate:
+            evaluate_alerts(report)
         return {
             "generatedAt": utc_now().isoformat(),
             "serverOiHistory": server_oi_history(),
-            "heatmap": heatmap(24, 32),
-            "liquidations": liquidation_feed(24, 100),
+            "heatmap": heatmap(24, 28),
+            "liquidations": liquidation_feed(24, 40),
             "chad": report,
-            "chadHistory": chad_history(30).get("history", []),
-            "predictions": prediction_ledger(60),
-            "alerts": alert_feed(20).get("alerts", []),
-            "alertTimeline": alert_timeline(120),
-            "paper": paper_ledger(150),
-            "social": social_ledger(150),
+            "chadHistory": chad_history(12).get("history", []),
+            "predictions": prediction_ledger(30, grade=False),
+            "alerts": alert_feed(12).get("alerts", []),
+            "alertTimeline": alert_timeline(60),
+            "paper": paper_ledger(50, evaluate=False, create_account=False),
+            "social": social_ledger(50, refresh_grades=False),
         }
 
 

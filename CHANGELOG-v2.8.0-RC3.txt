@@ -1,0 +1,16 @@
+TAG RELAY 2.8.0 RC3
+
+- Added default-on emergency repair mode and explicit feature flags.
+- Made health checks side-effect free.
+- Made Android terminal reads bounded, cached, coalesced and read-only.
+- Disabled collectors, WebSockets, graders, CMC polling, backfills, mutations and all OpenAI in repair mode.
+- Added stable-evidence OpenAI cache and explicit paid-call authorization for later non-repair operation.
+- Added in-process daily/monthly usage circuit breakers.
+- Added bounded/narrow database queries, composite indexes and a small connection pool.
+- Prevented confirmed alert downgrades from noisy snapshots.
+- Corrected current-book heatmap side labeling and separated historical samples.
+- Bounded analog discovery and forecast grading.
+- Deduplicated equivalent reports and forecasts.
+- Removed false challenger-model and fully-live-source claims.
+- Added 2.8.0-rc3 operating/build metadata.
+- Added cost-safety regression tests; total suite is 19 tests.

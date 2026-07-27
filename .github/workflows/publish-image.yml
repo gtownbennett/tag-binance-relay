@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-      - v2.5.0-durable-intelligence
+      - v2.8.0-rc3-cost-safe
   workflow_dispatch:
 
 permissions:

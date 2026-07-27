@@ -6,14 +6,24 @@ import unittest
 from datetime import timedelta
 from unittest.mock import patch
 
-from sqlalchemy import delete
+from fastapi import HTTPException
+from sqlalchemy import delete, func, select
 
 from app import main
 from app.terminal_database import (
     AggregateSnapshotRow,
+    AlertEventRow,
+    AlertTimelineRow,
     BinanceSnapshot,
+    ChadReportRow,
+    ForecastRecordRow,
     LiquidationEvent,
     OrderBookSnapshot,
+    PaperAccountRow,
+    PaperEquityRow,
+    PaperTradeRow,
+    SocialCallRow,
+    SocialCallerRow,
     SpotSnapshotRow,
     VisionRow,
     init_db,
@@ -21,6 +31,7 @@ from app.terminal_database import (
     session_scope,
     utc_now,
 )
+from app.terminal_addon import terminal_addon
 from app.terminal_intelligence import (
     LONG_TERM_HORIZONS,
     build_chad_report,
@@ -45,6 +56,15 @@ def clear_tables() -> None:
             AggregateSnapshotRow,
             SpotSnapshotRow,
             VisionRow,
+            ChadReportRow,
+            ForecastRecordRow,
+            AlertEventRow,
+            AlertTimelineRow,
+            PaperEquityRow,
+            PaperTradeRow,
+            PaperAccountRow,
+            SocialCallRow,
+            SocialCallerRow,
         ):
             session.execute(delete(model))
 
@@ -154,8 +174,8 @@ def seed_market() -> None:
 
         for index in range(12):
             levels = {
-                "bids": [[0.001 * (1 - index * 0.0002), 100_000, 100]],
-                "asks": [[0.001 * (1 + index * 0.0002), 90_000, 90]],
+                "bids": [[0.001 * (1 - (index + 1) * 0.0002), 100_000, 100]],
+                "asks": [[0.001 * (1 + (index + 1) * 0.0002), 90_000, 90]],
             }
             session.add(
                 OrderBookSnapshot(
@@ -214,6 +234,13 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(history["change1hPct"])
         self.assertIsNotNone(history["change4hPct"])
         self.assertEqual(depth["sampleCount"], 12)
+        self.assertTrue(depth["historyNotMergedIntoCurrentBook"])
+        self.assertTrue(
+            all(row["price"] < depth["currentPrice"] for row in depth["strongestBidZones"] if row["bidIntensity"] > 0)
+        )
+        self.assertTrue(
+            all(row["price"] > depth["currentPrice"] for row in depth["strongestAskZones"] if row["askIntensity"] > 0)
+        )
         self.assertEqual(liquidations["eventCount"], 3)
         self.assertEqual(liquidations["longUsd"], 200.0)
         self.assertEqual(liquidations["shortUsd"], 400.0)
@@ -226,6 +253,53 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
         long_term = [row for row in chad["forecastHorizons"] if row["label"] in LONG_TERM_HORIZONS]
         self.assertEqual(len(long_term), len(LONG_TERM_HORIZONS))
         self.assertTrue(all(row["status"] == "not-calibrated" and row["probability"] is None for row in long_term))
+
+    def test_terminal_read_does_not_create_reports_forecasts_alerts_or_accounts(self) -> None:
+        seed_market()
+        protected_models = (
+            ChadReportRow,
+            ForecastRecordRow,
+            AlertEventRow,
+            AlertTimelineRow,
+            PaperAccountRow,
+            PaperTradeRow,
+            PaperEquityRow,
+            SocialCallerRow,
+            SocialCallRow,
+        )
+
+        def counts() -> dict[str, int]:
+            with session_scope() as session:
+                return {
+                    model.__tablename__: session.scalar(select(func.count()).select_from(model)) or 0
+                    for model in protected_models
+                }
+
+        before = counts()
+        payload = terminal_addon.build_terminal_payload(store=False, evaluate=False)
+        after = counts()
+
+        self.assertEqual(before, after)
+        self.assertTrue(payload["chad"])
+        self.assertTrue(payload["paper"]["paperOnly"])
+
+    async def test_health_check_has_no_database_or_external_side_effects(self) -> None:
+        with patch.object(terminal_addon, "counts", side_effect=AssertionError("health queried the database")):
+            result = await main.health()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["healthCheckSideEffects"], "none")
+        self.assertIsNone(result["terminalHistoryCounts"])
+
+    async def test_repair_mode_blocks_paid_and_mutating_routes(self) -> None:
+        blocked_calls = (
+            main.terminal_test_alert_endpoint(x_relay_key=None),
+            main.terminal_paper_order_endpoint(payload={}, x_relay_key=None),
+            main.chad_analyze(main.ChadAnalyzeRequest(allowPaidCall=True), x_relay_key=None),
+        )
+        for call in blocked_calls:
+            with self.assertRaises(HTTPException) as caught:
+                await call
+            self.assertEqual(caught.exception.status_code, 423)
 
     def test_binance_normalisation(self) -> None:
         service = MultiExchangeService()

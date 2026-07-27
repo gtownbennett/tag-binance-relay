@@ -1,59 +1,50 @@
-# TAG Terminal Relay 2.7.0 RC2 — Paper, Social Calls and Alert History
+# TAG Terminal Relay 2.8.0 RC3 — Cost-Safe Repair Release
 
-This is an additive release candidate built on the verified durable TAG relay. It preserves the existing five-exchange market collector, PostgreSQL history, Chad analysis, prediction grading, freshness rules, Binance Vision import and protected relay connection.
+This release contains the RC2 paper/social system and an emergency repair mode designed to stop uncontrolled Neon, Render, and OpenAI usage.
 
-## RC2 additions
+## Safe defaults
 
-- Persistent alert timeline: first seen → candidate → confirmed → invalidated/resolved.
-- Dedicated TAG paper-futures simulator with a $10,000 paper-USDT account.
-- PAPER / NO REAL FUNDS enforcement; no exchange login, trading key, wallet or real order route.
-- Isolated-margin Market, Limit and Trigger paper orders with transparent estimated fees, funding and liquidation risk.
-- Paper positions, pending orders, realized/unrealized P/L, equity curve, grades and post-mortems.
-- Persistent social-caller and social-call scorecards with exact-time provenance and no guessed timestamps or entries.
-- Optional official CoinMarketCap Content API ingestion and historical quote comparison.
-- Stored DEX/exchange evidence around each social call, including OI, funding, taker flow and source status.
-- Consolidated forecast read model that displays both the OpenAI Chad ledger and deterministic Terminal ledger, preserves their source labels and grades due outcomes automatically.
-- Server-created test alert for Android notification diagnostics.
+With missing environment flags, the relay starts with:
 
-## Main TAG Terminal endpoints
+- `REPAIR_MODE=true`
+- `LIVE_COLLECTORS_ENABLED=false`
+- `BACKFILL_ENABLED=false`
+- `OPENAI_AUTOMATIC_ENABLED=false`
+- `PUSH_ENABLED=false`
 
-- `GET /v1/tag/terminal` — complete Android payload, including unified grading, alerts, paper and social ledgers.
-- `GET /v1/tag/predictions/unified` — source-labelled consolidated forecast record.
-- `GET /v1/tag/alert-timeline` — alert-stage history and active alert paths.
-- `POST /v1/tag/alerts/test` — protected diagnostic alert; not a market signal.
-- `GET /v1/tag/paper` — paper account, trades and equity history.
-- `POST /v1/tag/paper/orders` — paper-only Market/Limit/Trigger order.
-- `POST /v1/tag/paper/trades/{id}/close` and `/v1/tag/paper/orders/{id}/cancel`.
-- `GET /v1/tag/social` — callers, calls, grades, returns and evidence provenance.
-- Admin-only social import/research endpoints under `/v1/admin/social/`.
+The Render blueprint sets the same values explicitly. Provider spending limits remain the final cap and must not be raised automatically.
 
-Existing `/v1/chad/*`, market, heatmap, liquidations, forecast, patterns, Binance Vision and history endpoints remain available.
+## Cost repairs
 
-## Social-call timestamp rules
+- `/health` uses memory only; it never queries Neon or pings an exchange.
+- `GET /v1/tag/terminal` is read-only, bounded, cached for five minutes in repair mode, and coalesces concurrent refreshes.
+- GET/read routes no longer create Chad reports, forecasts, grades, alerts, paper accounts, or social-grade writes.
+- Client snapshot ingestion, paper/social mutations, history collection, backfills, collectors, WebSockets, CMC polling, grading, and all OpenAI are blocked in repair mode.
+- After repair mode is deliberately disabled, an OpenAI call still requires an authenticated explicit request with `allowPaidCall=true`; results are cached by stable evidence hash.
+- Database reads use narrow columns, bounded windows, composite indexes, and a two-connection PostgreSQL pool.
+- Daily/monthly in-process circuit breakers and usage/cache telemetry are exposed through `operatingStatus`.
 
-An exact post time is accepted only from source metadata such as the official CMC `post_time`, ISO metadata, JSON-LD or an explicit `<time datetime>` value. Relative labels such as “2h ago” are never converted into an invented timestamp. An entry is aligned only when a stored DEX snapshot or optional CMC historical quote is sufficiently close to that exact post time.
+## Accuracy repairs
 
-Automatic CMC polling requires `CMC_PRO_API_KEY`. `CMC_TAG_ID` enables supplemental historical quote comparisons. Without those variables, the ledger stays operational for verified manual/admin imports and explicitly reports that CMC automation is not configured.
-
-## Accuracy and safety
-
-- Missing, stale or contradictory values stay missing and reduce confidence.
-- Exact Binance taker B/S uses the same timestamped trailing 60-minute window.
-- The internal heatmap is stored visible order-book liquidity, not a guaranteed liquidation map.
-- Paper liquidation, funding and fees are educational estimates, never exchange guarantees.
-- No automatic real orders can be created by this service.
-
-## Storage
-
-Set `TERMINAL_DATABASE_URL` or Render's `DATABASE_URL` to PostgreSQL. New SQLAlchemy tables are created additively; the upgrade does not drop prior history. SQLite under `/tmp` is only a temporary local/test fallback.
+- A confirmed alert cannot fall back to candidate/observed from one noisy snapshot.
+- Current heatmap bids must be below the current mark and asks above it; historical books are retained only as sample counts.
+- Historical analogs are bounded and separated in time.
+- Forecast reports and equivalent forecasts are deduplicated.
+- Unified forecast status remains collecting/warming until every required horizon is independently calibrated.
+- Multi-exchange feeds expose per-metric coverage and sanitized errors instead of claiming fully live data from a partial response.
 
 ## Validation
 
 ```bash
-pip install -r requirements.txt
-python -m py_compile app/*.py
-python -m unittest discover -s tests -v
-python -c "from app.main import app; print(len(app.openapi()['paths']))"
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
+mkdir -p .testdata
+TERMINAL_DATABASE_URL=sqlite:///./.testdata/relay.sqlite3 \
+LEDGER_DATABASE_URL=sqlite:///./.testdata/ledger.sqlite3 \
+REPAIR_MODE=true \
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
-See `START-HERE-v2.7.0-RC2.txt` and `VALIDATION-v2.7.0-RC2.txt` before deployment.
+Expected: 19 tests pass.
+
+Read `00-START-HERE-v2.8.0-RC3.txt` and `VALIDATION-v2.8.0-RC3.txt`. Older release files are history only.

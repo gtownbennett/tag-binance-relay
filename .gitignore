@@ -1,0 +1,12 @@
+.env
+.venv/
+.testdata/
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+.pytest_cache/
+.mypy_cache/
+pip-metadata-*/
+pip-unpack-*/

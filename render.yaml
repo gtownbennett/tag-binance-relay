@@ -1,8 +1,19 @@
 services:
   - type: web
-    name: tag-binance-relay
+    name: tag-binance-relay-rc2-preview
     runtime: docker
     region: frankfurt
     plan: free
     healthCheckPath: /health
     autoDeployTrigger: commit
+    envVars:
+      - key: REPAIR_MODE
+        value: "true"
+      - key: LIVE_COLLECTORS_ENABLED
+        value: "false"
+      - key: BACKFILL_ENABLED
+        value: "false"
+      - key: OPENAI_AUTOMATIC_ENABLED
+        value: "false"
+      - key: PUSH_ENABLED
+        value: "false"

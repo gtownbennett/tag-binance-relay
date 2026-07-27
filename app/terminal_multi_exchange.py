@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -14,6 +15,21 @@ BITGET = "https://api.bitget.com"
 MEXC = "https://contract.mexc.com"
 GATE_HOSTS = ("https://api.gateio.ws/api/v4", "https://fx-api.gateio.ws/api/v4")
 BINGX_HOSTS = ("https://open-api.bingx.com", "https://open-api.bingx.pro")
+
+
+def _public_error(value: Any) -> str:
+    text = str(value or "").strip()
+    lowered = text.lower()
+    if "429" in lowered or "rate limit" in lowered:
+        return "Rate limited; this metric is temporarily excluded."
+    if "403" in lowered or "forbidden" in lowered:
+        return "Endpoint unavailable from the relay region; this metric is excluded."
+    if "ssl" in lowered or "certificate" in lowered or "tls" in lowered:
+        return "Secure connection validation failed; this metric is excluded."
+    if "timeout" in lowered or "timed out" in lowered:
+        return "Source timed out; this metric is temporarily excluded."
+    text = re.sub(r"https?://\S+", "source endpoint", text)
+    return text[:180] if text else "Source metric unavailable."
 
 
 def _finite(value: Any) -> float | None:
@@ -330,7 +346,7 @@ class MultiExchangeService:
     def binance_from_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
         quality = str(payload.get("takerWindowQuality") or "")
         notes: list[str] = []
-        if quality:
+        if quality and quality != "live-exact":
             notes.append(f"Taker window: {quality}")
         for error in payload.get("errors") or []:
             notes.append(str(error))
@@ -390,10 +406,34 @@ class MultiExchangeService:
         notes: list[str],
         extras: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        usable = any(value is not None for value in (mark, oi_usd, volume, funding))
+        safe_notes = list(dict.fromkeys(_public_error(note) for note in notes if str(note).strip()))
+        core_values = {
+            "price": mark,
+            "openInterest": oi_usd,
+            "volume24h": volume,
+            "funding": funding,
+            "depth": bid_depth if bid_depth is not None and ask_depth is not None else None,
+        }
+        metric_health = {
+            key: {
+                "status": "LIVE" if value is not None else "UNAVAILABLE",
+                "includedInAggregate": value is not None,
+            }
+            for key, value in core_values.items()
+        }
+        source_status = (
+            "live"
+            if all(value is not None for key, value in core_values.items() if key != "depth")
+            and not safe_notes
+            else "partial"
+            if usable
+            else "unavailable"
+        )
         payload = {
             "exchange": exchange,
             "symbol": symbol,
-            "available": any(value is not None for value in (mark, oi_usd, volume, funding)),
+            "available": usable,
             "markPrice": mark,
             "indexPrice": index,
             "priceChange24h": change,
@@ -405,12 +445,16 @@ class MultiExchangeService:
             "nextFundingTime": next_funding,
             "bidDepth1PercentUsd": bid_depth,
             "askDepth1PercentUsd": ask_depth,
-            "note": " • ".join(notes) if notes else None,
-            "sourceStatus": "live",
+            "note": " • ".join(safe_notes) if safe_notes else None,
+            "sourceStatus": source_status,
+            "metricHealth": metric_health,
             "updatedAt": datetime.now(timezone.utc).isoformat(),
         }
         if extras:
-            payload.update(extras)
+            requested_status = str(extras.get("sourceStatus") or "").lower()
+            payload.update({key: value for key, value in extras.items() if key != "sourceStatus"})
+            if requested_status in {"stale", "unavailable", "historical"}:
+                payload["sourceStatus"] = requested_status
         return payload
 
     async def collect(self, binance_payload: dict[str, Any]) -> dict[str, Any]:
@@ -421,11 +465,22 @@ class MultiExchangeService:
         names = ["Bitget", "MEXC", "Gate", "BingX"]
         for name, result in zip(names, results):
             if isinstance(result, Exception):
-                exchanges.append({"exchange": name, "symbol": "TAGUSDT", "available": False, "sourceStatus": "unavailable", "note": str(result)})
-                errors.append(f"{name}: {result}")
+                safe_error = _public_error(result)
+                exchanges.append({
+                    "exchange": name,
+                    "symbol": "TAGUSDT",
+                    "available": False,
+                    "sourceStatus": "unavailable",
+                    "metricHealth": {
+                        key: {"status": "UNAVAILABLE", "includedInAggregate": False}
+                        for key in ("price", "openInterest", "volume24h", "funding", "depth")
+                    },
+                    "note": safe_error,
+                })
+                errors.append(f"{name}: {safe_error}")
             else:
                 exchanges.append(result)
-        exchanges.append(self.binance_from_snapshot(binance_payload))
+        exchanges = [self.binance_from_snapshot(binance_payload), *exchanges]
         active = [
             row
             for row in exchanges
@@ -444,6 +499,34 @@ class MultiExchangeService:
         largest = max(active, key=lambda row: _finite(row.get("openInterestUsd")) or 0.0, default=None)
         binance = next((row for row in active if row.get("exchange") == "Binance"), {})
         coverage_key = "|".join(sorted(str(row.get("exchange")) for row in active))
+        metric_coverage = {
+            "price": [
+                str(row.get("exchange"))
+                for row in active
+                if _finite(row.get("markPrice")) is not None
+            ],
+            "openInterest": [
+                str(row.get("exchange"))
+                for row in active
+                if _finite(row.get("openInterestUsd")) is not None
+            ],
+            "funding": [
+                str(row.get("exchange"))
+                for row in active
+                if _finite(row.get("fundingRate")) is not None
+            ],
+            "volume24h": [
+                str(row.get("exchange"))
+                for row in active
+                if _finite(row.get("volumeUsd24h")) is not None
+            ],
+            "depth": [
+                str(row.get("exchange"))
+                for row in active
+                if _finite(row.get("bidDepth1PercentUsd")) is not None
+                and _finite(row.get("askDepth1PercentUsd")) is not None
+            ],
+        }
         aggregate = {
             "markPrice": mark,
             "indexPrice": _finite(binance.get("indexPrice")),
@@ -473,6 +556,7 @@ class MultiExchangeService:
             "activeExchangeCount": len(active),
             "requestedExchangeCount": 5,
             "coverageKey": coverage_key,
+            "metricCoverage": metric_coverage,
             "exchanges": exchanges,
             "historyStatus": "Server history is collecting.",
             "errors": errors,

@@ -15,12 +15,14 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    event,
     select,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from .terminal_config import DATABASE_URL
+from .terminal_usage import usage_governor
 
 
 def utc_now() -> datetime:
@@ -389,16 +391,47 @@ class VisionRow(Base):
     payload_json: Mapped[str] = mapped_column(Text)
 
 
+class OpenAIAnalysisCacheRow(Base):
+    __tablename__ = "openai_analysis_cache"
+
+    evidence_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    model: Mapped[str] = mapped_column(String(120))
+    trigger: Mapped[str] = mapped_column(String(80), default="explicit-user-request")
+    request_id: Mapped[str | None] = mapped_column(String(160))
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost_usd: Mapped[float | None] = mapped_column(Float)
+    cache_hit_count: Mapped[int] = mapped_column(Integer, default=0)
+    response_json: Mapped[str] = mapped_column(Text)
+
+
 connect_args: dict[str, Any] = {}
 if DATABASE_URL.startswith("sqlite"):
     connect_args["check_same_thread"] = False
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    connect_args=connect_args,
-)
+engine_options: dict[str, Any] = {
+    "pool_pre_ping": True,
+    "connect_args": connect_args,
+}
+if not DATABASE_URL.startswith("sqlite"):
+    # A small LIFO pool avoids Render opening the default five idle
+    # connections against a serverless preview database.
+    engine_options.update(
+        pool_size=2,
+        max_overflow=0,
+        pool_timeout=10,
+        pool_recycle=300,
+        pool_use_lifo=True,
+    )
+
+engine = create_engine(DATABASE_URL, **engine_options)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+@event.listens_for(engine, "after_cursor_execute")
+def _account_query(*_: Any) -> None:
+    usage_governor.record("database_query")
 
 
 def _migrate_postgres_timestamp_columns() -> None:
@@ -419,6 +452,19 @@ def _migrate_postgres_timestamp_columns() -> None:
 def init_db() -> None:
     Base.metadata.create_all(engine)
     _migrate_postgres_timestamp_columns()
+    # Existing PostgreSQL tables predate these composite indexes. create_all()
+    # does not add them to an already-created table, so create them explicitly
+    # and idempotently.
+    statements = (
+        "CREATE INDEX IF NOT EXISTS ix_aggregate_coverage_recorded ON aggregate_snapshots (coverage_key, recorded_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_forecast_due ON forecast_records (status, created_at, horizon_minutes)",
+        "CREATE INDEX IF NOT EXISTS ix_alert_state_created ON alert_events (state_key, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_alert_timeline_state_created ON alert_timeline (state_key, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_social_calls_caller_discovered ON social_calls (caller_id, discovered_at DESC)",
+    )
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 @contextmanager

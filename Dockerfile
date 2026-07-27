@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.source="https://github.com/gtownbennett/tag-binance-relay"
-LABEL org.opencontainers.image.description="TAG market-data relay v2.7.0 RC2 with durable intelligence, paper simulation, social-call grading and alert history"
+LABEL org.opencontainers.image.description="TAG market-data relay v2.8.0 RC3 with default-on cost-safe repair mode"
 LABEL org.opencontainers.image.licenses="MIT"
 
 ENV PYTHONDONTWRITEBYTECODE=1

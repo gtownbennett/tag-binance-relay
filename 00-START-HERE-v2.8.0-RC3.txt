@@ -1,0 +1,29 @@
+TAG RELAY 2.8.0 RC3 — START HERE
+
+STATUS
+- Cost-safe repair candidate.
+- The two existing Render test/preview services remain suspended.
+- Production must not be changed.
+
+DEPLOYMENT ORDER
+1. Create branch v2.8.0-rc3-cost-safe from the verified relay source.
+2. Upload this source without .venv, .testdata, caches, or secrets.
+3. Wait for all 19 tests to pass.
+4. Confirm the preview environment still has:
+   REPAIR_MODE=true
+   LIVE_COLLECTORS_ENABLED=false
+   BACKFILL_ENABLED=false
+   OPENAI_AUTOMATIC_ENABLED=false
+   PUSH_ENABLED=false
+5. Resume only tag-binance-relay-rc2-preview.
+6. Validate /health and one authenticated /v1/tag/terminal request.
+7. Inspect Render and Neon usage before doing anything else.
+8. Suspend the preview again if validation is finished or any usage spike appears.
+
+DO NOT
+- Do not resume tag-binance-relay-v260-test.
+- Do not deploy or merge to production.
+- Do not enable collectors/backfills/OpenAI/push.
+- Do not raise spending limits.
+- Do not run Vision imports or historical backfills.
+- Do not delete Neon data.

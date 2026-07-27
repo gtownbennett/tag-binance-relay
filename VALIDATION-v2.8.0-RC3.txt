@@ -1,0 +1,29 @@
+TAG RELAY 2.8.0 RC3 — VALIDATION
+
+OFFLINE
+[ ] python -m py_compile app/*.py tests/*.py passes.
+[ ] All 19 unit tests pass with workspace SQLite databases.
+[ ] No secret, database, virtualenv, cache, or build file is in the upload.
+
+PREVIEW ENVIRONMENT
+[ ] REPAIR_MODE=true.
+[ ] LIVE_COLLECTORS_ENABLED=false.
+[ ] BACKFILL_ENABLED=false.
+[ ] OPENAI_AUTOMATIC_ENABLED=false.
+[ ] PUSH_ENABLED=false.
+[ ] No spending limit was raised.
+
+BOUNDED LIVE CHECK
+[ ] Resume only tag-binance-relay-rc2-preview.
+[ ] GET /health returns healthCheckSideEffects=none.
+[ ] operatingStatus reports repairMode=true and all paid/background flags false.
+[ ] One authenticated GET /v1/tag/terminal succeeds.
+[ ] Repeating it within five minutes is a cache hit.
+[ ] No new report, forecast, alert, paper-account, or social-grade row is created by either read.
+[ ] No OpenAI request occurs.
+[ ] Paper, social, test-alert, grader and paid-analysis writes return HTTP 423.
+[ ] Render and Neon usage stay flat except for the two bounded terminal reads.
+
+STOP
+[ ] Suspend preview again if any usage spike appears.
+[ ] Do not deploy to production.
