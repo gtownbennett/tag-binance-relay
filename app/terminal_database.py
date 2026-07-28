@@ -22,7 +22,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from .terminal_config import DATABASE_URL
-from .terminal_usage import usage_governor
+from .terminal_usage import account_database_statement, usage_governor
 
 
 def utc_now() -> datetime:
@@ -429,9 +429,31 @@ engine = create_engine(DATABASE_URL, **engine_options)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
+@event.listens_for(engine, "before_cursor_execute")
+def _enforce_request_query_budget(
+    _: Any,
+    __: Any,
+    statement: str,
+    ___: Any,
+    ____: Any,
+    _____: Any,
+) -> None:
+    account_database_statement(statement)
+
+
 @event.listens_for(engine, "after_cursor_execute")
-def _account_query(*_: Any) -> None:
+def _account_query(
+    _: Any,
+    __: Any,
+    statement: str,
+    ___: Any,
+    ____: Any,
+    _____: Any,
+) -> None:
     usage_governor.record("database_query")
+    command = statement.lstrip().split(None, 1)[0].upper() if statement.strip() else ""
+    if command in {"INSERT", "UPDATE", "DELETE", "ALTER", "CREATE", "DROP"}:
+        usage_governor.record("database_write")
 
 
 def _migrate_postgres_timestamp_columns() -> None:

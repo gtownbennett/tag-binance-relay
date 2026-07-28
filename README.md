@@ -1,9 +1,10 @@
-# TAG Terminal Relay 2.8.4 RC6.1 — Startup and Grade Audit
+# TAG Terminal Relay 2.8.5 RC6.2 — Chad Reactivation Gate
 
-This release keeps RC6's working live-plus-stored packet, removes avoidable
-database bootstrap work from repair-mode startup, and corrects misleading
-forecast sample counts. Existing forecast rows remain untouched and available
-for audit.
+This release preserves RC6.1's working protected packet and adds a fail-closed,
+manual-only Chad reactivation gate. It is designed to deploy first with every
+reactivation switch off. The existing Render `OPENAI_API_KEY` is referenced only
+at runtime; no key is included in this repository and no live OpenAI call is
+made by the test suite.
 
 ## Safe defaults
 
@@ -13,10 +14,47 @@ With missing environment flags, the relay starts with:
 - `LIVE_COLLECTORS_ENABLED=false`
 - `BACKFILL_ENABLED=false`
 - `OPENAI_AUTOMATIC_ENABLED=false`
+- `CHAD_REACTIVATION_ENABLED=false`
+- `CHAD_KILL_SWITCH=true`
+- `CHAD_FORECAST_WRITES_ENABLED=false`
+- `CHAD_GRADING_ENABLED=false`
+- `CHAD_CACHE_WRITES_ENABLED=false`
+- `OPENAI_PROJECT_BUDGET_CONFIRMED=false`
 - `PUSH_ENABLED=false`
 - `DB_BOOTSTRAP_ON_START=false`
 
 The Render blueprint sets the same values explicitly. Provider spending limits remain the final cap and must not be raised automatically.
+
+## Chad reactivation safety
+
+- Chad remains unavailable unless all six independent reactivation/budget/write
+  switches agree and the relay token plus existing server-side OpenAI key are
+  configured.
+- The endpoint stays authenticated, manual-only, and requires explicit paid,
+  forecast-lock, and grading approval on each request.
+- One request can make at most one OpenAI attempt. Network and API failures are
+  never retried automatically.
+- One Chad request may run at a time, requests have a five-minute cooldown, and
+  the default in-process ceilings are two requests/calls per day and twenty per
+  month.
+- Per-request ceilings stop work before exceeding 40 database queries, 12
+  database writes, 20 external reads, or one OpenAI call.
+- The OpenAI output cap is 4,000 tokens and cannot be raised above 5,000 by an
+  environment variable.
+- Durable OpenAI evidence-hash caching is mandatory before the gate can open;
+  cache hits no longer create a Neon write.
+- Forecast IDs are deterministic from the evidence hash, so the same evidence
+  cannot create a duplicate locked forecast after a retry or restart.
+- New paid calls are blocked before OpenAI when the six-hour forecast cadence
+  cannot accept a new immutable forecast.
+- Regime changes require two observations separated by at least five minutes;
+  an unconfirmed change cannot lock a forecast.
+- Due grading is limited to four horizons per batch and accepts only a 5-minute
+  Binance close within 15 minutes of the exact forecast due time.
+- `/health` exposes blockers, safe feature flags, request/cache/retry telemetry,
+  token counts, and budget usage without exposing credentials or querying Neon.
+- PostgreSQL ledgers no longer export the entire history after each new forecast
+  write, removing an avoidable Neon egress pattern.
 
 ## Cost repairs
 
@@ -38,7 +76,7 @@ The Render blueprint sets the same values explicitly. Provider spending limits r
 - Core spot/leverage data still returns if an optional stored-intelligence table is unavailable.
 - GET/read routes no longer create Chad reports, forecasts, grades, alerts, paper accounts, or social-grade writes.
 - Client snapshot ingestion, paper/social mutations, history collection, backfills, collectors, WebSockets, CMC polling, grading, and all OpenAI are blocked in repair mode.
-- After repair mode is deliberately disabled, an OpenAI call still requires an authenticated explicit request with `allowPaidCall=true`; results are cached by stable evidence hash.
+- RC6.2 keeps repair mode enabled and permits only the narrow Chad route after every reactivation gate passes; unrelated writes and automatic work remain blocked.
 - Database reads use narrow columns, bounded windows, composite indexes, and a two-connection PostgreSQL pool.
 - Daily/monthly in-process circuit breakers and usage/cache telemetry are exposed through `operatingStatus`.
 
@@ -84,8 +122,9 @@ REPAIR_MODE=true \
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Expected: 34 tests pass.
+Expected: 45 tests pass.
 
-Read `00-START-HERE-v2.8.4-RC6.1.txt`,
-`VALIDATION-v2.8.4-RC6.1.txt`, and
+Read `00-START-HERE-v2.8.5-RC6.2.txt`,
+`VALIDATION-v2.8.5-RC6.2.txt`, and
+`CHANGELOG-v2.8.5-RC6.2.txt`. Also retain
 `FORECAST-GRADE-AUDIT-v2.8.4-RC6.1.txt`. Older release files are history only.

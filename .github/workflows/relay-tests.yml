@@ -8,6 +8,8 @@ on:
       - v2.8.1-rc4-manual-live
       - v2.8.2-rc5-fast-manual
       - v2.8.3-rc6-bounded-neon
+      - v2.8.4-rc6-1-startup-grade-audit
+      - v2.8.5-rc6-2-chad-reactivation-gate
   pull_request:
   workflow_dispatch:
 

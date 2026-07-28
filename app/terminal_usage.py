@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 import threading
 from collections import defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterator
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -29,11 +32,41 @@ LIVE_COLLECTORS_ENABLED = env_bool("LIVE_COLLECTORS_ENABLED", False)
 BACKFILL_ENABLED = env_bool("BACKFILL_ENABLED", False)
 OPENAI_AUTOMATIC_ENABLED = env_bool("OPENAI_AUTOMATIC_ENABLED", False)
 PUSH_ENABLED = env_bool("PUSH_ENABLED", False)
+CHAD_REACTIVATION_ENABLED = env_bool("CHAD_REACTIVATION_ENABLED", False)
+CHAD_KILL_SWITCH = env_bool("CHAD_KILL_SWITCH", True)
+CHAD_FORECAST_WRITES_ENABLED = env_bool("CHAD_FORECAST_WRITES_ENABLED", False)
+CHAD_GRADING_ENABLED = env_bool("CHAD_GRADING_ENABLED", False)
+CHAD_CACHE_WRITES_ENABLED = env_bool("CHAD_CACHE_WRITES_ENABLED", False)
+OPENAI_PROJECT_BUDGET_CONFIRMED = env_bool(
+    "OPENAI_PROJECT_BUDGET_CONFIRMED",
+    False,
+)
 # The protected repair deployment already has a verified schema. Re-running
 # create_all(), ALTER TABLE, CREATE INDEX, and ledger bootstrap work on every
 # Render wake delays readiness and performs avoidable Neon queries. Normal mode
 # keeps the existing bootstrap default; repair mode can opt back in explicitly.
 DB_BOOTSTRAP_ON_START = env_bool("DB_BOOTSTRAP_ON_START", not REPAIR_MODE)
+
+CHAD_REQUEST_DATABASE_QUERY_LIMIT = env_int(
+    "CHAD_REQUEST_DATABASE_QUERY_LIMIT",
+    40,
+    minimum=1,
+)
+CHAD_REQUEST_DATABASE_WRITE_LIMIT = env_int(
+    "CHAD_REQUEST_DATABASE_WRITE_LIMIT",
+    12,
+    minimum=0,
+)
+CHAD_REQUEST_EXTERNAL_REQUEST_LIMIT = env_int(
+    "CHAD_REQUEST_EXTERNAL_REQUEST_LIMIT",
+    20,
+    minimum=1,
+)
+CHAD_REQUEST_OPENAI_CALL_LIMIT = env_int(
+    "CHAD_REQUEST_OPENAI_CALL_LIMIT",
+    1,
+    minimum=1,
+)
 
 BUILD_ID = (
     os.getenv("RENDER_GIT_COMMIT")
@@ -41,6 +74,76 @@ BUILD_ID = (
     or os.getenv("SOURCE_BUILD_ID")
     or "source-package"
 ).strip()
+
+
+class RequestBudgetExceeded(RuntimeError):
+    def __init__(self, category: str, limit: int) -> None:
+        self.category = category
+        self.limit = limit
+        super().__init__(f"{category} request budget exceeded ({limit}).")
+
+
+@dataclass
+class RequestBudget:
+    limits: dict[str, int]
+    used: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+
+    def consume(self, category: str, amount: int = 1) -> None:
+        safe_amount = max(0, int(amount))
+        next_value = int(self.used.get(category, 0)) + safe_amount
+        limit = int(self.limits.get(category, 0))
+        if limit >= 0 and next_value > limit:
+            raise RequestBudgetExceeded(category, limit)
+        self.used[category] = next_value
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "used": dict(self.used),
+            "limits": dict(self.limits),
+            "withinBudget": all(
+                int(self.used.get(category, 0)) <= int(limit)
+                for category, limit in self.limits.items()
+            ),
+        }
+
+
+_request_budget: ContextVar[RequestBudget | None] = ContextVar(
+    "tag_terminal_request_budget",
+    default=None,
+)
+
+
+@contextmanager
+def request_budget_scope(
+    limits: dict[str, int] | None = None,
+) -> Iterator[RequestBudget]:
+    budget = RequestBudget(
+        limits=limits
+        or {
+            "database_query": CHAD_REQUEST_DATABASE_QUERY_LIMIT,
+            "database_write": CHAD_REQUEST_DATABASE_WRITE_LIMIT,
+            "external_request": CHAD_REQUEST_EXTERNAL_REQUEST_LIMIT,
+            "openai_call": CHAD_REQUEST_OPENAI_CALL_LIMIT,
+        }
+    )
+    token: Token[RequestBudget | None] = _request_budget.set(budget)
+    try:
+        yield budget
+    finally:
+        _request_budget.reset(token)
+
+
+def consume_request_budget(category: str, amount: int = 1) -> None:
+    budget = _request_budget.get()
+    if budget is not None:
+        budget.consume(category, amount)
+
+
+def account_database_statement(statement: str) -> None:
+    consume_request_budget("database_query")
+    command = statement.lstrip().split(None, 1)[0].upper() if statement.strip() else ""
+    if command in {"INSERT", "UPDATE", "DELETE", "ALTER", "CREATE", "DROP"}:
+        consume_request_budget("database_write")
 
 
 class UsageGovernor:
@@ -63,8 +166,16 @@ class UsageGovernor:
         self._last_bounded_test_at: str | None = None
         self._limits = {
             "openai_call": (
-                env_int("OPENAI_DAILY_CALL_LIMIT", 3),
-                env_int("OPENAI_MONTHLY_CALL_LIMIT", 30),
+                env_int("OPENAI_DAILY_CALL_LIMIT", 2),
+                env_int("OPENAI_MONTHLY_CALL_LIMIT", 20),
+            ),
+            "chad_request": (
+                env_int("CHAD_DAILY_REQUEST_LIMIT", 2),
+                env_int("CHAD_MONTHLY_REQUEST_LIMIT", 20),
+            ),
+            "chad_grade_batch": (
+                env_int("CHAD_GRADE_DAILY_BATCH_LIMIT", 4),
+                env_int("CHAD_GRADE_MONTHLY_BATCH_LIMIT", 80),
             ),
             "external_request": (
                 env_int("EXTERNAL_DAILY_REQUEST_LIMIT", 250),
@@ -167,6 +278,12 @@ class UsageGovernor:
                     "openAiAutomaticEnabled": OPENAI_AUTOMATIC_ENABLED,
                     "pushEnabled": PUSH_ENABLED,
                     "databaseBootstrapOnStart": DB_BOOTSTRAP_ON_START,
+                    "chadReactivationEnabled": CHAD_REACTIVATION_ENABLED,
+                    "chadKillSwitch": CHAD_KILL_SWITCH,
+                    "chadForecastWritesEnabled": CHAD_FORECAST_WRITES_ENABLED,
+                    "chadGradingEnabled": CHAD_GRADING_ENABLED,
+                    "chadCacheWritesEnabled": CHAD_CACHE_WRITES_ENABLED,
+                    "openAiProjectBudgetConfirmed": OPENAI_PROJECT_BUDGET_CONFIRMED,
                 },
                 "today": dict(self._daily),
                 "month": dict(self._monthly),

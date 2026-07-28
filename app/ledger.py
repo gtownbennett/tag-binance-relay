@@ -15,6 +15,8 @@ from typing import Any
 from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Connection, Engine
 
+from .terminal_usage import account_database_statement, usage_governor
+
 HORIZON_HOURS: dict[str, int] = {
     "6h": 6,
     "24h": 24,
@@ -61,6 +63,18 @@ def _as_float(value: Any) -> float | None:
         result = float(value)
         return result if math.isfinite(result) else None
     except (TypeError, ValueError):
+        return None
+
+
+def _sample_offset_seconds(actual_at: Any, due_ts: Any) -> float | None:
+    if not actual_at:
+        return None
+    try:
+        actual_datetime = datetime.fromisoformat(str(actual_at).replace("Z", "+00:00"))
+        if actual_datetime.tzinfo is None:
+            actual_datetime = actual_datetime.replace(tzinfo=timezone.utc)
+        return round(abs(actual_datetime.timestamp() - float(due_ts)), 3)
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -206,12 +220,48 @@ class _SqlAlchemyConnection:
         return "".join(rebuilt), bindings
 
     def execute(self, statement: str, params: Any = None) -> _SqlAlchemyResult:
+        account_database_statement(statement)
         sql, bindings = self._prepare(statement, params)
         result = self._connection.execute(sql_text(sql), bindings)
         command = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+        usage_governor.record("database_query")
         if command in {"INSERT", "UPDATE", "DELETE"} and result.rowcount and result.rowcount > 0:
             self.total_changes += int(result.rowcount)
+            usage_governor.record("database_write")
         return _SqlAlchemyResult(result)
+
+    def executescript(self, script: str) -> None:
+        for statement in script.split(";"):
+            statement = statement.strip()
+            if statement:
+                self.execute(statement)
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+class _BudgetedSqliteConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    @property
+    def total_changes(self) -> int:
+        return int(self._connection.total_changes)
+
+    def execute(self, statement: str, params: Any = None) -> sqlite3.Cursor:
+        account_database_statement(statement)
+        usage_governor.record("database_query")
+        command = statement.lstrip().split(None, 1)[0].upper() if statement.strip() else ""
+        if params is None:
+            cursor = self._connection.execute(statement)
+        else:
+            cursor = self._connection.execute(statement, params)
+        if command in {"INSERT", "UPDATE", "DELETE"} and cursor.rowcount and cursor.rowcount > 0:
+            usage_governor.record("database_write")
+        return cursor
 
     def executescript(self, script: str) -> None:
         for statement in script.split(";"):
@@ -266,7 +316,10 @@ class PredictionLedger:
         self.deadband_pct = max(0.1, float(deadband_pct))
         self.max_records = max(100, int(max_records))
         self.backup_path = (backup_path or f"{db_path}.backup.json").strip()
-        self.auto_backup = bool(auto_backup)
+        # Exporting the entire ledger after every write is appropriate for the
+        # legacy local SQLite file, but would create avoidable Neon egress when
+        # PostgreSQL is already the durable source of truth.
+        self.auto_backup = bool(auto_backup and self._database_url is None)
         self._lock = threading.RLock()
         self._last_backup_error: str | None = None
         self._last_backup_at: str | None = None
@@ -285,7 +338,7 @@ class PredictionLedger:
             )
         return "The ledger is stored at the configured LEDGER_DB_PATH."
 
-    def _connect(self) -> sqlite3.Connection | _SqlAlchemyConnection:
+    def _connect(self) -> _BudgetedSqliteConnection | _SqlAlchemyConnection:
         if self._engine is not None:
             return _SqlAlchemyConnection(self._engine)
 
@@ -295,7 +348,7 @@ class PredictionLedger:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
-        return connection
+        return _BudgetedSqliteConnection(connection)
 
     def initialize(self) -> None:
         with self._lock, closing(self._connect()) as db:
@@ -371,8 +424,16 @@ class PredictionLedger:
         analysis: dict[str, Any],
         snapshot: dict[str, Any],
         spot: dict[str, Any],
+        lock_key: str | None = None,
     ) -> str:
-        prediction_id = uuid.uuid4().hex
+        normalized_lock_key = (lock_key or "").strip()
+        prediction_id = (
+            hashlib.sha256(
+                f"tag-terminal-locked-forecast:{normalized_lock_key}".encode("utf-8")
+            ).hexdigest()[:32]
+            if normalized_lock_key
+            else uuid.uuid4().hex
+        )
         created_ts = time.time()
         created_at = utc_iso(created_ts)
 
@@ -418,6 +479,13 @@ class PredictionLedger:
             raise ValueError(f"Forecast ledger is missing valid horizons: {', '.join(missing)}")
 
         with self._lock, closing(self._connect()) as db:
+            if normalized_lock_key:
+                existing = db.execute(
+                    "SELECT id FROM predictions WHERE id = ?",
+                    (prediction_id,),
+                ).fetchone()
+                if existing is not None:
+                    return prediction_id
             db.execute(
                 """
                 INSERT INTO predictions (
@@ -475,6 +543,59 @@ class PredictionLedger:
         self._maybe_backup()
         return prediction_id
 
+    def forecast_lock_status(
+        self,
+        *,
+        lock_key: str,
+        minimum_interval_seconds: int,
+        now_ts: float | None = None,
+    ) -> dict[str, Any]:
+        normalized = lock_key.strip()
+        if not normalized:
+            return {
+                "allowed": False,
+                "reason": "missing_lock_key",
+                "predictionId": None,
+            }
+        prediction_id = hashlib.sha256(
+            f"tag-terminal-locked-forecast:{normalized}".encode("utf-8")
+        ).hexdigest()[:32]
+        current = time.time() if now_ts is None else float(now_ts)
+        with self._lock, closing(self._connect()) as db:
+            existing = db.execute(
+                "SELECT id, created_at FROM predictions WHERE id = ?",
+                (prediction_id,),
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "allowed": False,
+                    "reason": "duplicate_evidence_lock",
+                    "predictionId": prediction_id,
+                    "existingCreatedAt": existing["created_at"],
+                }
+            latest = db.execute(
+                "SELECT id, created_at, created_ts FROM predictions ORDER BY created_ts DESC LIMIT 1"
+            ).fetchone()
+
+        if latest is not None:
+            elapsed = max(0.0, current - float(latest["created_ts"]))
+            minimum = max(0, int(minimum_interval_seconds))
+            if elapsed < minimum:
+                return {
+                    "allowed": False,
+                    "reason": "forecast_cadence",
+                    "predictionId": prediction_id,
+                    "previousPredictionId": latest["id"],
+                    "previousCreatedAt": latest["created_at"],
+                    "retryAfterSeconds": int(minimum - elapsed),
+                }
+
+        return {
+            "allowed": True,
+            "reason": None,
+            "predictionId": prediction_id,
+        }
+
     def _prune_locked(self, db: sqlite3.Connection) -> None:
         count = db.execute("SELECT COUNT(*) AS c FROM predictions").fetchone()["c"]
         excess = int(count) - self.max_records
@@ -520,6 +641,7 @@ class PredictionLedger:
         actual_price_usd: float,
         actual_at: str,
         actual_source: str,
+        max_sample_offset_seconds: int = 900,
     ) -> dict[str, Any]:
         with self._lock, closing(self._connect()) as db:
             row = db.execute(
@@ -535,6 +657,21 @@ class PredictionLedger:
                 raise KeyError("Forecast horizon was not found.")
             if row["status"] == "graded":
                 return dict(row)
+
+            try:
+                actual_datetime = datetime.fromisoformat(actual_at.replace("Z", "+00:00"))
+                if actual_datetime.tzinfo is None:
+                    actual_datetime = actual_datetime.replace(tzinfo=timezone.utc)
+                actual_ts = actual_datetime.timestamp()
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Forecast grade sample time must be valid ISO-8601.") from exc
+            sample_offset_seconds = abs(actual_ts - float(row["due_ts"]))
+            tolerance = max(60, int(max_sample_offset_seconds))
+            if sample_offset_seconds > tolerance:
+                raise ValueError(
+                    "Forecast grade sample is outside the exact-due-time tolerance "
+                    f"({sample_offset_seconds:.0f}s > {tolerance}s)."
+                )
 
             start_price = float(row["start_price_usd"])
             target_low = float(row["target_low_usd"])
@@ -606,6 +743,8 @@ class PredictionLedger:
             "actualPriceUsd": actual_price_usd,
             "actualAt": actual_at,
             "actualSource": actual_source,
+            "sampleOffsetSeconds": round(sample_offset_seconds, 3),
+            "sampleToleranceSeconds": tolerance,
             "actualDirection": actual_direction,
             "directionCorrect": direction_correct,
             "rangeHit": range_hit,
@@ -768,6 +907,10 @@ class PredictionLedger:
                             "actualPriceUsd": h["actual_price_usd"],
                             "actualAt": h["actual_at"],
                             "actualSource": h["actual_source"],
+                            "sampleOffsetSeconds": _sample_offset_seconds(
+                                h["actual_at"],
+                                h["due_ts"],
+                            ),
                             "actualDirection": h["actual_direction"],
                             "directionCorrect": (
                                 bool(h["direction_correct"])
@@ -1279,4 +1422,3 @@ class PredictionLedger:
             "durableServerStorage": not db_path.startswith("/tmp/"),
             "recoveryReady": backup_exists or not db_path.startswith("/tmp/"),
         }
-

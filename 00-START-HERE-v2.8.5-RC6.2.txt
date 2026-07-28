@@ -1,0 +1,56 @@
+TAG RELAY 2.8.5 RC6.2 — START HERE
+
+Purpose
+- Preserve the verified RC6.1 live-plus-stored protected packet.
+- Stage a fail-closed, manual-only Chad reactivation gate.
+- Reuse only the existing OPENAI_API_KEY already stored on Render.
+- Prove budgets, forecast locking, grading, debounce, telemetry, and kill switches before any paid call.
+
+Phase A — safe candidate deployment
+1. Publish branch v2.8.5-rc6-2-chad-reactivation-gate.
+2. Wait for all 45 tests and the container image build to pass.
+3. Suspend only tag-binance-relay-rc2-preview.
+4. Point only that preview at:
+   ghcr.io/gtownbennett/tag-binance-relay:v2.8.5-rc6-2-chad-reactivation-gate
+5. Keep REPAIR_MODE=true.
+6. Keep LIVE_COLLECTORS_ENABLED=false.
+7. Keep BACKFILL_ENABLED=false.
+8. Keep OPENAI_AUTOMATIC_ENABLED=false.
+9. Keep PUSH_ENABLED=false.
+10. Keep DB_BOOTSTRAP_ON_START=false.
+11. Keep CHAD_REACTIVATION_ENABLED=false.
+12. Keep CHAD_KILL_SWITCH=true.
+13. Keep CHAD_FORECAST_WRITES_ENABLED=false.
+14. Keep CHAD_GRADING_ENABLED=false.
+15. Keep CHAD_CACHE_WRITES_ENABLED=false.
+16. Keep OPENAI_PROJECT_BUDGET_CONFIRMED=false.
+17. Do not replace, reveal, copy, or test the existing Render OPENAI_API_KEY.
+18. Deploy and verify /health reports 2.8.5-rc6.2, side effects none,
+    zero startup queries, manualReady=false, and the expected closed-gate blockers.
+19. Perform one normal RC7.1 market refresh to prove RC6.1 behavior did not regress.
+
+Stop after Phase A
+- A green deployment does not authorize a paid Chad call.
+- Do not enable any reactivation flag until Eric reviews the OpenAI project
+  spending limit and explicitly approves the one-call preview test.
+- Do not disable repair mode.
+- Do not enable collectors, backfills, automatic OpenAI, push, or unrelated writes.
+
+Candidate limits
+- 2 Chad requests/OpenAI calls per day.
+- 20 Chad requests/OpenAI calls per month.
+- 5-minute request cooldown.
+- 1 concurrent Chad request.
+- 1 OpenAI attempt and 0 automatic OpenAI retries per request.
+- 40 database queries, 12 database writes, and 20 external reads per request.
+- 4 due grades per request.
+- 6-hour minimum new-forecast cadence.
+- 2 regime observations separated by at least 5 minutes.
+- Grade sample must be within 15 minutes of the exact due time.
+- OpenAI output defaults to 4,000 tokens and is hard-capped at 5,000.
+
+Protected baseline
+- Deployed relay remains RC6.1 until Phase A is deliberately performed.
+- Installed Android remains RC7.1.
+- Existing Neon rows remain unchanged during packaging and Phase A.
+- Production and main remain untouched.

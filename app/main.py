@@ -12,6 +12,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.ledger import PredictionLedger
+from app.chad_reactivation import (
+    CHAD_FORECAST_MIN_INTERVAL_SECONDS,
+    CHAD_GRADING_MAX_PER_BATCH,
+    FORECAST_GRADE_TOLERANCE_SECONDS,
+    chad_reactivation_gate,
+)
 from app.terminal_config import DATABASE_URL as TERMINAL_DATABASE_URL
 from app.terminal_addon import (
     APP_VERSION as TERMINAL_ADDON_VERSION,
@@ -57,12 +63,17 @@ from app.terminal_paper_social import (
 from app.terminal_usage import (
     BACKFILL_ENABLED,
     BUILD_ID,
+    CHAD_CACHE_WRITES_ENABLED,
+    CHAD_GRADING_ENABLED,
     DB_BOOTSTRAP_ON_START,
     LIVE_COLLECTORS_ENABLED,
     OPENAI_AUTOMATIC_ENABLED,
     PUSH_ENABLED,
     REPAIR_MODE,
+    RequestBudgetExceeded,
+    consume_request_budget,
     operating_status,
+    request_budget_scope,
     usage_governor,
 )
 
@@ -74,7 +85,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.8.4-rc6.1"
+SERVICE_VERSION = "2.8.5-rc6.2"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -109,7 +120,10 @@ TAG_CIRCULATING_SUPPLY = float(
     os.getenv("TAG_CIRCULATING_SUPPLY", "108404572594")
 )
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip().lower()
-OPENAI_MAX_OUTPUT_TOKENS = max(600, int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "8000")))
+OPENAI_MAX_OUTPUT_TOKENS = min(
+    5_000,
+    max(1_200, int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "4000"))),
+)
 OPENAI_TIMEOUT_SECONDS = max(20, int(os.getenv("OPENAI_TIMEOUT_SECONDS", "75")))
 
 LEDGER_ENABLED = os.getenv("LEDGER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
@@ -182,11 +196,19 @@ class ChadAnalyzeRequest(BaseModel):
     historyLimit: int = Field(default=72, ge=12, le=240)
     positionTag: float | None = Field(default=None, ge=0)
     averageEntryUsd: float | None = Field(default=None, ge=0)
-    forceFresh: bool = Field(default=True)
+    forceFresh: bool = Field(default=False)
     includeRawHistory: bool = Field(default=False)
     allowPaidCall: bool = Field(
         default=False,
-        description="Must be true for an explicit user-approved paid analysis after repair mode is disabled.",
+        description="Must be true for an explicit user-approved paid analysis through the narrow reactivation gate.",
+    )
+    allowForecastWrite: bool = Field(
+        default=False,
+        description="Must be true to lock a new immutable forecast.",
+    )
+    allowGrading: bool = Field(
+        default=False,
+        description="Must be true to grade due locked forecasts.",
     )
     trigger: str = Field(default="explicit-user-request", max_length=80)
 
@@ -611,6 +633,7 @@ def require_repair_writes_unlocked(action: str) -> None:
 async def get_json(path: str, params: dict[str, Any] | None = None) -> Any:
     if http_client is None:
         raise RuntimeError("HTTP client has not started.")
+    consume_request_budget("external_request")
     allowed, reason = usage_governor.authorize("external_request")
     if not allowed:
         raise RuntimeError(f"External request circuit is open ({reason}).")
@@ -632,6 +655,7 @@ async def get_json(path: str, params: dict[str, Any] | None = None) -> Any:
 async def get_dex_json(path: str) -> Any:
     if http_client is None:
         raise RuntimeError("HTTP client has not started.")
+    consume_request_budget("external_request")
     allowed, reason = usage_governor.authorize("external_request")
     if not allowed:
         raise RuntimeError(f"External request circuit is open ({reason}).")
@@ -924,7 +948,9 @@ def current_market_features(snapshot: dict[str, Any], spot: dict[str, Any]) -> d
     }
 
 
-async def historical_futures_price_near(due_ts: float) -> tuple[float | None, str | None, str | None]:
+async def historical_futures_price_near(
+    due_ts: float,
+) -> tuple[float | None, str | None, float | None, str | None]:
     due_ms = int(due_ts * 1000)
     try:
         rows = await get_json(
@@ -938,10 +964,10 @@ async def historical_futures_price_near(due_ts: float) -> tuple[float | None, st
             },
         )
     except Exception as exc:
-        return None, None, str(exc)
+        return None, None, None, str(exc)
 
     if not isinstance(rows, list) or not rows:
-        return None, None, "Binance returned no 5-minute candle near the forecast due time."
+        return None, None, None, "Binance returned no 5-minute candle near the forecast due time."
 
     candidates: list[tuple[int, float, int]] = []
     for row in rows:
@@ -955,30 +981,62 @@ async def historical_futures_price_near(due_ts: float) -> tuple[float | None, st
         candidates.append((abs(close_time - due_ms), close_price, close_time))
 
     if not candidates:
-        return None, None, "Binance candle rows were missing a usable close price."
+        return None, None, None, "Binance candle rows were missing a usable close price."
 
-    _, price, close_time = min(candidates, key=lambda item: item[0])
-    return price, utc_iso(close_time), "Binance futures 5m close nearest forecast due time"
+    offset_ms, price, close_time = min(candidates, key=lambda item: item[0])
+    offset_seconds = offset_ms / 1000.0
+    if offset_seconds > FORECAST_GRADE_TOLERANCE_SECONDS:
+        return (
+            None,
+            None,
+            offset_seconds,
+            "Binance candle was outside the exact-due-time grading tolerance.",
+        )
+    return price, utc_iso(close_time / 1000.0), offset_seconds, None
 
 
 async def grade_due_ledger_predictions(limit: int = 50) -> dict[str, Any]:
-    if not LEDGER_ENABLED:
-        return {"enabled": False, "graded": 0, "pendingDue": 0, "errors": []}
+    if not LEDGER_ENABLED or not CHAD_GRADING_ENABLED:
+        return {
+            "enabled": False,
+            "graded": 0,
+            "pendingDue": 0,
+            "errors": [],
+            "reason": "ledger_disabled" if not LEDGER_ENABLED else "grading_disabled",
+        }
 
     async with ledger_lock:
         due = prediction_ledger.due_horizons(
             now_ts=time.time() - 5 * 60,
-            limit=max(1, min(200, int(limit))),
+            limit=max(1, min(CHAD_GRADING_MAX_PER_BATCH, int(limit))),
         )
+        if not due:
+            return {
+                "enabled": True,
+                "graded": 0,
+                "pendingDue": 0,
+                "errors": [],
+            }
+        allowed, reason = usage_governor.authorize("chad_grade_batch")
+        if not allowed:
+            return {
+                "enabled": True,
+                "graded": 0,
+                "pendingDue": len(due),
+                "errors": [f"Grading batch circuit is open ({reason})."],
+            }
         graded: list[dict[str, Any]] = []
         errors: list[str] = []
-        price_cache: dict[int, tuple[float | None, str | None, str | None]] = {}
+        price_cache: dict[
+            int,
+            tuple[float | None, str | None, float | None, str | None],
+        ] = {}
 
         for item in due:
             due_bucket = int(float(item["due_ts"]) // 300 * 300)
             if due_bucket not in price_cache:
                 price_cache[due_bucket] = await historical_futures_price_near(float(item["due_ts"]))
-            actual_price, actual_at, error = price_cache[due_bucket]
+            actual_price, actual_at, _, error = price_cache[due_bucket]
             if actual_price is None or actual_at is None:
                 errors.append(
                     f"{item['prediction_id']} {item['horizon']}: {error or 'price unavailable'}"
@@ -992,6 +1050,7 @@ async def grade_due_ledger_predictions(limit: int = 50) -> dict[str, Any]:
                         actual_price_usd=actual_price,
                         actual_at=actual_at,
                         actual_source="Binance futures 5m close nearest forecast due time",
+                        max_sample_offset_seconds=FORECAST_GRADE_TOLERANCE_SECONDS,
                     )
                 )
             except Exception as exc:
@@ -1108,7 +1167,6 @@ def _cached_openai_analysis(
         analysis = payload.get("analysis")
         if not isinstance(analysis, dict):
             return None
-        row.cache_hit_count += 1
         raw = {
             "id": row.request_id,
             "model": row.model,
@@ -1129,6 +1187,8 @@ def _store_openai_analysis(
     analysis: dict[str, Any],
     raw: dict[str, Any],
 ) -> None:
+    if not CHAD_CACHE_WRITES_ENABLED:
+        raise RuntimeError("Durable Chad cache writes are disabled.")
     usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
     input_tokens = int(usage.get("input_tokens") or 0)
     output_tokens = int(usage.get("output_tokens") or 0)
@@ -1232,14 +1292,27 @@ async def request_chad_analysis(
         "store": False,
     }
 
-    response = await openai_client.post(
-        f"{OPENAI_API_BASE}/responses",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=request_body,
-    )
+    consume_request_budget("openai_call")
+    chad_reactivation_gate.record_openai_attempt(retry=False)
+    try:
+        response = await openai_client.post(
+            f"{OPENAI_API_BASE}/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=request_body,
+        )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="OpenAI timed out. The request was not retried.",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenAI request failed without retry ({type(exc).__name__}).",
+        ) from exc
 
     if response.status_code >= 400:
         detail = openai_error_detail(response)
@@ -1273,6 +1346,7 @@ async def request_chad_analysis(
             detail="OpenAI returned text that was not valid structured JSON.",
         ) from exc
 
+    chad_reactivation_gate.record_openai_usage(raw)
     return analysis, raw
 
 
@@ -2150,6 +2224,10 @@ async def health() -> dict[str, Any]:
         "depthStreamLastError": None,
         "chadConfigured": bool(OPENAI_API_KEY and RELAY_TOKEN),
         "chadProtected": bool(RELAY_TOKEN),
+        "chadReactivation": chad_reactivation_gate.status(
+            key_configured=bool(OPENAI_API_KEY),
+            relay_token_configured=bool(RELAY_TOKEN),
+        ),
         "openAIModel": OPENAI_MODEL,
         "predictionLedgerEnabled": LEDGER_ENABLED,
         "predictionLedgerPath": LEDGER_DB_PATH if LEDGER_ENABLED else None,
@@ -2373,22 +2451,7 @@ async def chad_ledger_export(
     return prediction_ledger.export_data(limit=min(limit, 200) if REPAIR_MODE else limit)
 
 
-@app.post("/v1/chad/analyze")
-async def chad_analyze(
-    request: ChadAnalyzeRequest,
-    x_relay_key: str | None = Header(default=None),
-) -> dict[str, Any]:
-    require_repair_writes_unlocked("paid OpenAI analysis")
-    require_chad_access(x_relay_key)
-    if not request.allowPaidCall:
-        raise HTTPException(
-            status_code=423,
-            detail=(
-                "Paid Chad analysis requires allowPaidCall=true outside repair mode; "
-                "routine refreshes never call OpenAI."
-            ),
-        )
-
+async def _run_chad_analysis(request: ChadAnalyzeRequest) -> dict[str, Any]:
     if request.historyPeriod not in VALID_PERIODS:
         raise HTTPException(
             status_code=400,
@@ -2422,7 +2485,33 @@ async def chad_analyze(
         spot=spot,
     )
 
-    grading_before = await grade_due_ledger_predictions(limit=100)
+    cached_analysis = _cached_openai_analysis(evidence_hash)
+    cache_hit = cached_analysis is not None
+    chad_reactivation_gate.record_cache(hit=cache_hit)
+    usage_governor.cache(cache_hit)
+
+    lock_status = (
+        prediction_ledger.forecast_lock_status(
+            lock_key=evidence_hash,
+            minimum_interval_seconds=CHAD_FORECAST_MIN_INTERVAL_SECONDS,
+        )
+        if LEDGER_ENABLED
+        else {"allowed": False, "reason": "ledger_disabled", "predictionId": None}
+    )
+    if not cache_hit and not lock_status.get("allowed"):
+        retry_after = int(lock_status.get("retryAfterSeconds") or 0)
+        suffix = f" Retry after {retry_after} seconds." if retry_after else ""
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "A paid Chad call was blocked before OpenAI because a new immutable "
+                f"forecast cannot be locked ({lock_status.get('reason')}).{suffix}"
+            ),
+        )
+
+    grading_before = await grade_due_ledger_predictions(
+        limit=CHAD_GRADING_MAX_PER_BATCH
+    )
     features = current_market_features(snapshot, spot)
     freshness = build_freshness_report(snapshot, spot, history)
     ledger_performance = (
@@ -2442,12 +2531,9 @@ async def chad_analyze(
         else []
     )
 
-    cached_analysis = _cached_openai_analysis(evidence_hash)
     if cached_analysis is not None:
-        usage_governor.cache(True)
         analysis, raw_response = cached_analysis
     else:
-        usage_governor.cache(False)
         allowed, reason = usage_governor.authorize("openai_call")
         if not allowed:
             raise HTTPException(
@@ -2474,7 +2560,39 @@ async def chad_analyze(
             analysis=analysis,
             raw=raw_response,
         )
+
     analysis = apply_confidence_controls(analysis, freshness=freshness, calibration=calibration_profile)
+    previous_state = None
+    if isinstance(previous_prediction, dict):
+        previous_analysis = (
+            previous_prediction.get("analysis")
+            if isinstance(previous_prediction.get("analysis"), dict)
+            else {}
+        )
+        previous_state = str(
+            previous_analysis.get("marketState")
+            or previous_prediction.get("marketState")
+            or ""
+        )
+    regime_debounce = chad_reactivation_gate.debounce_regime(
+        candidate_state=str(analysis.get("marketState") or "insufficient_data"),
+        previous_state=previous_state,
+    )
+    analysis["regimeDebounce"] = regime_debounce
+    if not regime_debounce["confirmed"]:
+        analysis["marketState"] = regime_debounce["effective"]
+        why = analysis.get("whyItMatters")
+        if not isinstance(why, list):
+            why = []
+        why.insert(
+            0,
+            (
+                "A possible regime change is still inside the debounce window; "
+                "Chad kept the prior effective state and did not lock a new forecast."
+            ),
+        )
+        analysis["whyItMatters"] = why
+
     decision_change = (
         prediction_ledger.decision_delta(
             current_analysis=analysis,
@@ -2494,11 +2612,19 @@ async def chad_analyze(
     cache_hit = bool(raw_response.get("cacheHit"))
     if (
         LEDGER_ENABLED
-        and not cache_hit
+        and bool(lock_status.get("allowed"))
+        and bool(regime_debounce.get("confirmed"))
         and isinstance(forecast_ledger, dict)
         and start_price is not None
     ):
         try:
+            locked_at = utc_iso()
+            analysis["forecastLock"] = {
+                "predictionId": lock_status.get("predictionId"),
+                "evidenceHash": evidence_hash,
+                "lockedAt": locked_at,
+                "immutable": True,
+            }
             ledger_prediction_id = prediction_ledger.save_prediction(
                 model=str(raw_response.get("model", OPENAI_MODEL)),
                 question=request.question,
@@ -2521,16 +2647,24 @@ async def chad_analyze(
                 analysis=analysis,
                 snapshot=snapshot,
                 spot=spot,
+                lock_key=evidence_hash,
             )
             ledger_saved = True
         except Exception as exc:
             ledger_error = str(exc)
     elif LEDGER_ENABLED:
-        ledger_error = (
-            "Unchanged evidence reused the original locked forecast; no duplicate was created."
-            if cache_hit
-            else "Prediction was not saved because forecastLedger or a valid start price was missing."
-        )
+        if cache_hit:
+            ledger_prediction_id = lock_status.get("predictionId")
+            ledger_error = (
+                "Unchanged evidence reused the original locked forecast; "
+                "no duplicate was created."
+            )
+        elif not regime_debounce.get("confirmed"):
+            ledger_error = "Forecast was not locked while the regime change is unconfirmed."
+        else:
+            ledger_error = (
+                "Prediction was not saved because forecastLedger or a valid start price was missing."
+            )
 
     result: dict[str, Any] = {
         "ok": True,
@@ -2548,6 +2682,8 @@ async def chad_analyze(
             "saved": ledger_saved,
             "predictionId": ledger_prediction_id,
             "saveError": ledger_error,
+            "lockStatus": lock_status,
+            "regimeDebounce": regime_debounce,
             "gradedBeforeAnalysis": grading_before,
             "performance": prediction_ledger.performance_summary() if LEDGER_ENABLED else None,
             "calibration": prediction_ledger.calibration_profile() if LEDGER_ENABLED else None,
@@ -2570,6 +2706,85 @@ async def chad_analyze(
         result["dataUsed"]["history"] = compact_history_for_chad(history)
 
     return result
+
+
+@app.post("/v1/chad/analyze")
+async def chad_analyze(
+    request: ChadAnalyzeRequest,
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    blockers = chad_reactivation_gate.blockers(
+        key_configured=bool(OPENAI_API_KEY),
+        relay_token_configured=bool(RELAY_TOKEN),
+    )
+    if blockers:
+        raise HTTPException(
+            status_code=423,
+            detail=f"Chad reactivation gate is closed ({blockers[0]}).",
+        )
+    require_chad_access(x_relay_key)
+    if not request.allowPaidCall:
+        raise HTTPException(
+            status_code=423,
+            detail="Paid Chad analysis requires allowPaidCall=true.",
+        )
+    if not request.allowForecastWrite or not request.allowGrading:
+        raise HTTPException(
+            status_code=423,
+            detail=(
+                "Chad reactivation requires explicit forecast locking and grading "
+                "approval on the request."
+            ),
+        )
+
+    request_id, blocked_reason = chad_reactivation_gate.begin_request(
+        key_configured=bool(OPENAI_API_KEY),
+        relay_token_configured=bool(RELAY_TOKEN),
+    )
+    if request_id is None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Chad request was blocked ({blocked_reason or 'circuit'}).",
+        )
+
+    started_at = time.time()
+    request_budget: dict[str, Any] | None = None
+    budget_object: Any = None
+    error: BaseException | None = None
+    success = False
+    try:
+        with request_budget_scope() as budget:
+            budget_object = budget
+            result = await _run_chad_analysis(request)
+            request_budget = budget.summary()
+            result["requestBudget"] = request_budget
+            result["reactivationRequestId"] = request_id
+            success = True
+            return result
+    except RequestBudgetExceeded as exc:
+        if budget_object is not None:
+            request_budget = budget_object.summary()
+        error = exc
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Chad stopped before exceeding its per-request "
+                f"{exc.category} budget."
+            ),
+        ) from exc
+    except BaseException as exc:
+        if budget_object is not None:
+            request_budget = budget_object.summary()
+        error = exc
+        raise
+    finally:
+        chad_reactivation_gate.finish_request(
+            request_id,
+            success=success,
+            started_at=started_at,
+            budget=request_budget,
+            error=error,
+        )
 
 
 

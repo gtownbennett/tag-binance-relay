@@ -15,6 +15,18 @@ services:
         value: "false"
       - key: OPENAI_AUTOMATIC_ENABLED
         value: "false"
+      - key: CHAD_REACTIVATION_ENABLED
+        value: "false"
+      - key: CHAD_KILL_SWITCH
+        value: "true"
+      - key: CHAD_FORECAST_WRITES_ENABLED
+        value: "false"
+      - key: CHAD_GRADING_ENABLED
+        value: "false"
+      - key: CHAD_CACHE_WRITES_ENABLED
+        value: "false"
+      - key: OPENAI_PROJECT_BUDGET_CONFIRMED
+        value: "false"
       - key: PUSH_ENABLED
         value: "false"
       - key: DB_BOOTSTRAP_ON_START
@@ -31,3 +43,33 @@ services:
         value: "8"
       - key: MANUAL_RESPONSE_BUDGET_SECONDS
         value: "24"
+      - key: CHAD_DAILY_REQUEST_LIMIT
+        value: "2"
+      - key: CHAD_MONTHLY_REQUEST_LIMIT
+        value: "20"
+      - key: OPENAI_DAILY_CALL_LIMIT
+        value: "2"
+      - key: OPENAI_MONTHLY_CALL_LIMIT
+        value: "20"
+      - key: CHAD_MIN_REQUEST_INTERVAL_SECONDS
+        value: "300"
+      - key: CHAD_FORECAST_MIN_INTERVAL_SECONDS
+        value: "21600"
+      - key: CHAD_REQUEST_DATABASE_QUERY_LIMIT
+        value: "40"
+      - key: CHAD_REQUEST_DATABASE_WRITE_LIMIT
+        value: "12"
+      - key: CHAD_REQUEST_EXTERNAL_REQUEST_LIMIT
+        value: "20"
+      - key: CHAD_REQUEST_OPENAI_CALL_LIMIT
+        value: "1"
+      - key: CHAD_GRADING_MAX_PER_BATCH
+        value: "4"
+      - key: FORECAST_GRADE_TOLERANCE_SECONDS
+        value: "900"
+      - key: CHAD_REGIME_CONFIRMATIONS_REQUIRED
+        value: "2"
+      - key: CHAD_REGIME_DEBOUNCE_SECONDS
+        value: "300"
+      - key: OPENAI_MAX_OUTPUT_TOKENS
+        value: "4000"

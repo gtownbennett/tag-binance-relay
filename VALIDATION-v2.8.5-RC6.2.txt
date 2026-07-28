@@ -1,0 +1,57 @@
+TAG RELAY 2.8.5 RC6.2 — VALIDATION
+
+Local/package gate
+[ ] Relay unit suite reports 45/45 passed.
+[ ] Python compilation succeeds.
+[ ] Git diff whitespace check succeeds.
+[ ] Render YAML parses successfully.
+[ ] No credential, database, cache, virtual environment, or build artifact is packaged.
+[ ] Existing RC6.1 tests remain green.
+[ ] No test makes a live OpenAI, Neon, exchange, Render, or notification call.
+
+Fail-closed deployment gate
+[ ] /health reports version 2.8.5-rc6.2 and side effects none.
+[ ] REPAIR_MODE is true.
+[ ] DB_BOOTSTRAP_ON_START is false.
+[ ] Startup database-query count is zero.
+[ ] LIVE_COLLECTORS_ENABLED is false.
+[ ] BACKFILL_ENABLED is false.
+[ ] OPENAI_AUTOMATIC_ENABLED is false.
+[ ] PUSH_ENABLED is false.
+[ ] CHAD_REACTIVATION_ENABLED is false.
+[ ] CHAD_KILL_SWITCH is true.
+[ ] CHAD_FORECAST_WRITES_ENABLED is false.
+[ ] CHAD_GRADING_ENABLED is false.
+[ ] CHAD_CACHE_WRITES_ENABLED is false.
+[ ] OPENAI_PROJECT_BUDGET_CONFIRMED is false.
+[ ] chadReactivation.manualReady is false.
+[ ] Health output exposes no OpenAI key or relay token.
+[ ] One RC7.1 manual market refresh still returns the complete RC6.1 packet.
+[ ] Existing Neon rows remain unchanged.
+
+Reactivation design gate
+[ ] Authenticated request requires allowPaidCall=true.
+[ ] Authenticated request requires allowForecastWrite=true.
+[ ] Authenticated request requires allowGrading=true.
+[ ] Only one Chad request can run at a time.
+[ ] Five-minute cooldown blocks duplicate user requests.
+[ ] Daily request and OpenAI limits are 2.
+[ ] Monthly request and OpenAI limits are 20.
+[ ] Per-request limits are 40 database queries, 12 writes, 20 external reads,
+    and 1 OpenAI attempt.
+[ ] OpenAI failures have zero automatic retries and record failure telemetry.
+[ ] Output token cap defaults to 4,000 and cannot exceed 5,000.
+[ ] Durable cache is mandatory before the gate can open.
+[ ] Cache hits do not write a hit counter to Neon.
+[ ] Same evidence hash maps to the same immutable prediction ID.
+[ ] New paid call is blocked before OpenAI inside the six-hour forecast cadence.
+[ ] Regime change requires two observations separated by five minutes.
+[ ] Unconfirmed regime change cannot lock a forecast.
+[ ] Due grading is limited to four horizons per batch.
+[ ] Grade sample outside 15 minutes of due time is rejected.
+[ ] Millisecond Binance close time is converted correctly to UTC seconds.
+[ ] PostgreSQL forecast saves do not export the full ledger after every write.
+
+Paid-call stop
+[ ] Do not enable the gate or make a paid Chad call merely because these checks pass.
+[ ] Eric must first approve the provider spending-limit setting and the exact one-call preview sequence.

@@ -1,0 +1,25 @@
+TAG RELAY 2.8.5 RC6.2 — CHAD REACTIVATION GATE
+
+- Preserves RC6.1 as the deployed protected checkpoint until this isolated candidate passes preview validation.
+- Reuses only the existing server-side Render OPENAI_API_KEY; no key is stored or called during development.
+- Adds six fail-closed reactivation/budget/write switches and keeps every one safely closed in render.yaml.
+- Keeps REPAIR_MODE on so collectors, backfills, push, automatic OpenAI, and unrelated mutations stay blocked.
+- Requires authenticated, explicit paid-call, forecast-lock, and grading approval on every Chad request.
+- Adds one-concurrent-request enforcement and a five-minute cooldown.
+- Lowers default OpenAI and Chad ceilings to 2/day and 20/month.
+- Adds hard per-request limits: 40 database queries, 12 database writes, 20 external reads, and one OpenAI call.
+- Makes every OpenAI request one attempt with zero automatic retries and records safe failure/retry/token/budget telemetry.
+- Caps OpenAI output at 4,000 tokens by default and 5,000 maximum.
+- Makes durable evidence-hash cache writes a prerequisite for reactivation.
+- Stops writing cache-hit counters to Neon.
+- Generates deterministic immutable forecast IDs from evidence hashes.
+- Blocks a paid call before OpenAI unless a new locked forecast can satisfy the six-hour cadence.
+- Requires two regime observations separated by five minutes before a change can lock a forecast.
+- Limits grading to four due horizons per request.
+- Rejects a grading sample more than 15 minutes from exact due time.
+- Corrects Binance millisecond close timestamps before grading.
+- Exposes exact grade sample offsets in the ledger.
+- Adds context-local query/write/external/model budgets enforced inside both terminal and prediction-ledger database paths.
+- Stops full-ledger backup exports after each PostgreSQL forecast write, reducing avoidable Neon egress.
+- Adds safe /health reactivation blockers, limits, cache/retry telemetry, and token counters without database or external work.
+- Adds 11 Chad safety/locking/grading tests; the relay suite now contains 45 tests.
