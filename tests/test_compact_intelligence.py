@@ -249,7 +249,10 @@ class CompactIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(before, after)
         self.assertLessEqual(len(statements), 12)
         self.assertTrue(
-            all(statement.upper().startswith("SELECT") for statement in statements)
+            all(
+                statement.upper().startswith(("SELECT", "WITH"))
+                for statement in statements
+            )
         )
         self.assertLessEqual(len(payload["chadHistory"]), 8)
         self.assertLessEqual(len(payload["predictions"]["reports"]), 42)
@@ -273,6 +276,21 @@ class CompactIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(payload["boundedIntelligence"]["writes"], 0)
         self.assertEqual(payload["boundedIntelligence"]["openAiCalls"], 0)
+
+    def test_overlapping_grades_use_horizon_sized_evaluation_cohorts(self) -> None:
+        payload = build_compact_terminal_payload()
+        one_hour = payload["predictions"]["byHorizon"]["1h"]
+
+        self.assertEqual(one_hour["rawGraded"], 80)
+        self.assertLess(one_hour["graded"], one_hour["rawGraded"])
+        self.assertEqual(one_hour["graded"], one_hour["evaluationCohorts"])
+        self.assertGreater(one_hour["overlapInflationFactor"], 1.0)
+        self.assertEqual(
+            payload["unifiedPredictions"]["gradeAudit"][
+                "historicalRowsChanged"
+            ],
+            False,
+        )
 
     def test_live_merge_labels_archive_and_populates_specialists(self) -> None:
         compact = build_compact_terminal_payload()

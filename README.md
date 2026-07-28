@@ -1,6 +1,9 @@
-# TAG Terminal Relay 2.8.3 RC6 — Bounded Neon Intelligence
+# TAG Terminal Relay 2.8.4 RC6.1 — Startup and Grade Audit
 
-This release keeps RC5's fast live market packet and restores a compact, read-only slice of the existing Neon intelligence. Market and Neon work start concurrently, the database slice has an eight-second wait limit inside a 24-second total response budget, and a slow database can never discard an otherwise valid live packet.
+This release keeps RC6's working live-plus-stored packet, removes avoidable
+database bootstrap work from repair-mode startup, and corrects misleading
+forecast sample counts. Existing forecast rows remain untouched and available
+for audit.
 
 ## Safe defaults
 
@@ -11,11 +14,15 @@ With missing environment flags, the relay starts with:
 - `BACKFILL_ENABLED=false`
 - `OPENAI_AUTOMATIC_ENABLED=false`
 - `PUSH_ENABLED=false`
+- `DB_BOOTSTRAP_ON_START=false`
 
 The Render blueprint sets the same values explicitly. Provider spending limits remain the final cap and must not be raised automatically.
 
 ## Cost repairs
 
+- Repair mode no longer runs `create_all`, timestamp-column migrations, index
+  creation, or legacy ledger bootstrap on every Render wake. The verified
+  schema is used as-is, avoiding the 27 startup queries observed on RC6.
 - `/health` uses memory only; it never queries Neon or pings an exchange.
 - `GET /v1/tag/terminal?manual=true` performs one user-requested public market read, is cached for five minutes, and coalesces concurrent refreshes.
 - Binance, DEX Screener, Bitget, MEXC, Gate, and BingX are requested in one concurrent window instead of two sequential phases.
@@ -46,6 +53,18 @@ The Render blueprint sets the same values explicitly. Provider spending limits r
 
 ## Accuracy repairs
 
+- Raw overlapping grades are preserved, but accuracy and calibration now use
+  one representative record per horizon-sized UTC evaluation cohort.
+- The old `104 graded 24-hour forecasts` display is no longer treated as 104
+  independent samples. The live audit found only two 24-hour evaluation
+  cohorts, which is far too small for a trustworthy score.
+- New Chad reports cannot be stored more often than every 15 minutes.
+- New deterministic forecasts are separated by a horizon-aware cadence:
+  1 hour minimum and 6 hours maximum.
+- A forecast is graded only when a stored market snapshot is within 15 minutes
+  of its exact due time, and the closest eligible snapshot is selected.
+- Future grade rows retain sample time, offset, tolerance, outcome, price
+  change, and correctness metadata inside the existing JSON audit field.
 - A confirmed alert cannot fall back to candidate/observed from one noisy snapshot.
 - Current heatmap bids must be below the current mark and asks above it; historical books are retained only as sample counts.
 - Historical analogs are bounded and separated in time.
@@ -65,6 +84,8 @@ REPAIR_MODE=true \
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Expected: 30 tests pass.
+Expected: 34 tests pass.
 
-Read `00-START-HERE-v2.8.3-RC6.txt` and `VALIDATION-v2.8.3-RC6.txt`. Older release files are history only.
+Read `00-START-HERE-v2.8.4-RC6.1.txt`,
+`VALIDATION-v2.8.4-RC6.1.txt`, and
+`FORECAST-GRADE-AUDIT-v2.8.4-RC6.1.txt`. Older release files are history only.

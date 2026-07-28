@@ -35,7 +35,9 @@ from app.terminal_database import (
 from app.terminal_addon import terminal_addon
 from app.terminal_intelligence import (
     LONG_TERM_HORIZONS,
+    _store_report_and_forecasts,
     build_chad_report,
+    grade_forecasts,
     heatmap,
     liquidation_feed,
     server_oi_history,
@@ -290,6 +292,125 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["healthCheckSideEffects"], "none")
         self.assertIsNone(result["terminalHistoryCounts"])
+
+    async def test_repair_start_can_skip_database_bootstrap(self) -> None:
+        terminal_addon.started = False
+        terminal_addon.external_clients_started = False
+        try:
+            with patch(
+                "app.terminal_addon.init_db",
+                side_effect=AssertionError("repair startup touched the database"),
+            ):
+                await terminal_addon.start(
+                    enable_external_clients=False,
+                    bootstrap_database=False,
+                )
+            self.assertTrue(terminal_addon.started)
+            self.assertFalse(terminal_addon.external_clients_started)
+        finally:
+            terminal_addon.started = False
+            terminal_addon.external_clients_started = False
+
+    def test_report_and_forecast_storage_enforces_cadence(self) -> None:
+        clear_tables()
+
+        def report(regime: str, scenario: str) -> dict[str, object]:
+            return {
+                "generatedAt": utc_now().isoformat(),
+                "regime": regime,
+                "confidence": 70.0,
+                "dataQuality": 90.0,
+                "futurePaths": [],
+                "whatChanged": [regime],
+                "forecastHorizons": [
+                    {
+                        "label": "1h",
+                        "minutes": 60,
+                        "scenario": scenario,
+                        "probability": 70.0,
+                        "targetLow": 0.00101,
+                        "targetHigh": 0.00103,
+                        "status": "candidate",
+                    }
+                ],
+            }
+
+        _store_report_and_forecasts(report("FIRST", "bull"), 0.001)
+        _store_report_and_forecasts(report("SECOND", "bear"), 0.001)
+        with session_scope() as session:
+            self.assertEqual(
+                session.scalar(select(func.count(ChadReportRow.id))),
+                1,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count(ForecastRecordRow.id))),
+                1,
+            )
+            stored = session.scalar(
+                select(ChadReportRow)
+                .order_by(ChadReportRow.created_at.desc())
+                .limit(1)
+            )
+            stored.created_at = stored.created_at - timedelta(minutes=16)
+
+        _store_report_and_forecasts(report("THIRD", "bear"), 0.001)
+        with session_scope() as session:
+            self.assertEqual(
+                session.scalar(select(func.count(ChadReportRow.id))),
+                2,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count(ForecastRecordRow.id))),
+                1,
+            )
+
+    def test_grader_requires_snapshot_near_exact_due_time(self) -> None:
+        clear_tables()
+        now = utc_now()
+        created_at = now - timedelta(days=1, minutes=30)
+        target_at = created_at + timedelta(days=1)
+        with session_scope() as session:
+            session.add(
+                ForecastRecordRow(
+                    created_at=created_at,
+                    horizon_minutes=1440,
+                    horizon_label="1d",
+                    baseline_price=0.001,
+                    regime="TEST",
+                    scenario="bull",
+                    probability=70.0,
+                    target_low=0.0011,
+                    target_high=0.0012,
+                    status="candidate",
+                    payload_json=json_dumps({}),
+                )
+            )
+            session.add(
+                AggregateSnapshotRow(
+                    recorded_at=now,
+                    coverage_key=COVERAGE,
+                    price=0.0012,
+                    payload_json=json_dumps({}),
+                )
+            )
+
+        self.assertEqual(grade_forecasts(), 0)
+        with session_scope() as session:
+            session.add(
+                AggregateSnapshotRow(
+                    recorded_at=target_at + timedelta(minutes=5),
+                    coverage_key=COVERAGE,
+                    price=0.0012,
+                    payload_json=json_dumps({}),
+                )
+            )
+
+        self.assertEqual(grade_forecasts(), 1)
+        with session_scope() as session:
+            graded = session.scalar(select(ForecastRecordRow).limit(1))
+            audit = json.loads(graded.payload_json)["grading"]
+            self.assertTrue(graded.correct)
+            self.assertLessEqual(audit["sampleOffsetSeconds"], 15 * 60)
 
     async def test_repair_mode_blocks_paid_and_mutating_routes(self) -> None:
         blocked_calls = (

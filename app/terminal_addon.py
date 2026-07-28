@@ -93,10 +93,16 @@ class TerminalAddon:
         self.market_cache: dict[str, Any] = {"time": 0.0, "value": None}
         self.cache_lock = asyncio.Lock()
 
-    async def start(self, *, enable_external_clients: bool = True) -> None:
+    async def start(
+        self,
+        *,
+        enable_external_clients: bool = True,
+        bootstrap_database: bool = True,
+    ) -> None:
         if self.started:
             return
-        init_db()
+        if bootstrap_database:
+            init_db()
         if enable_external_clients:
             await multi_exchange_service.start()
             self.external_clients_started = True

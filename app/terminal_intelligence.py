@@ -40,6 +40,14 @@ HORIZONS: list[tuple[str, int]] = [
     ("7d", 10080),
 ]
 LONG_TERM_HORIZONS = ["1 month", "1 year", "2026", "2027", "2028", "2029", "2030"]
+REPORT_STORAGE_CADENCE = timedelta(minutes=15)
+GRADE_SAMPLE_TOLERANCE = timedelta(minutes=15)
+
+
+def _forecast_issue_cadence(horizon_minutes: int) -> timedelta:
+    """Keep forecast samples meaningfully separated for each horizon."""
+    cadence_minutes = max(60, min(360, int(horizon_minutes) // 4))
+    return timedelta(minutes=cadence_minutes)
 
 
 def _aware(value: datetime) -> datetime:
@@ -1040,10 +1048,12 @@ def _store_report_and_forecasts(report: dict[str, Any], price: float | None) -> 
             or previous_payload.get("evidenceHash") != evidence_hash
             or last.regime != report.get("regime")
         )
-        minimum_cadence_met = not last or now - _aware(last.created_at) >= timedelta(minutes=15)
+        minimum_cadence_met = (
+            not last
+            or now - _aware(last.created_at) >= REPORT_STORAGE_CADENCE
+        )
         should_store = bool(
             not last
-            or last.regime != report.get("regime")
             or (material_change and minimum_cadence_met)
         )
         if not should_store:
@@ -1077,16 +1087,14 @@ def _store_report_and_forecasts(report: dict[str, Any], price: float | None) -> 
                 .where(
                     ForecastRecordRow.model_id == MODEL_ID,
                     ForecastRecordRow.horizon_label == str(forecast.get("label")),
-                    ForecastRecordRow.status == "candidate",
                 )
                 .order_by(ForecastRecordRow.created_at.desc())
                 .limit(1)
             )
             if (
                 latest_equivalent
-                and latest_equivalent.scenario == forecast.get("scenario")
-                and abs((latest_equivalent.probability or 0) - float(forecast.get("probability") or 0)) < 3
-                and now - _aware(latest_equivalent.created_at) < timedelta(hours=6)
+                and now - _aware(latest_equivalent.created_at)
+                < _forecast_issue_cadence(int(forecast["minutes"]))
             ):
                 continue
             session.add(ForecastRecordRow(
@@ -1124,7 +1132,19 @@ def grade_forecasts() -> int:
             target_time = _aware(record.created_at) + timedelta(minutes=record.horizon_minutes)
             if now < target_time:
                 continue
-            tolerance = timedelta(minutes=max(10, min(240, record.horizon_minutes // 4)))
+            tolerance = GRADE_SAMPLE_TOLERANCE
+            if session.get_bind().dialect.name == "postgresql":
+                sample_distance = func.abs(
+                    func.extract(
+                        "epoch",
+                        AggregateSnapshotRow.recorded_at - target_time,
+                    )
+                )
+            else:
+                sample_distance = func.abs(
+                    func.julianday(AggregateSnapshotRow.recorded_at)
+                    - func.julianday(target_time)
+                )
             candidate = session.execute(
                 select(
                     AggregateSnapshotRow.recorded_at,
@@ -1135,7 +1155,7 @@ def grade_forecasts() -> int:
                     AggregateSnapshotRow.recorded_at >= target_time - tolerance,
                     AggregateSnapshotRow.recorded_at <= target_time + tolerance,
                 )
-                .order_by(AggregateSnapshotRow.recorded_at.desc())
+                .order_by(sample_distance.asc())
                 .limit(1)
             ).first()
             if not candidate or not candidate.price or not record.baseline_price:
@@ -1145,6 +1165,26 @@ def grade_forecasts() -> int:
             record.outcome = f"{outcome} {change:+.2f}%"
             record.correct = outcome == record.scenario
             record.status = "graded"
+            grading_payload = _load_json(record.payload_json)
+            grading_payload["grading"] = {
+                "targetAt": target_time.isoformat(),
+                "sampledAt": _aware(candidate.recorded_at).isoformat(),
+                "sampleOffsetSeconds": round(
+                    abs(
+                        (
+                            _aware(candidate.recorded_at) - target_time
+                        ).total_seconds()
+                    ),
+                    1,
+                ),
+                "sampleToleranceSeconds": int(
+                    GRADE_SAMPLE_TOLERANCE.total_seconds()
+                ),
+                "outcome": outcome,
+                "changePct": round(change, 4),
+                "correct": record.correct,
+            }
+            record.payload_json = json_dumps(grading_payload)
             updated += 1
     return updated
 

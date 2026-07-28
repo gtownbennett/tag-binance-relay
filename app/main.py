@@ -57,6 +57,7 @@ from app.terminal_paper_social import (
 from app.terminal_usage import (
     BACKFILL_ENABLED,
     BUILD_ID,
+    DB_BOOTSTRAP_ON_START,
     LIVE_COLLECTORS_ENABLED,
     OPENAI_AUTOMATIC_ENABLED,
     PUSH_ENABLED,
@@ -73,7 +74,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.8.3-rc6"
+SERVICE_VERSION = "2.8.4-rc6.1"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -1992,10 +1993,13 @@ async def lifespan(_: FastAPI):
         headers={"User-Agent": f"TAG-Terminal-Relay/{SERVICE_VERSION}"},
         follow_redirects=True,
     )
-    if LEDGER_ENABLED:
+    if LEDGER_ENABLED and DB_BOOTSTRAP_ON_START:
         prediction_ledger.initialize()
     automatic_live_work = not REPAIR_MODE and LIVE_COLLECTORS_ENABLED
-    await terminal_addon.start(enable_external_clients=automatic_live_work)
+    await terminal_addon.start(
+        enable_external_clients=automatic_live_work,
+        bootstrap_database=DB_BOOTSTRAP_ON_START,
+    )
 
     openai_client = httpx.AsyncClient(
         timeout=httpx.Timeout(float(OPENAI_TIMEOUT_SECONDS), connect=15.0),

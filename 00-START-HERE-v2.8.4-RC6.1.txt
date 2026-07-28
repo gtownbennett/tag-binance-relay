@@ -1,0 +1,34 @@
+TAG RELAY 2.8.4 RC6.1 — START HERE
+
+Purpose
+- Keep RC6's working live market and stored intelligence packet.
+- Remove avoidable Neon bootstrap work from a Render cold start.
+- Correct forecast accuracy/count semantics without deleting history.
+- Prevent new forecast and regime-history spam.
+
+Safe release order
+1. Publish branch v2.8.4-rc6-1-startup-grade-audit.
+2. Wait for all 34 tests and the container image build to pass.
+3. Suspend only tag-binance-relay-rc2-preview.
+4. Point only that preview at:
+   ghcr.io/gtownbennett/tag-binance-relay:v2.8.4-rc6-1-startup-grade-audit
+5. Keep REPAIR_MODE=true and all automatic-work flags false.
+6. Add or confirm DB_BOOTSTRAP_ON_START=false.
+7. Keep the 25/day and 500/month manual/intelligence limits.
+8. Deploy and verify /health reports 2.8.4-rc6.1 with zero startup queries.
+9. Keep the installed Android 0.6.2 RC7 app.
+10. Perform one cold-start refresh, then one warmed refresh only if directed.
+
+Expected phone result
+- Live DEX and five-exchange market data remain available.
+- Stored history, alerts, paper/social records, and specialists still return.
+- Grade counts become conservative evaluation cohorts.
+- The 24-hour horizon returns to WARMING because two cohorts are insufficient.
+- No new analysis, grading, OpenAI, alert evaluation, or background work starts.
+
+Render limitation
+- This release removes application-created cold-start delay.
+- A free Render service can still sleep at the platform level.
+- Only an always-on Render plan can guarantee that platform wake time disappears.
+
+Never merge to main or change another service during preview validation.

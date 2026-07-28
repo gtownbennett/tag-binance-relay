@@ -5,7 +5,7 @@ import math
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Text, case, cast, func, select, text
+from sqlalchemy import Float, Text, case, cast, func, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from .terminal_config import TAG_BAG_TOKENS, TAG_COST_BASIS
@@ -156,21 +156,77 @@ def _bounded_chad_history(session: Any) -> tuple[list[dict[str, Any]], dict[str,
 
 
 def _bounded_predictions(session: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-    stats_rows = session.execute(
+    raw_stats = (
         select(
             ForecastRecordRow.horizon_label,
             func.count(ForecastRecordRow.id).label("records"),
-            func.count(ForecastRecordRow.correct).label("graded"),
+            func.count(ForecastRecordRow.correct).label("raw_graded"),
             func.sum(
                 case((ForecastRecordRow.correct.is_(True), 1), else_=0)
-            ).label("correct"),
+            ).label("raw_correct"),
             func.sum(
                 case(
                     (ForecastRecordRow.status.in_(("pending", "candidate")), 1),
                     else_=0,
                 )
             ).label("pending"),
-        ).group_by(ForecastRecordRow.horizon_label)
+        )
+        .group_by(ForecastRecordRow.horizon_label)
+        .cte("raw_forecast_stats")
+    )
+    if session.get_bind().dialect.name == "postgresql":
+        created_epoch = func.extract("epoch", ForecastRecordRow.created_at)
+    else:
+        created_epoch = cast(
+            func.strftime("%s", ForecastRecordRow.created_at),
+            Float,
+        )
+    cohort_bucket = func.floor(
+        created_epoch
+        / (cast(ForecastRecordRow.horizon_minutes, Float) * 60.0)
+    )
+    ranked_grades = (
+        select(
+            ForecastRecordRow.horizon_label.label("horizon_label"),
+            ForecastRecordRow.correct.label("correct"),
+            func.row_number()
+            .over(
+                partition_by=(
+                    ForecastRecordRow.horizon_label,
+                    cohort_bucket,
+                ),
+                order_by=ForecastRecordRow.created_at.asc(),
+            )
+            .label("cohort_rank"),
+        )
+        .where(ForecastRecordRow.correct.is_not(None))
+        .cte("ranked_forecast_grades")
+    )
+    cohort_stats = (
+        select(
+            ranked_grades.c.horizon_label,
+            func.count().label("cohort_graded"),
+            func.sum(
+                case((ranked_grades.c.correct.is_(True), 1), else_=0)
+            ).label("cohort_correct"),
+        )
+        .where(ranked_grades.c.cohort_rank == 1)
+        .group_by(ranked_grades.c.horizon_label)
+        .cte("cohort_forecast_stats")
+    )
+    stats_rows = session.execute(
+        select(
+            raw_stats.c.horizon_label,
+            raw_stats.c.records,
+            raw_stats.c.raw_graded,
+            raw_stats.c.raw_correct,
+            raw_stats.c.pending,
+            cohort_stats.c.cohort_graded,
+            cohort_stats.c.cohort_correct,
+        ).outerjoin(
+            cohort_stats,
+            cohort_stats.c.horizon_label == raw_stats.c.horizon_label,
+        )
     ).all()
     total_predictions = session.scalar(
         select(func.count(func.distinct(ForecastRecordRow.created_at)))
@@ -195,8 +251,10 @@ def _bounded_predictions(session: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     stats = {
         str(row.horizon_label): {
             "records": int(row.records or 0),
-            "graded": int(row.graded or 0),
-            "correct": int(row.correct or 0),
+            "rawGraded": int(row.raw_graded or 0),
+            "rawCorrect": int(row.raw_correct or 0),
+            "cohortGraded": int(row.cohort_graded or 0),
+            "cohortCorrect": int(row.cohort_correct or 0),
             "pending": int(row.pending or 0),
         }
         for row in stats_rows
@@ -204,12 +262,27 @@ def _bounded_predictions(session: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     by_horizon: dict[str, dict[str, Any]] = {}
     for label, _ in HORIZONS:
         row = stats.get(label, {})
-        graded = int(row.get("graded") or 0)
-        correct = int(row.get("correct") or 0)
+        raw_graded = int(row.get("rawGraded") or 0)
+        raw_correct = int(row.get("rawCorrect") or 0)
+        graded = int(row.get("cohortGraded") or 0)
+        correct = int(row.get("cohortCorrect") or 0)
         by_horizon[label] = {
             "graded": graded,
             "correct": correct,
             "accuracyPct": round(correct / graded * 100.0, 1) if graded else None,
+            "evaluationCohorts": graded,
+            "rawGraded": raw_graded,
+            "rawCorrect": raw_correct,
+            "rawAccuracyPct": (
+                round(raw_correct / raw_graded * 100.0, 1)
+                if raw_graded
+                else None
+            ),
+            "overlapInflationFactor": (
+                round(raw_graded / graded, 1)
+                if graded
+                else None
+            ),
             "calibrated": graded >= 25,
         }
 
@@ -233,7 +306,14 @@ def _bounded_predictions(session: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         "byHorizon": by_horizon,
         "reports": reports,
     }
-    graded_count = sum(int(row.get("graded") or 0) for row in stats.values())
+    graded_count = sum(
+        int(row.get("cohortGraded") or 0)
+        for row in stats.values()
+    )
+    raw_graded_count = sum(
+        int(row.get("rawGraded") or 0)
+        for row in stats.values()
+    )
     pending_count = sum(int(row.get("pending") or 0) for row in stats.values())
     calibrated = {label for label, row in by_horizon.items() if row["calibrated"]}
     required = {"1h", "4h", "1d", "7d", "30d", "3mo"}
@@ -277,6 +357,7 @@ def _bounded_predictions(session: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         "predictionCount": int(total_predictions),
         "horizonRecordCount": sum(int(row.get("records") or 0) for row in stats.values()),
         "gradedCount": graded_count,
+        "rawGradedCount": raw_graded_count,
         "pendingCount": pending_count,
         "learningReady": learning_ready,
         "sourceCounts": {
@@ -288,9 +369,18 @@ def _bounded_predictions(session: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         },
         "byHorizon": by_horizon,
         "records": unified_records,
+        "gradeAudit": {
+            "method": "one representative grade per horizon-sized UTC cohort",
+            "rawGradedRecords": raw_graded_count,
+            "evaluationCohorts": graded_count,
+            "historicalRowsChanged": False,
+            "calibrationUsesCohorts": True,
+        },
         "note": (
-            "Read-only Neon forecast history. No grading, forecast creation, "
-            "OpenAI call, or database write occurred during this refresh."
+            "Read-only Neon forecast history. Overlapping grades are preserved "
+            "for audit but collapsed into horizon-sized evaluation cohorts for "
+            "accuracy and calibration. No grading, forecast creation, OpenAI "
+            "call, or database write occurred during this refresh."
         ),
     }
     return ledger, unified

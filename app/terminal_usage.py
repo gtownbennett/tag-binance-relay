@@ -29,6 +29,11 @@ LIVE_COLLECTORS_ENABLED = env_bool("LIVE_COLLECTORS_ENABLED", False)
 BACKFILL_ENABLED = env_bool("BACKFILL_ENABLED", False)
 OPENAI_AUTOMATIC_ENABLED = env_bool("OPENAI_AUTOMATIC_ENABLED", False)
 PUSH_ENABLED = env_bool("PUSH_ENABLED", False)
+# The protected repair deployment already has a verified schema. Re-running
+# create_all(), ALTER TABLE, CREATE INDEX, and ledger bootstrap work on every
+# Render wake delays readiness and performs avoidable Neon queries. Normal mode
+# keeps the existing bootstrap default; repair mode can opt back in explicitly.
+DB_BOOTSTRAP_ON_START = env_bool("DB_BOOTSTRAP_ON_START", not REPAIR_MODE)
 
 BUILD_ID = (
     os.getenv("RENDER_GIT_COMMIT")
@@ -161,6 +166,7 @@ class UsageGovernor:
                     "backfillEnabled": BACKFILL_ENABLED,
                     "openAiAutomaticEnabled": OPENAI_AUTOMATIC_ENABLED,
                     "pushEnabled": PUSH_ENABLED,
+                    "databaseBootstrapOnStart": DB_BOOTSTRAP_ON_START,
                 },
                 "today": dict(self._daily),
                 "month": dict(self._monthly),

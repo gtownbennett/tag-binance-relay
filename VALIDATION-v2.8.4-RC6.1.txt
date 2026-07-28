@@ -1,0 +1,30 @@
+TAG RELAY 2.8.4 RC6.1 — VALIDATION
+
+[ ] Relay unit suite reports 34/34 passed.
+[ ] Python compilation succeeds.
+[ ] Git diff whitespace check succeeds.
+[ ] GitHub image is v2.8.4-rc6-1-startup-grade-audit.
+[ ] /health reports version 2.8.4-rc6.1 and side effects none.
+[ ] REPAIR_MODE is true.
+[ ] DB_BOOTSTRAP_ON_START is false.
+[ ] Startup database-query count is zero.
+[ ] LIVE_COLLECTORS_ENABLED is false.
+[ ] BACKFILL_ENABLED is false.
+[ ] OPENAI_AUTOMATIC_ENABLED is false.
+[ ] PUSH_ENABLED is false.
+[ ] Existing Neon forecast/history rows are unchanged.
+[ ] Raw overlapping grades remain visible as rawGraded.
+[ ] Displayed graded count and accuracy use horizon-sized evaluation cohorts.
+[ ] Calibration stays false until 25 evaluation cohorts exist.
+[ ] New reports cannot be stored less than 15 minutes apart.
+[ ] New forecast rows obey the horizon-aware one-to-six-hour cadence.
+[ ] New grades require a snapshot within 15 minutes of the exact due time.
+[ ] The closest eligible snapshot is used and sampling metadata is retained.
+[ ] Compact Neon read remains at twelve or fewer SELECT/WITH statements.
+[ ] The compact response remains at or below 240,000 bytes.
+[ ] A slow Neon read still falls back to a valid live market packet.
+[ ] A repeated manual request inside five minutes remains a cache hit.
+[ ] Manual packet reports databaseWrites=0 and automaticWorkStarted=false.
+[ ] First cold-start phone refresh returns; if Render free-tier wake still exceeds
+    the Android deadline, use an always-on paid Render instance rather than
+    re-enabling startup database work.

@@ -1,0 +1,14 @@
+TAG RELAY 2.8.4 RC6.1
+
+- Keeps RC6's validated concurrent live market and bounded Neon packet.
+- Skips schema and legacy-ledger bootstrap during protected repair-mode startup.
+- Removes the 27 avoidable database queries observed before RC6 served traffic.
+- Preserves every historical forecast row; no Neon row is deleted or rewritten.
+- Separates raw overlapping grade records from horizon-sized evaluation cohorts.
+- Uses evaluation cohorts, not overlapping raw rows, for displayed accuracy and calibration.
+- Limits stored Chad reports to one every 15 minutes.
+- Limits deterministic forecast issuance to a horizon-aware 1-to-6-hour cadence.
+- Grades only against the closest snapshot within 15 minutes of the exact due time.
+- Stores future grade sampling metadata in the existing forecast JSON audit field.
+- Keeps collectors, writes, automatic OpenAI, backfills, polling, grading, and push off.
+- Adds four startup/grade regressions; the relay suite now contains 34 tests.
