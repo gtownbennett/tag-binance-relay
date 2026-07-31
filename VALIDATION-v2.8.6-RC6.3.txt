@@ -1,0 +1,21 @@
+TAG Relay 2.8.6 RC6.3 — Validation Record
+=========================================
+
+Completed locally before deployment:
+
+* Python compileall: PASS
+* Relay pytest suite: 48/48 PASS
+* Full forecast contract tests: PASS
+* Exact ordered horizon count: 25
+* Paid-call invariant: one OpenAI attempt maximum per accepted manual request
+* Retry invariant: no automatic OpenAI retry
+* Secret handling: no API key committed or printed
+
+The production acceptance run must additionally verify:
+
+* Render reports service version 2.8.6-rc6.3.
+* Neon stores the new immutable analysis/cache record and core scorecard rows.
+* The signed Android update preserves existing app preferences.
+* The saved result contains exactly 25 ordered horizons.
+* Usage counters advance by exactly one paid call and zero retries.
+* Input/output token counts are retained for the final cost report.

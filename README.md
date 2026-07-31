@@ -1,10 +1,9 @@
-# TAG Terminal Relay 2.8.5 RC6.2 — Chad Reactivation Gate
+# TAG Terminal Relay 2.8.6 RC6.3 — Full Forecast Contract
 
-This release preserves RC6.1's working protected packet and adds a fail-closed,
-manual-only Chad reactivation gate. It is designed to deploy first with every
-reactivation switch off. The existing Render `OPENAI_API_KEY` is referenced only
-at runtime; no key is included in this repository and no live OpenAI call is
-made by the test suite.
+This release preserves the fail-closed, manual-only Chad reactivation gate and
+extends the structured result to the terminal's complete 25-horizon forecast.
+The existing Render `OPENAI_API_KEY` is referenced only at runtime; no key is
+included in this repository and no live OpenAI call is made by the test suite.
 
 ## Safe defaults
 
@@ -122,9 +121,8 @@ REPAIR_MODE=true \
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Expected: 45 tests pass.
+Expected: 48 tests pass.
 
-Read `00-START-HERE-v2.8.5-RC6.2.txt`,
-`VALIDATION-v2.8.5-RC6.2.txt`, and
-`CHANGELOG-v2.8.5-RC6.2.txt`. Also retain
+Read `CHANGELOG-v2.8.6-RC6.3.txt` and
+`VALIDATION-v2.8.6-RC6.3.txt`. Also retain
 `FORECAST-GRADE-AUDIT-v2.8.4-RC6.1.txt`. Older release files are history only.

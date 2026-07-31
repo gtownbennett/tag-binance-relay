@@ -85,7 +85,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.8.5-rc6.2"
+SERVICE_VERSION = "2.8.6-rc6.3"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -124,7 +124,7 @@ OPENAI_MAX_OUTPUT_TOKENS = min(
     5_000,
     max(1_200, int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "4000"))),
 )
-OPENAI_TIMEOUT_SECONDS = max(20, int(os.getenv("OPENAI_TIMEOUT_SECONDS", "75")))
+OPENAI_TIMEOUT_SECONDS = max(20, int(os.getenv("OPENAI_TIMEOUT_SECONDS", "90")))
 
 LEDGER_ENABLED = os.getenv("LEDGER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 LEDGER_DB_PATH = os.getenv("LEDGER_DB_PATH", "/tmp/tag_prediction_ledger.sqlite3").strip() or "/tmp/tag_prediction_ledger.sqlite3"
@@ -213,6 +213,14 @@ class ChadAnalyzeRequest(BaseModel):
     trigger: str = Field(default="explicit-user-request", max_length=80)
 
 
+FULL_FORECAST_HORIZONS = (
+    "15m", "1h", "2h", "4h", "6h", "12h", "24h",
+    "3d", "7d", "2w", "3w", "1mo", "3mo", "6mo", "1y",
+    "2026", "2027", "2028", "2029", "2030",
+    "2y", "3y", "4y", "5y", "6y",
+)
+
+
 CHAD_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -279,14 +287,14 @@ CHAD_RESPONSE_SCHEMA: dict[str, Any] = {
                 "confidenceAdjustment": {"type": "string"},
                 "horizons": {
                     "type": "array",
-                    "minItems": 4,
-                    "maxItems": 4,
+                    "minItems": len(FULL_FORECAST_HORIZONS),
+                    "maxItems": len(FULL_FORECAST_HORIZONS),
                     "items": {
                         "type": "object",
                         "properties": {
                             "horizon": {
                                 "type": "string",
-                                "enum": ["6h", "24h", "3d", "7d"],
+                                "enum": list(FULL_FORECAST_HORIZONS),
                             },
                             "direction": {
                                 "type": "string",
@@ -367,7 +375,9 @@ Rules:
 - Compare futures movement with DEX spot participation. A futures-led move with weak DEX volume or weak transaction confirmation deserves lower durability confidence.
 - Missing, delayed, stale, or contradictory data must reduce confidence and obey the supplied confidence cap.
 - Give exactly three scenarios whose probabilities total 100.
-- Produce exactly four machine-readable forecast horizons: 6h, 24h, 3d and 7d. Use the supplied primary DEX spot price as the anchor when available. Each horizon needs one direction, one stated probability, a realistic target range and a clear invalidation price.
+- Produce exactly 25 machine-readable forecast horizons, once each and in this exact order: 15m, 1h, 2h, 4h, 6h, 12h, 24h, 3d, 7d, 2w, 3w, 1mo, 3mo, 6mo, 1y, 2026, 2027, 2028, 2029, 2030, 2y, 3y, 4y, 5y, 6y.
+- Use the supplied primary DEX spot price as the anchor. Each horizon needs one direction, one stated probability, a realistic target range and a clear invalidation price. Keep each reasoning field to one short sentence so the phone response stays compact and cost-bounded.
+- Near-term horizons may use current market structure. Multi-month, calendar-year, and 2y–6y ranges must become progressively wider and probabilities more conservative. Explicitly label their reasoning as low confidence when verified TAG history or catalyst evidence is insufficient; do not pretend they are calibrated.
 - targetLowUsd must be less than or equal to targetHighUsd. Avoid false precision and do not make every horizon point in the same direction unless the evidence supports it.
 - Use prediction-ledger performance only when enough graded outcomes exist. If fewer than 8 horizons are graded, explicitly say the sample is too small for meaningful calibration.
 - Similar historical setups are project-specific analogs, not proof that the same outcome will repeat.
@@ -2674,6 +2684,14 @@ async def _run_chad_analysis(request: ChadAnalyzeRequest) -> dict[str, Any]:
         "openAIResponseId": raw_response.get("id"),
         "cacheHit": cache_hit,
         "evidenceHash": evidence_hash,
+        "openAIUsage": {
+            "inputTokens": int(
+                (raw_response.get("usage") or {}).get("input_tokens") or 0
+            ),
+            "outputTokens": int(
+                (raw_response.get("usage") or {}).get("output_tokens") or 0
+            ),
+        },
         "analysis": analysis,
         "decisionChange": decision_change,
         "freshness": freshness,

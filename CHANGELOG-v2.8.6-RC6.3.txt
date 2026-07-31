@@ -1,0 +1,16 @@
+TAG Relay 2.8.6 RC6.3 — Full Forecast Contract
+==============================================
+
+* Expands the structured Chad response from four core forecast rows to the
+  exact 25 horizons requested by the terminal.
+* Requires every horizon once, in order, with direction, probability, range,
+  invalidation, and concise reasoning.
+* Tells Chad to widen uncertainty and avoid pretending that long-range outputs
+  are precisely calibrated.
+* Preserves the established 6h/24h/3d/7d durable scorecard contract while the
+  complete 25-row analysis remains available in the immutable saved result.
+* Records OpenAI input/output token counts in the protected result for an
+  evidence-based single-run cost calculation.
+* Keeps all paid behavior fail-closed, manual-only, capped at one OpenAI call
+  per accepted request, and without automatic retry.
+* Bumps the relay version to 2.8.6-rc6.3 and adds branch-scoped validation.
