@@ -85,7 +85,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.8.6-rc6.3"
+SERVICE_VERSION = "2.8.6-rc6.4"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -2168,6 +2168,8 @@ async def root() -> dict[str, Any]:
         "realTradingEnabled": False,
         "docs": "/docs",
         "health": "/health",
+        "sourceHealth": "/v1/tag/source-health",
+        "connection": "/v1/tag/connection",
         "snapshot": "/v1/tag/snapshot",
         "spot": "/v1/tag/spot",
         "history": "/v1/tag/history?period=5m&limit=100",
@@ -2258,6 +2260,126 @@ async def health() -> dict[str, Any]:
         ),
         "terminalStorageError": None,
     }
+
+
+async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
+    """Return side-effect-free operational health for TAGalyst.
+
+    This deliberately reads only process memory and configuration. It must not
+    wake Neon, poll a provider, start a collector, grade a forecast, or call AI.
+    """
+    async with stream_lock:
+        market_connected = bool(stream_state["connected"])
+        market_last_message = stream_state["lastMessageAt"]
+        depth_connected = bool(stream_state["depthConnected"])
+        depth_last_message = stream_state["depthLastMessageAt"]
+
+    storage_persistent = (
+        TERMINAL_DATABASE_URL.startswith("postgresql+")
+        or (
+            TERMINAL_DATABASE_URL.startswith("sqlite")
+            and "/tmp/" not in TERMINAL_DATABASE_URL
+        )
+    )
+    collector_running = bool(
+        terminal_addon.collector_task
+        and not terminal_addon.collector_task.done()
+    )
+    grader_running = bool(grader_state.get("running", False))
+    flags = operating_status(SERVICE_VERSION)["usage"]["flags"]
+    minimum_ready = bool(
+        authenticated
+        and not REPAIR_MODE
+        and flags["liveCollectorsEnabled"]
+        and collector_running
+        and flags["chadGradingEnabled"]
+        and grader_running
+        and storage_persistent
+    )
+    blockers: list[str] = []
+    if not authenticated:
+        blockers.append("Authorization required")
+    if REPAIR_MODE:
+        blockers.append("Repair Mode is active")
+    if not flags["liveCollectorsEnabled"]:
+        blockers.append("Current-data collection is paused")
+    elif not collector_running:
+        blockers.append("Collector job is not running")
+    if not flags["chadGradingEnabled"]:
+        blockers.append("Deterministic grading is disabled")
+    elif not grader_running:
+        blockers.append("Forecast grader is not running")
+    if not storage_persistent:
+        blockers.append("Persistent database storage is not configured")
+
+    return {
+        "ok": True,
+        "generatedAt": utc_iso(),
+        "serviceVersion": SERVICE_VERSION,
+        "buildId": BUILD_ID,
+        "authenticated": authenticated,
+        "sideEffects": "none",
+        "repairMode": REPAIR_MODE,
+        "minimumLiveServicesReady": minimum_ready,
+        "blockers": blockers,
+        "services": {
+            "collection": {
+                "enabled": flags["liveCollectorsEnabled"],
+                "running": collector_running,
+            },
+            "grading": {
+                "enabled": flags["chadGradingEnabled"],
+                "running": grader_running,
+            },
+            "backfill": {"enabled": flags["backfillEnabled"]},
+            "optionalAiSynthesis": {
+                "enabled": flags["openAiAutomaticEnabled"],
+            },
+            "notifications": {"enabled": flags["pushEnabled"]},
+            "forecastWrites": {
+                "enabled": flags["chadForecastWritesEnabled"],
+            },
+            "cacheWrites": {
+                "enabled": flags["chadCacheWritesEnabled"],
+            },
+        },
+        "sources": [
+            {
+                "id": "binance-market-stream",
+                "status": "CURRENT" if market_connected else "PAUSED",
+                "connected": market_connected,
+                "lastObservedAt": market_last_message,
+            },
+            {
+                "id": "binance-depth-stream",
+                "status": "CURRENT" if depth_connected else "PAUSED",
+                "connected": depth_connected,
+                "lastObservedAt": depth_last_message,
+            },
+        ],
+        "storage": {
+            "persistent": storage_persistent,
+            "databaseCheckedByThisRequest": False,
+        },
+        "nextAction": (
+            "Minimum live services are ready"
+            if minimum_ready
+            else blockers[0] if blockers else "Review service configuration"
+        ),
+    }
+
+
+@app.get("/v1/tag/source-health")
+async def tag_source_health() -> dict[str, Any]:
+    return await source_health_payload(authenticated=False)
+
+
+@app.get("/v1/tag/connection")
+async def tag_connection(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return await source_health_payload(authenticated=True)
 
 
 @app.get("/v1/tag/snapshot")
