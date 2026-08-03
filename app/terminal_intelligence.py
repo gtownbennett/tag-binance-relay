@@ -35,11 +35,13 @@ HORIZONS: list[tuple[str, int]] = [
     ("4h", 240),
     ("6h", 360),
     ("12h", 720),
-    ("1d", 1440),
+    ("24h", 1440),
     ("3d", 4320),
     ("7d", 10080),
+    ("30d", 43200),
+    ("90d", 129600),
 ]
-LONG_TERM_HORIZONS = ["1 month", "1 year", "2026", "2027", "2028", "2029", "2030"]
+LONG_TERM_HORIZONS = ["1y", "5y"]
 REPORT_STORAGE_CADENCE = timedelta(minutes=15)
 GRADE_SAMPLE_TOLERANCE = timedelta(minutes=15)
 
@@ -727,7 +729,7 @@ def _forecast_horizons(price: float, direction: str, confidence: float, data_qua
         hours = minutes / 60.0
         target_low, target_high = _path_targets(price, direction, hours, _num(vision.get("hourlyRealizedVolPct")))
         probability = max(34, min(85, int(confidence - math.log2(max(hours, 1)) * 3)))
-        status = "candidate" if data_quality >= 60 else "warming"
+        status = "candidate" if data_quality >= 60 else "incomplete-not-graded"
         active.append({
             "label": label,
             "minutes": minutes,
@@ -797,7 +799,11 @@ def build_chad_report(store: bool = True) -> dict[str, Any]:
     oi4h = _num(history.get("change4hPct"))
     funding = _num(futures.get("fundingRate"))
     taker = _num(binance.get("takerBuySellRatio1h") or futures.get("takerBuySellRatio"))
-    taker_quality = str(binance.get("takerWindowQuality") or futures.get("takerWindowQuality") or "warming")
+    taker_quality = str(
+        binance.get("takerWindowQuality")
+        or futures.get("takerWindowQuality")
+        or "not-enough-current-evidence"
+    )
     book = _num(binance.get("orderBookImbalancePct") or futures.get("orderBookImbalancePct"))
     top_positions = _num(binance.get("topPositionRatio") or futures.get("topPositionRatio"))
     buys = int(spot.get("buysH1") or 0)
@@ -921,7 +927,7 @@ def build_chad_report(store: bool = True) -> dict[str, Any]:
     attention_message = "Nothing important has changed since your last check. Go enjoy your day. Chad will interrupt you if something actually matters."
     if data_quality < 55:
         attention = "DATA WARNING"
-        attention_message = "Important inputs are missing or still warming up, so Chad is refusing a high-confidence call."
+        attention_message = "Important inputs are missing or incomplete, so Chad is refusing a high-confidence call."
     elif confidence >= 72 and regime not in {"CONFLICTING SIGNALS — WAIT", "COLLECTING HISTORY"}:
         attention = "WATCH"
         attention_message = f"{regime} is becoming actionable, but confirmation and invalidation still matter."
@@ -953,7 +959,7 @@ def build_chad_report(store: bool = True) -> dict[str, Any]:
         "whatChanged": [
             f"Price 1h: {price1h:+.2f}%" if price1h is not None else "Price 1h unavailable",
             f"Aggregate OI 1h: {oi1h:+.2f}%" if oi1h is not None else "Server OI history still collecting",
-            f"Binance taker B/S 1h: {taker:.3f} ({taker_quality})" if taker is not None else "Taker window still warming up",
+            f"Binance taker B/S 1h: {taker:.3f} ({taker_quality})" if taker is not None else "Not enough current taker history yet",
             f"Book imbalance: {book:+.2f}%" if book is not None else "Order-book pressure unavailable",
         ],
         "whyChanged": why_changed,
@@ -1072,7 +1078,7 @@ def _store_report_and_forecasts(report: dict[str, Any], price: float | None) -> 
             payload_json=json_dumps(report),
         ))
         for forecast in report.get("forecastHorizons") or []:
-            # Low-quality/warming forecasts are displayed for transparency but
+            # Low-quality incomplete forecasts are displayed for transparency but
             # are excluded from the learning ledger so missing data cannot train
             # Chad into false confidence.
             if (

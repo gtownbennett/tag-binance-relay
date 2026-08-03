@@ -316,7 +316,7 @@ def _bounded_predictions(session: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     )
     pending_count = sum(int(row.get("pending") or 0) for row in stats.values())
     calibrated = {label for label, row in by_horizon.items() if row["calibrated"]}
-    required = {"1h", "4h", "1d", "7d", "30d", "3mo"}
+    required = {"1h", "4h", "24h", "7d", "30d", "3mo"}
     learning_ready = required.issubset(calibrated)
     status = (
         "READY"
@@ -848,7 +848,6 @@ def build_compact_terminal_payload() -> dict[str, Any]:
         predictions, unified = _bounded_predictions(session)
         alerts, alert_timeline = _bounded_alerts(session)
         paper = _bounded_paper(session)
-        social = _bounded_social(session)
     result = {
         "generatedAt": utc_now().isoformat(),
         "chadHistory": history,
@@ -856,7 +855,6 @@ def build_compact_terminal_payload() -> dict[str, Any]:
         "alerts": alerts,
         "alertTimeline": alert_timeline,
         "paper": paper,
-        "social": social,
         "unifiedPredictions": unified,
         "latestStoredReport": {
             "generatedAt": _text(latest_report.get("generatedAt"), 80),
@@ -880,8 +878,6 @@ def build_compact_terminal_payload() -> dict[str, Any]:
                 "alertTimeline": ALERT_TIMELINE_LIMIT,
                 "paperTrades": PAPER_TRADE_LIMIT,
                 "paperEquity": PAPER_EQUITY_LIMIT,
-                "socialCallers": SOCIAL_CALLER_LIMIT,
-                "socialCalls": SOCIAL_CALL_LIMIT,
             },
         },
     }
@@ -894,7 +890,6 @@ def build_compact_terminal_payload() -> dict[str, Any]:
         result["unifiedPredictions"]["records"] = result["unifiedPredictions"]["records"][:24]
         result["alertTimeline"]["events"] = result["alertTimeline"]["events"][:40]
         result["paper"]["equityCurve"] = result["paper"]["equityCurve"][-30:]
-        result["social"]["calls"] = result["social"]["calls"][:12]
         response_bytes = len(
             json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         )

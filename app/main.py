@@ -3004,7 +3004,7 @@ async def build_unified_forecast_ledger(
     except Exception as exc:
         ledger_warning = ledger_warning or f"OpenAI Chad ledger unavailable: {type(exc).__name__}: {exc}"
         openai_performance = {}
-    required_ready_horizons = {"1h", "4h", "1d", "7d", "30d", "3mo"}
+    required_ready_horizons = {"1h", "4h", "24h", "7d", "30d", "3mo"}
     calibrated_horizons = {
         label
         for label, value in by_horizon.items()
@@ -3430,7 +3430,6 @@ async def terminal_bundle_endpoint(
                     "alerts": [],
                     "alertTimeline": {},
                     "paper": {},
-                    "social": {},
                 }
                 unified_predictions = {}
         else:
@@ -3464,7 +3463,6 @@ async def terminal_bundle_endpoint(
                     "alerts": [],
                     "alertTimeline": {},
                     "paper": {},
-                    "social": {},
                 }
             try:
                 unified_predictions = await build_unified_forecast_ledger(

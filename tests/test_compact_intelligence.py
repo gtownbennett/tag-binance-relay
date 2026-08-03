@@ -259,7 +259,8 @@ class CompactIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(payload["alerts"]), 12)
         self.assertLessEqual(len(payload["alertTimeline"]["events"]), 80)
         self.assertLessEqual(len(payload["paper"]["equityCurve"]), 60)
-        self.assertLessEqual(len(payload["social"]["calls"]), 24)
+        self.assertNotIn("social", payload)
+        self.assertNotIn("community", payload)
         encoded = json.dumps(
             payload,
             separators=(",", ":"),

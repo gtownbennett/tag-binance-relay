@@ -863,6 +863,11 @@ def _open_trade(session, account: PaperAccountRow, trade: PaperTradeRow, entry: 
 
 
 def place_paper_order(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("socialCallId") is not None:
+        raise ValueError(
+            "Community Calls are display-only and cannot create, influence, "
+            "or be linked to a paper trade."
+        )
     side = str(payload.get("side") or "").upper()
     order_type = str(payload.get("orderType") or "MARKET").upper()
     if side not in {"LONG", "SHORT"}:
@@ -911,7 +916,7 @@ def place_paper_order(payload: dict[str, Any]) -> dict[str, Any]:
             take_profit=_num(payload.get("takeProfit")),
             signal_source=str(payload.get("signalSource") or "manual paper trade")[:120],
             alert_id=int(payload["alertId"]) if payload.get("alertId") is not None else None,
-            social_call_id=int(payload["socialCallId"]) if payload.get("socialCallId") is not None else None,
+            social_call_id=None,
             thesis=str(payload.get("thesis") or ""),
             assumptions_json=json_dumps(assumptions),
             payload_json=json_dumps(payload),

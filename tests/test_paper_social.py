@@ -150,6 +150,26 @@ class PaperSocialTests(unittest.TestCase):
                 }
             )
 
+    def test_community_call_cannot_create_or_link_a_paper_trade(self) -> None:
+        with self.assertRaisesRegex(ValueError, "display-only"):
+            place_paper_order(
+                {
+                    "side": "LONG",
+                    "orderType": "MARKET",
+                    "leverage": 1,
+                    "marginUsdt": 100,
+                    "socialCallId": 42,
+                    "signalSource": "Community call",
+                }
+            )
+        ledger = paper_ledger()
+        self.assertEqual(
+            len(ledger["openPositions"])
+            + len(ledger["pendingOrders"])
+            + len(ledger["history"]),
+            0,
+        )
+
     def test_social_call_without_timestamp_never_invents_entry(self) -> None:
         call = ingest_social_call(
             {

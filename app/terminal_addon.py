@@ -446,7 +446,6 @@ class TerminalAddon:
             "alerts": alert_feed(12).get("alerts", []),
             "alertTimeline": alert_timeline(60),
             "paper": paper_ledger(50, evaluate=False, create_account=False),
-            "social": social_ledger(50, refresh_grades=False),
         }
 
 
