@@ -1,0 +1,16 @@
+TAG Relay 2.8.7 RC6.5 — Binance-safe grading
+================================================
+
+- Removes the automatic grader's direct dependency on the geo-blocked Binance
+  Futures REST kline route.
+- Resolves exact-due grade prices from durable relay snapshots first, stored
+  Binance Vision futures candles second, and completed-day Binance Vision
+  archives third.
+- Keeps the 15-minute exact-due tolerance and refuses to grade when no trusted
+  Binance sample is available.
+- Never silently substitutes an alternate exchange price.
+- Stores auditable source provenance for every new grade.
+- Normalizes seconds, milliseconds, and microseconds from Binance archives.
+- Corrects a seconds/milliseconds formatting defect that could turn a valid
+  2026 candle time into a 1970 timestamp and report an enormous sample offset.
+- Adds four focused regressions and bumps the relay to 2.8.7-rc6.5.

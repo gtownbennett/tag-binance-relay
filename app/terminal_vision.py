@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import zipfile
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -13,7 +14,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .terminal_config import SYMBOL
-from .terminal_database import VisionRow, json_dumps, session_scope
+from .terminal_database import BinanceSnapshot, VisionRow, json_dumps, session_scope
 
 BASE = "https://data.binance.vision/data/futures/um"
 CANDLE_DATASETS = {
@@ -56,6 +57,181 @@ def _int(value: Any) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _timestamp_ms(value: Any) -> int | None:
+    """Normalize Binance timestamps that may be seconds, ms, or microseconds."""
+    timestamp = _int(value)
+    if timestamp is None or timestamp <= 0:
+        return None
+    while timestamp > 10_000_000_000_000:
+        timestamp //= 1000
+    if timestamp < 10_000_000_000:
+        timestamp *= 1000
+    return timestamp
+
+
+def _aware_epoch(value: datetime) -> float:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
+
+
+def _interval_ms(interval: str) -> int:
+    unit = interval[-1:].lower()
+    amount = _int(interval[:-1]) or 5
+    multipliers = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
+    return amount * multipliers.get(unit, 60_000)
+
+
+def _vision_close_time_ms(row: VisionRow, interval: str) -> int | None:
+    try:
+        payload = json.loads(row.payload_json or "[]")
+    except (TypeError, ValueError):
+        payload = []
+    if isinstance(payload, list) and len(payload) >= 7:
+        close_time = _timestamp_ms(payload[6])
+        if close_time is not None:
+            return close_time
+    open_time = _timestamp_ms(row.event_time_ms)
+    return open_time + _interval_ms(interval) - 1 if open_time is not None else None
+
+
+def _stored_price_candidates(
+    due_ts: float,
+    tolerance_seconds: int,
+    interval: str,
+) -> list[tuple[float, float, str]]:
+    """Return price, sample epoch, and auditable source from durable relay data."""
+    start = datetime.fromtimestamp(due_ts - tolerance_seconds, tz=timezone.utc)
+    end = datetime.fromtimestamp(due_ts + tolerance_seconds, tz=timezone.utc)
+    due_ms = int(due_ts * 1000)
+    tolerance_ms = tolerance_seconds * 1000
+    candidates: list[tuple[float, float, str]] = []
+
+    with session_scope() as session:
+        snapshots = session.scalars(
+            select(BinanceSnapshot).where(
+                BinanceSnapshot.recorded_at >= start,
+                BinanceSnapshot.recorded_at <= end,
+                BinanceSnapshot.price.is_not(None),
+            )
+        ).all()
+        for row in snapshots:
+            if row.price is not None and row.price > 0:
+                candidates.append(
+                    (
+                        float(row.price),
+                        _aware_epoch(row.recorded_at),
+                        "Stored Binance relay snapshot nearest forecast due time",
+                    )
+                )
+
+        # Binance began publishing some archives with microsecond timestamps.
+        # Query both the normalized millisecond and legacy raw-microsecond ranges.
+        seen_ids: set[int] = set()
+        for scale in (1, 1000):
+            rows = session.scalars(
+                select(VisionRow).where(
+                    VisionRow.dataset == "klines",
+                    VisionRow.interval == interval,
+                    VisionRow.close_price.is_not(None),
+                    VisionRow.event_time_ms >= (due_ms - tolerance_ms - _interval_ms(interval)) * scale,
+                    VisionRow.event_time_ms <= (due_ms + tolerance_ms) * scale,
+                )
+            ).all()
+            for row in rows:
+                if row.id in seen_ids or row.close_price is None or row.close_price <= 0:
+                    continue
+                seen_ids.add(row.id)
+                close_time_ms = _vision_close_time_ms(row, interval)
+                if close_time_ms is not None:
+                    candidates.append(
+                        (
+                            float(row.close_price),
+                            close_time_ms / 1000.0,
+                            "Stored Binance Vision futures close nearest forecast due time",
+                        )
+                    )
+    return candidates
+
+
+async def historical_futures_price_near(
+    due_ts: float,
+    *,
+    tolerance_seconds: int = 900,
+    interval: str = "5m",
+) -> tuple[float | None, str | None, float | None, str | None, str | None]:
+    """Resolve an exact-due futures grade without depending on blocked Binance REST.
+
+    Durable relay snapshots and imported Binance Vision rows are preferred. For a
+    completed UTC day that is not stored yet, the public Binance Vision archive is
+    read directly. No alternate exchange price is silently substituted.
+    """
+    normalized_due_ts = float(due_ts)
+    if normalized_due_ts > 10_000_000_000:
+        normalized_due_ts /= 1000.0
+    tolerance_seconds = max(60, int(tolerance_seconds))
+
+    errors: list[str] = []
+    try:
+        candidates = _stored_price_candidates(normalized_due_ts, tolerance_seconds, interval)
+    except Exception as exc:
+        candidates = []
+        errors.append(f"stored history unavailable: {type(exc).__name__}: {exc}")
+
+    if candidates:
+        price, sample_ts, source = min(candidates, key=lambda item: abs(item[1] - normalized_due_ts))
+        offset = abs(sample_ts - normalized_due_ts)
+        if offset <= tolerance_seconds:
+            return (
+                price,
+                datetime.fromtimestamp(sample_ts, tz=timezone.utc).isoformat(),
+                offset,
+                source,
+                None,
+            )
+
+    due_day = datetime.fromtimestamp(normalized_due_ts, tz=timezone.utc).date()
+    if due_day >= datetime.now(timezone.utc).date():
+        errors.append("Binance Vision daily archive is not complete for the due UTC day")
+    else:
+        try:
+            url, raw = await _download_csv("klines", due_day.isoformat(), interval, "daily")
+            archive_candidates: list[tuple[float, float, str]] = []
+            for fields in raw:
+                if len(fields) < 7:
+                    continue
+                close_price = _float(fields[4])
+                close_time_ms = _timestamp_ms(fields[6])
+                if close_price is None or close_price <= 0 or close_time_ms is None:
+                    continue
+                sample_ts = close_time_ms / 1000.0
+                if abs(sample_ts - normalized_due_ts) <= tolerance_seconds:
+                    archive_candidates.append(
+                        (
+                            close_price,
+                            sample_ts,
+                            f"Binance Vision daily futures close ({url})",
+                        )
+                    )
+            if archive_candidates:
+                price, sample_ts, source = min(
+                    archive_candidates,
+                    key=lambda item: abs(item[1] - normalized_due_ts),
+                )
+                return (
+                    price,
+                    datetime.fromtimestamp(sample_ts, tz=timezone.utc).isoformat(),
+                    abs(sample_ts - normalized_due_ts),
+                    source,
+                    None,
+                )
+            errors.append("Binance Vision archive had no candle inside the grading tolerance")
+        except Exception as exc:
+            errors.append(f"Binance Vision archive unavailable: {type(exc).__name__}: {exc}")
+
+    return None, None, None, None, "; ".join(errors) or "No trusted Binance history was available"
 
 
 def _normalise_header(value: str) -> str:
@@ -273,7 +449,7 @@ async def backfill_day(day: str, interval: str = "5m") -> dict[str, Any]:
             for fields in raw:
                 if len(fields) < 6:
                     continue
-                event_time = _int(fields[0])
+                event_time = _timestamp_ms(fields[0])
                 if event_time is None:
                     continue
                 rows.append(
@@ -309,7 +485,7 @@ async def backfill_day(day: str, interval: str = "5m") -> dict[str, Any]:
                 continue
             price = _float(fields[1])
             quantity = _float(fields[2])
-            event_time = _int(fields[5])
+            event_time = _timestamp_ms(fields[5])
             buyer_maker = str(fields[6]).strip().lower() in {"true", "1"}
             if price is None or quantity is None or event_time is None:
                 continue

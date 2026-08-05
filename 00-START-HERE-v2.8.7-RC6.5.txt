@@ -1,0 +1,28 @@
+TAG RELAY 2.8.7 RC6.5 — START HERE
+
+Purpose
+- Eliminate Binance HTTP 418 failures from exact-due forecast grading.
+- Preserve grade timing, provenance, tolerance, and learning integrity.
+- Make no paid OpenAI call and no unrelated application change.
+
+Candidate workflow
+1. Review draft PR from branch agent/fix-binance-grading-fallback.
+2. Confirm all 56 tests and the container build are green.
+3. Deploy the branch image only to the relay preview service first:
+   ghcr.io/gtownbennett/tag-binance-relay:agent-fix-binance-grading-fallback
+4. Do not change relay keys or OpenAI settings.
+5. Confirm `/health` reports 2.8.7-rc6.5.
+6. Confirm live Binance market and depth streams remain current.
+7. Allow one automatic grading pass.
+8. Confirm the prior HTTP 418 and 1970/exact-due-offset errors are gone.
+9. Confirm any unresolvable sample remains pending instead of being graded from
+   a different exchange or a sample outside the 900-second tolerance.
+10. Promote only after the preview checks pass; keep the previous image tag for
+    immediate rollback.
+
+Safety invariants
+- No direct Futures REST kline dependency in automatic grading.
+- No cross-exchange silent substitution.
+- No grading outside exact-due tolerance.
+- No automatic OpenAI call.
+- No secret changes.

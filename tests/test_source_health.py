@@ -71,3 +71,34 @@ def test_minimum_live_status_never_implies_optional_ai_is_required() -> None:
     assert "collection" in services
     assert "grading" in services
     assert response.json()["minimumLiveServicesReady"] is False
+
+
+def test_grader_item_errors_mark_connection_degraded() -> None:
+    degraded = {
+        "running": True,
+        "lastRunAt": "2026-08-05T16:26:24Z",
+        "lastResult": {
+            "graded": 0,
+            "pendingDue": 4,
+            "errors": ["TAGUSDT 24h: HTTP 418"],
+        },
+    }
+    with (
+        patch.object(main, "RELAY_TOKEN", "test-relay-token"),
+        patch.object(main, "REPAIR_MODE", False),
+        patch.object(main, "grader_state", degraded),
+    ):
+        response = client.get(
+            "/v1/tag/connection",
+            headers={"X-Relay-Key": "test-relay-token"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    grading = payload["services"]["grading"]
+    assert grading["running"] is True
+    assert grading["healthy"] is False
+    assert grading["errorCount"] == 1
+    assert grading["pendingDue"] == 4
+    assert payload["minimumLiveServicesReady"] is False
+    assert any("degraded" in blocker.lower() for blocker in payload["blockers"])

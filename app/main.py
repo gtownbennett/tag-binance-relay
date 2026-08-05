@@ -41,6 +41,9 @@ from app.terminal_compact import (
     merge_compact_intelligence,
 )
 from app.terminal_multi_exchange import multi_exchange_service
+from app.terminal_vision import (
+    historical_futures_price_near as historical_vision_price_near,
+)
 from app.terminal_database import (
     OpenAIAnalysisCacheRow,
     json_dumps as terminal_json_dumps,
@@ -85,7 +88,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.8.6-rc6.4"
+SERVICE_VERSION = "2.8.7-rc6.5"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -960,49 +963,12 @@ def current_market_features(snapshot: dict[str, Any], spot: dict[str, Any]) -> d
 
 async def historical_futures_price_near(
     due_ts: float,
-) -> tuple[float | None, str | None, float | None, str | None]:
-    due_ms = int(due_ts * 1000)
-    try:
-        rows = await get_json(
-            "/fapi/v1/klines",
-            {
-                "symbol": SYMBOL,
-                "interval": "5m",
-                "startTime": due_ms - 5 * 60 * 1000,
-                "endTime": due_ms + 10 * 60 * 1000,
-                "limit": 4,
-            },
-        )
-    except Exception as exc:
-        return None, None, None, str(exc)
-
-    if not isinstance(rows, list) or not rows:
-        return None, None, None, "Binance returned no 5-minute candle near the forecast due time."
-
-    candidates: list[tuple[int, float, int]] = []
-    for row in rows:
-        if not isinstance(row, list) or len(row) < 7:
-            continue
-        open_time = as_int(row[0])
-        close_price = as_float(row[4])
-        close_time = as_int(row[6])
-        if open_time is None or close_price is None or close_time is None:
-            continue
-        candidates.append((abs(close_time - due_ms), close_price, close_time))
-
-    if not candidates:
-        return None, None, None, "Binance candle rows were missing a usable close price."
-
-    offset_ms, price, close_time = min(candidates, key=lambda item: item[0])
-    offset_seconds = offset_ms / 1000.0
-    if offset_seconds > FORECAST_GRADE_TOLERANCE_SECONDS:
-        return (
-            None,
-            None,
-            offset_seconds,
-            "Binance candle was outside the exact-due-time grading tolerance.",
-        )
-    return price, utc_iso(close_time / 1000.0), offset_seconds, None
+) -> tuple[float | None, str | None, float | None, str | None, str | None]:
+    return await historical_vision_price_near(
+        due_ts,
+        tolerance_seconds=FORECAST_GRADE_TOLERANCE_SECONDS,
+        interval="5m",
+    )
 
 
 async def grade_due_ledger_predictions(limit: int = 50) -> dict[str, Any]:
@@ -1039,14 +1005,14 @@ async def grade_due_ledger_predictions(limit: int = 50) -> dict[str, Any]:
         errors: list[str] = []
         price_cache: dict[
             int,
-            tuple[float | None, str | None, float | None, str | None],
+            tuple[float | None, str | None, float | None, str | None, str | None],
         ] = {}
 
         for item in due:
             due_bucket = int(float(item["due_ts"]) // 300 * 300)
             if due_bucket not in price_cache:
                 price_cache[due_bucket] = await historical_futures_price_near(float(item["due_ts"]))
-            actual_price, actual_at, _, error = price_cache[due_bucket]
+            actual_price, actual_at, _, actual_source, error = price_cache[due_bucket]
             if actual_price is None or actual_at is None:
                 errors.append(
                     f"{item['prediction_id']} {item['horizon']}: {error or 'price unavailable'}"
@@ -1059,7 +1025,7 @@ async def grade_due_ledger_predictions(limit: int = 50) -> dict[str, Any]:
                         horizon=str(item["horizon"]),
                         actual_price_usd=actual_price,
                         actual_at=actual_at,
-                        actual_source="Binance futures 5m close nearest forecast due time",
+                        actual_source=actual_source or "Verified Binance futures history",
                         max_sample_offset_seconds=FORECAST_GRADE_TOLERANCE_SECONDS,
                     )
                 )
@@ -2286,6 +2252,17 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         and not terminal_addon.collector_task.done()
     )
     grader_running = bool(grader_state.get("running", False))
+    grader_last_result = (
+        grader_state.get("lastResult")
+        if isinstance(grader_state.get("lastResult"), dict)
+        else {}
+    )
+    grader_errors = [
+        str(value)
+        for value in grader_last_result.get("errors", [])
+        if str(value).strip()
+    ]
+    grader_healthy = grader_running and not grader_errors
     flags = operating_status(SERVICE_VERSION)["usage"]["flags"]
     minimum_ready = bool(
         authenticated
@@ -2293,7 +2270,7 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         and flags["liveCollectorsEnabled"]
         and collector_running
         and flags["chadGradingEnabled"]
-        and grader_running
+        and grader_healthy
         and storage_persistent
     )
     blockers: list[str] = []
@@ -2309,6 +2286,10 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         blockers.append("Deterministic grading is disabled")
     elif not grader_running:
         blockers.append("Forecast grader is not running")
+    if grader_errors:
+        blockers.append(
+            f"Forecast grader is degraded ({len(grader_errors)} unresolved item error(s))"
+        )
     if not storage_persistent:
         blockers.append("Persistent database storage is not configured")
 
@@ -2330,6 +2311,12 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
             "grading": {
                 "enabled": flags["chadGradingEnabled"],
                 "running": grader_running,
+                "healthy": grader_healthy,
+                "lastRunAt": grader_state.get("lastRunAt"),
+                "gradedLastRun": grader_last_result.get("graded", 0),
+                "pendingDue": grader_last_result.get("pendingDue", 0),
+                "errorCount": len(grader_errors),
+                "errors": grader_errors[:3],
             },
             "backfill": {"enabled": flags["backfillEnabled"]},
             "optionalAiSynthesis": {
