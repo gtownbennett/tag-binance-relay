@@ -1,4 +1,17 @@
-# TAG Terminal Relay 2.8.6 RC6.3 — Full Forecast Contract
+# TAG Terminal Relay 2.8.7 RC6.5 — Binance-safe grading
+
+## RC6.5 grading correction
+
+Forecast grading no longer depends on the geo-blocked Binance Futures REST
+`/fapi/v1/klines` route. Exact-due prices are resolved in this order:
+
+1. durable Binance relay snapshots;
+2. stored Binance Vision futures candles;
+3. the public completed-day Binance Vision futures archive.
+
+Every successful grade retains its exact sample timestamp, offset, tolerance,
+and source. Another exchange is never silently substituted. Binance archive
+timestamps are normalized across seconds, milliseconds, and microseconds.
 
 This release preserves the fail-closed, manual-only Chad reactivation gate and
 extends the structured result to the terminal's complete 25-horizon forecast.

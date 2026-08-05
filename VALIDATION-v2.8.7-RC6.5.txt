@@ -1,0 +1,27 @@
+TAG Relay 2.8.7 RC6.5 — Validation record
+============================================
+
+Completed locally before deployment:
+
+- Python compileall: PASS
+- Full relay unit suite: 56/56 PASS
+- New Binance grading regressions: 4/4 PASS
+- Direct `/fapi/v1/klines` call from the grader: REMOVED
+- Cross-exchange silent substitution: NOT ALLOWED
+- Exact sample source and offset: RETAINED
+- OpenAI calls: 0
+- Real Binance Vision acceptance sample: PASS
+  - Dataset: TAGUSDT 5-minute USD-M futures candles
+  - UTC day: 2026-07-29
+  - Selected close: 2026-07-29T22:09:59.999Z
+  - Due-time offset: approximately 100 seconds
+  - Allowed tolerance: 900 seconds
+
+Required after candidate deployment:
+
+- `/health` reports version 2.8.7-rc6.5.
+- Live Binance market and depth streams remain connected.
+- The next automatic grading pass contains no HTTP 418 error.
+- Previously pending due items grade only when a trusted sample is inside the
+  tolerance; otherwise they remain pending with a clear provider error.
+- No OpenAI call, paper trade, alert write, or unrelated mutation is triggered.
