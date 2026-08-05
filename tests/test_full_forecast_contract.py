@@ -14,14 +14,15 @@ IMAGE_WORKFLOW = (ROOT / ".github/workflows/publish-image.yml").read_text(
 
 
 class FullForecastContractTests(unittest.TestCase):
-    def test_version_and_workflows_target_rc65(self):
+    def test_version_and_workflows_cover_current_production_lineage(self):
         self.assertIn('SERVICE_VERSION = "2.8.7-rc6.5"', MAIN)
         self.assertIn('APP_VERSION = "2.8.7-rc6.5"', CONFIG)
         for workflow in (TEST_WORKFLOW, IMAGE_WORKFLOW):
             self.assertIn(
-                "agent/fix-binance-grading-fallback",
+                "v2.8.6-rc6-3-full-forecast-contract",
                 workflow,
             )
+        self.assertIn("pull_request:", TEST_WORKFLOW)
 
     def test_all_twenty_five_requested_horizons_are_bounded(self):
         required = (
