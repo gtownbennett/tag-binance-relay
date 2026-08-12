@@ -101,7 +101,9 @@ def online_regime(features: Mapping[str, float]) -> dict[str, Any]:
     """Explainable forecast-time regime; no retrospective label is consumed."""
     oi = _finite(features.get("oiChange")) or 0.0
     funding = _finite(features.get("funding")) or 0.0
-    spot = _finite(features.get("spotConfirmation")) or 0.0
+    raw_spot = _finite(features.get("spotConfirmation"))
+    spot_missing = bool(features.get("spotConfirmationMissing")) or raw_spot is None
+    spot = raw_spot or 0.0
     volatility = abs(_finite(features.get("realizedVolatility")) or 0.0)
     liquidation = abs(_finite(features.get("liquidationPressure")) or 0.0)
     if liquidation >= 0.7 and oi <= -0.2:
@@ -116,6 +118,9 @@ def online_regime(features: Mapping[str, float]) -> dict[str, Any]:
     elif volatility >= 0.55 or abs(funding) >= 0.55:
         name = "EXTREME_LEVERAGE_OR_VOLATILITY"
         reasons = ["Volatility or funding is at an extreme versus its frozen scale."]
+    elif abs(oi) < 0.15 and spot_missing:
+        name = "LIMITED_SOURCE_MIXED"
+        reasons = ["OI is muted, but independent spot confirmation is unavailable."]
     elif abs(oi) < 0.15 and abs(spot) < 0.15:
         name = "LOW_PARTICIPATION_RANGE"
         reasons = ["OI and spot participation are muted."]

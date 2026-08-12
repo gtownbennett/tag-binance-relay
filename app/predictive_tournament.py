@@ -108,7 +108,9 @@ def historical_feature_cases(
             features["liquidationPressure1h"] = max(-1.0, min(1.0, liquidation))
         if change_4h is not None:
             features["priceChange4h"] = _clip(change_4h, 0.08)
-            features["spotConfirmation4h"] = _clip(change_4h, 0.08) if quote > 0 else 0.0
+            # Binance Vision futures candles cannot honestly stand in for an
+            # independent spot-confirmation source.  Leave this feature absent
+            # until aligned historical spot evidence is available.
         if oi_change_4h is not None:
             features["oiChange4h"] = _clip(oi_change_4h, 0.30)
         if funding is not None:
@@ -121,7 +123,11 @@ def historical_feature_cases(
         regime_features = {
             "oiChange": _clip(oi_change_1h or 0.0, 0.15),
             "funding": _clip(funding or 0.0, 0.003),
-            "spotConfirmation": _clip(change_4h or 0.0, 0.08),
+            # The historical replay archive has no aligned independent spot
+            # series.  Online regime detection must record that absence rather
+            # than treating a futures return as spot confirmation.
+            "spotConfirmation": 0.0,
+            "spotConfirmationMissing": 1.0,
             "realizedVolatility": _clip(_realized_volatility(prices), 2.0),
             "liquidationPressure": liquidation or 0.0,
         }

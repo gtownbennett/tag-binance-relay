@@ -28,6 +28,9 @@ def test_projection_is_the_shared_real_canonical_formula_not_an_interval_midpoin
 def test_tournament_uses_only_trailing_cases_and_purges_overlaps():
     cases = historical_feature_cases(_rows(), horizon="1h")
     assert cases and all(case["cutoff"] < NOW + timedelta(minutes=5 * 1_800) for case in cases)
+    assert all("spotConfirmation4h" not in case["features"] for case in cases)
+    assert all(case["regimeFeatures"]["spotConfirmation"] == 0.0 for case in cases)
+    assert all(case["regimeFeatures"]["spotConfirmationMissing"] == 1.0 for case in cases)
     result = evaluate_canonical_tournament(_rows(), horizon="1h")
     assert result["noLookahead"] is True
     assert result["effectiveIndependentSampleCount"] <= result["rawCaseCount"]

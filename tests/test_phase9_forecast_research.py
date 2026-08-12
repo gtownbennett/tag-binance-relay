@@ -47,6 +47,12 @@ def test_online_regime_is_explainable_and_forecast_time_safe() -> None:
     assert regime["noLookahead"] is True
 
 
+def test_online_regime_never_labels_missing_spot_as_muted_spot() -> None:
+    regime = online_regime({"oiChange": 0.0, "spotConfirmationMissing": 1.0})
+    assert regime["label"] == "LIMITED_SOURCE_MIXED"
+    assert "unavailable" in regime["reasons"][0]
+
+
 def test_online_regime_requires_confirmation_without_backdating_detection() -> None:
     rows = [
         {"observedAt": NOW.isoformat(), "features": {"oiChange": 0.0}},
