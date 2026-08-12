@@ -111,6 +111,7 @@ from app.historical_memory import (
     historical_maintenance,
     historical_production_summary,
 )
+from app.forecast_research import production_research_watermark, run_bounded_production_research
 from app.event_driven_chad import (
     chad_usage_report,
     finish_chad_call,
@@ -137,6 +138,7 @@ from app.terminal_usage import (
     CHAD_GRADING_ENABLED,
     DB_BOOTSTRAP_ON_START,
     DETERMINISTIC_GRADING_ENABLED,
+    HISTORICAL_RESEARCH_ENABLED,
     LIVE_COLLECTORS_ENABLED,
     OPENAI_DAILY_CALL_LIMIT,
     OPENAI_MONTHLY_CALL_LIMIT,
@@ -2501,6 +2503,10 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
             include_recent_detection=not bool((job.get("payload") or {}).get("importActivation")),
         )
         return {**maintenance, "archiveCatchUp": archive_catch_up}
+    if job_type == "run_bounded_forecast_research":
+        if not HISTORICAL_RESEARCH_ENABLED:
+            return {"enabled": False, "reason": "historical_research_disabled", "automaticPaidAiCalls": 0}
+        return await asyncio.to_thread(run_bounded_production_research)
     if job_type == "evaluate_event_driven_chad":
         return await evaluate_event_driven_chad()
     raise ValueError(f"Unsupported server job type: {job_type}")
@@ -2551,6 +2557,19 @@ async def phase1_job_loop() -> None:
                     payload={"bucket": history_bucket},
                     max_attempts=2,
                 )
+                # Lowest-priority deterministic learning job: keyed to the
+                # historical watermark so unchanged history cannot trigger a
+                # repeated full replay, and scheduled after live work.
+                research_watermark = await asyncio.to_thread(production_research_watermark)
+                if research_watermark is not None:
+                    await asyncio.to_thread(
+                        enqueue_job,
+                        job_type="run_bounded_forecast_research",
+                        idempotency_key=f"phase9-bounded-research:{research_watermark}",
+                        origin="server-scheduler",
+                        payload={"historyWatermark": research_watermark, "priority": "lowest"},
+                        max_attempts=1,
+                    )
                 chad_event_bucket = int(time.time()) // max(300, COLLECT_SECONDS) * max(300, COLLECT_SECONDS)
                 await asyncio.to_thread(
                     enqueue_job,

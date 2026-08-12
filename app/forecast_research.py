@@ -11,13 +11,17 @@ import math
 import statistics
 import hashlib
 import json
+from bisect import bisect_left
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
+
+from sqlalchemy import func, select
 
 from app.terminal_database import (
     FeatureReliabilityProfileRow,
     ForecastResearchRunRow,
     MarketStructureRegimeVersionRow,
+    HistoricalMarketRow,
     json_dumps,
     session_scope,
     utc_now,
@@ -29,6 +33,16 @@ class ResearchValidationError(ValueError):
 
 
 RESEARCH_VERSION = "tag-forecast-research-v1"
+REPLAY_HORIZONS: dict[str, timedelta] = {
+    "1h": timedelta(hours=1),
+    "4h": timedelta(hours=4),
+    "24h": timedelta(hours=24),
+    "7d": timedelta(days=7),
+    "30d": timedelta(days=30),
+    "90d": timedelta(days=90),
+    "180d": timedelta(days=180),
+    "1y": timedelta(days=365),
+}
 
 
 def _hash(value: Any) -> str:
@@ -174,6 +188,220 @@ def generic_ai_benchmark_status(records: Sequence[Mapping[str, Any]]) -> dict[st
         "claimAllowed": False,
         "reason": "No superiority claim is allowed without sufficient frozen, graded actual generic-AI records.",
     }
+
+
+def deterministic_replay(
+    observations: Sequence[Mapping[str, Any]], *, horizon: str, lookback: timedelta = timedelta(days=7),
+    embargo: timedelta | None = None,
+) -> dict[str, Any]:
+    """Replay a modest deterministic momentum/persistence study without future features.
+
+    Every forecast uses only observations at or before its cutoff.  This is a
+    research baseline, not a replacement for a frozen canonical TAGalysis
+    forecast, so it must never be displayed as live producer performance.
+    """
+    if horizon not in REPLAY_HORIZONS:
+        raise ResearchValidationError(f"unsupported replay horizon: {horizon}")
+    points: list[tuple[datetime, float]] = []
+    for row in observations:
+        at = _time(row.get("observedAt"), "observedAt")
+        price = _finite(row.get("price"))
+        if price is not None and price > 0:
+            points.append((at, price))
+    points.sort(key=lambda value: value[0])
+    if len(points) < 3:
+        return {"horizon": horizon, "status": "STILL_LEARNING", "rawCaseCount": 0,
+                "effectiveSampleCount": 0, "noLookahead": True, "reason": "insufficient valid price observations"}
+
+    delta = REPLAY_HORIZONS[horizon]
+    point_times = [row[0] for row in points]
+    # Evaluate a bounded grid rather than every five-minute archive row.  The
+    # grid deliberately remains denser than longer outcome windows, so the
+    # purge report continues to expose overlap inflation honestly.
+    candidate_spacing = max(timedelta(hours=1), min(timedelta(days=1), delta / 4))
+    candidates: list[dict[str, Any]] = []
+    start = 0
+    last_candidate_at: datetime | None = None
+    for index, (cutoff, current) in enumerate(points):
+        if last_candidate_at is not None and cutoff < last_candidate_at + candidate_spacing:
+            continue
+        last_candidate_at = cutoff
+        while start < index and points[start][0] < cutoff - lookback:
+            start += 1
+        history = points[start:index + 1]
+        if len(history) < 3 or history[0][0] > cutoff - lookback * 0.75:
+            continue
+        target_at = cutoff + delta
+        future_index = bisect_left(point_times, target_at, lo=index + 1)
+        if future_index >= len(points):
+            continue
+        actual = points[future_index][1]
+        returns = [math.log(right[1] / left[1]) for left, right in zip(history, history[1:]) if left[1] > 0 and right[1] > 0]
+        if not returns:
+            continue
+        # A strictly trailing signal: last-vs-first movement, shrunk for a
+        # deliberately conservative research proxy.  It is not an interval midpoint.
+        momentum = history[-1][1] / history[0][1] - 1.0
+        volatility = max(0.0025, statistics.pstdev(returns) if len(returns) > 1 else abs(returns[-1]))
+        scale = min(1.0, math.sqrt(delta.total_seconds() / timedelta(days=1).total_seconds()))
+        projected_return = max(-0.50, min(0.50, momentum * 0.35 * scale))
+        point = current * (1.0 + projected_return)
+        width = max(0.015, min(0.75, volatility * math.sqrt(max(1.0, delta.total_seconds() / 300.0)) * 1.35))
+        lower, upper = current * (1.0 + projected_return - width), current * (1.0 + projected_return + width)
+        neutral_band = max(0.0025, volatility * 0.5)
+        predicted = "SIDEWAYS" if abs(projected_return) <= neutral_band else ("HIGHER" if projected_return > 0 else "LOWER")
+        actual_return = actual / current - 1.0
+        actual_direction = "SIDEWAYS" if abs(actual_return) <= neutral_band else ("HIGHER" if actual_return > 0 else "LOWER")
+        candidates.append({
+            "cutoff": cutoff, "current": current, "actual": actual, "point": point, "lower": lower, "upper": upper,
+            "predictedDirection": predicted, "actualDirection": actual_direction,
+            "probabilityUp": max(0.05, min(0.95, 0.5 + projected_return / max(width * 2.0, 0.01))),
+            "volatility": volatility,
+        })
+
+    independence = purged_embargoed_cases([row["cutoff"] for row in candidates], horizon=delta, embargo=embargo)
+    accepted = {value for value in independence["acceptedCutoffs"]}
+    cases = [row for row in candidates if row["cutoff"].isoformat() in accepted]
+    # The complete cutoff list is used only while evaluating the local run;
+    # storing thousands of timestamps in a compact immutable result is wasteful.
+    # Keep a hash and small preview so an audit can verify the exact selection.
+    audit_independence = dict(independence)
+    cutoff_list = audit_independence.pop("acceptedCutoffs")
+    audit_independence["acceptedCutoffHash"] = _hash(cutoff_list)
+    audit_independence["acceptedCutoffPreview"] = cutoff_list if len(cutoff_list) <= 6 else cutoff_list[:3] + cutoff_list[-3:]
+    if not cases:
+        return {"horizon": horizon, "status": "STILL_LEARNING", **audit_independence, "noLookahead": True}
+    abs_errors = [abs(row["point"] / row["actual"] - 1.0) for row in cases]
+    widths = [(row["upper"] - row["lower"]) / row["current"] for row in cases]
+    coverage = [row["lower"] <= row["actual"] <= row["upper"] for row in cases]
+    direction = [row["predictedDirection"] == row["actualDirection"] for row in cases]
+    brier = [
+        (row["probabilityUp"] - (1.0 if row["actualDirection"] == "HIGHER" else 0.0)) ** 2
+        for row in cases
+    ]
+    wis = [
+        (row["upper"] - row["lower"]) + 10.0 * max(0.0, row["lower"] - row["actual"])
+        + 10.0 * max(0.0, row["actual"] - row["upper"])
+        for row in cases
+    ]
+    return {
+        "horizon": horizon,
+        "status": "AVAILABLE" if len(cases) >= 5 else "STILL_LEARNING",
+        **audit_independence,
+        "noLookahead": True,
+        "model": "deterministic-research-proxy-v1",
+        "metrics": {
+            "directionAccuracy": round(sum(direction) / len(cases), 6),
+            "maePct": round(100.0 * statistics.mean(abs_errors), 6),
+            "medianAbsoluteErrorPct": round(100.0 * statistics.median(abs_errors), 6),
+            "intervalCoverage": round(sum(coverage) / len(cases), 6),
+            "intervalWidthPct": round(100.0 * statistics.mean(widths), 6),
+            "weightedIntervalScore": round(statistics.mean(wis), 10),
+            "brierUp": round(statistics.mean(brier), 8),
+            "persistenceMaePct": round(100.0 * statistics.mean(abs(row["current"] / row["actual"] - 1.0) for row in cases), 6),
+        },
+        "outcomes": outcome_distribution([row["actual"] / row["current"] - 1.0 for row in cases]),
+    }
+
+
+def persist_regime_version(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Persist one immutable online/retrospective regime study result."""
+    effective_from = _time(payload.get("effectiveFrom"), "effectiveFrom")
+    effective_to = _time(payload.get("effectiveTo"), "effectiveTo")
+    detected_at = _time(payload.get("detectedAt") or effective_to, "detectedAt")
+    if effective_to < effective_from or detected_at < effective_from:
+        raise ResearchValidationError("regime timestamps are not time ordered")
+    online = str(payload.get("onlineLabel") or "MIXED_TRANSITION")
+    retrospective = payload.get("retrospectiveLabel")
+    normalized = {
+        "regimeKey": str(payload.get("regimeKey") or f"{online}:{effective_from.isoformat()}"),
+        "detectorVersion": str(payload.get("detectorVersion") or RESEARCH_VERSION),
+        "onlineLabel": online, "retrospectiveLabel": str(retrospective) if retrospective else None,
+        "detectedAt": detected_at.isoformat(), "effectiveFrom": effective_from.isoformat(), "effectiveTo": effective_to.isoformat(),
+        "onlineConfidence": float(payload.get("onlineConfidence") or 0.0),
+        "retrospectiveConfidence": _finite(payload.get("retrospectiveConfidence")),
+        "features": dict(payload.get("features") or {}), "sourceCoverage": dict(payload.get("sourceCoverage") or {}),
+        "missingness": dict(payload.get("missingness") or {}), "noLookahead": bool(payload.get("noLookahead") is True),
+    }
+    if not normalized["noLookahead"]:
+        raise ResearchValidationError("regime persistence requires online no-lookahead evidence")
+    digest = _hash(normalized)
+    regime_id = f"regime_research_{digest[:32]}"
+    with session_scope() as session:
+        existing = session.get(MarketStructureRegimeVersionRow, regime_id)
+        if existing is not None:
+            return {"regimeVersionId": existing.regime_version_id, "deduplicated": True}
+        session.add(MarketStructureRegimeVersionRow(
+            regime_version_id=regime_id, regime_key=normalized["regimeKey"], version=1,
+            detector_version=normalized["detectorVersion"], online_label=online,
+            retrospective_label=normalized["retrospectiveLabel"], detected_at=detected_at,
+            effective_from=effective_from, effective_to=effective_to,
+            online_confidence=normalized["onlineConfidence"], retrospective_confidence=normalized["retrospectiveConfidence"],
+            features_json=json_dumps(normalized["features"]), source_coverage_json=json_dumps(normalized["sourceCoverage"]),
+            missingness_json=json_dumps(normalized["missingness"]), payload_json=json_dumps(normalized), created_at=utc_now(),
+        ))
+    return {"regimeVersionId": regime_id, "deduplicated": False}
+
+
+def run_bounded_production_research(*, max_observations: int = 120_000, persist: bool = True) -> dict[str, Any]:
+    """Run a low-priority, deterministic replay from persisted production history.
+
+    This does not acquire data, alter a forecast, select a champion, or call a
+    provider.  It deliberately uses only stored rows and appends compact,
+    reproducible research records once per historical coverage watermark.
+    """
+    with session_scope() as session:
+        futures = list(session.execute(
+            select(HistoricalMarketRow.observed_at, HistoricalMarketRow.close_price)
+            .where(HistoricalMarketRow.source == "Binance Vision", HistoricalMarketRow.dataset == "klines",
+                   HistoricalMarketRow.validation_status == "valid", HistoricalMarketRow.close_price.is_not(None))
+            .order_by(HistoricalMarketRow.observed_at.asc()).limit(max_observations)
+        ))
+        daily = list(session.execute(
+            select(HistoricalMarketRow.observed_at, HistoricalMarketRow.close_price)
+            .where(HistoricalMarketRow.source == "CoinMarketCap Data API", HistoricalMarketRow.dataset == "aggregateDaily",
+                   HistoricalMarketRow.validation_status == "valid", HistoricalMarketRow.close_price.is_not(None))
+            .order_by(HistoricalMarketRow.observed_at.asc()).limit(max_observations)
+        ))
+
+    def observations(rows: Sequence[tuple[datetime, float]]) -> list[dict[str, Any]]:
+        return [{"observedAt": _time(at, "observedAt").isoformat(), "price": float(price)} for at, price in rows]
+
+    futures_points, daily_points = observations(futures), observations(daily)
+    horizons = {
+        "1h": (futures_points, timedelta(days=1)), "4h": (futures_points, timedelta(days=2)),
+        "24h": (futures_points, timedelta(days=7)), "7d": (daily_points, timedelta(days=30)),
+        "30d": (daily_points, timedelta(days=90)), "90d": (daily_points, timedelta(days=180)),
+        "180d": (daily_points, timedelta(days=180)), "1y": (daily_points, timedelta(days=365)),
+    }
+    stored: dict[str, Any] = {}
+    for horizon, (points, lookback) in horizons.items():
+        result = deterministic_replay(points, horizon=horizon, lookback=lookback)
+        if not points:
+            stored[horizon] = {"status": "STILL_LEARNING", "reason": "no persisted source coverage"}
+            continue
+        persisted = (
+            persist_research_run({
+                "runKind": "blind_deterministic_proxy_replay", "horizon": horizon,
+                "modelVersion": "deterministic-research-proxy-v1",
+                "evaluationStartAt": points[0]["observedAt"], "evaluationEndAt": points[-1]["observedAt"],
+                "rawCaseCount": result["rawCaseCount"], "effectiveSampleCount": result["effectiveIndependentSampleCount"],
+                "noLookahead": True, "results": result,
+            }) if persist else {"stored": False, "reason": "dry_run"}
+        )
+        stored[horizon] = {**result, "persistence": persisted}
+    return {
+        "model": "deterministic-research-proxy-v1", "sourceRows": {"futures": len(futures_points), "dailyAggregate": len(daily_points)},
+        "replays": stored, "automaticPaidAiCalls": 0, "liveForecastWeightsChanged": False,
+        "championPromotion": "not_evaluated_proxy_is_not_eligible_for_promotion",
+    }
+
+
+def production_research_watermark() -> str | None:
+    """Cheap immutable-history watermark for replay-job idempotency."""
+    with session_scope() as session:
+        watermark = session.scalar(select(func.max(HistoricalMarketRow.observed_at)))
+    return _time(watermark, "history watermark").isoformat() if watermark is not None else None
 
 
 def persist_research_run(payload: Mapping[str, Any]) -> dict[str, Any]:

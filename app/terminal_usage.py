@@ -33,6 +33,10 @@ BACKFILL_ENABLED = env_bool("BACKFILL_ENABLED", False)
 SERVER_JOBS_ENABLED = env_bool("SERVER_JOBS_ENABLED", True)
 SERVER_JOB_POLL_SECONDS = env_int("SERVER_JOB_POLL_SECONDS", 30, minimum=5)
 DETERMINISTIC_GRADING_ENABLED = env_bool("DETERMINISTIC_GRADING_ENABLED", True)
+# This bounded, database-only research job has no provider, paid-AI, or
+# forecast-write path. It is independently visible in health and can be
+# paused without disabling collection, grading, or historical maintenance.
+HISTORICAL_RESEARCH_ENABLED = env_bool("HISTORICAL_RESEARCH_ENABLED", True)
 # Phase 1 is a zero-paid-call phase. This is a separate, fail-closed gate so a
 # stale collection of legacy Chad flags cannot accidentally enable a request.
 PAID_AI_ENABLED = env_bool("PAID_AI_ENABLED", False)
@@ -297,6 +301,7 @@ class UsageGovernor:
                     "backfillEnabled": BACKFILL_ENABLED,
                     "serverJobsEnabled": SERVER_JOBS_ENABLED,
                     "deterministicGradingEnabled": DETERMINISTIC_GRADING_ENABLED,
+                    "historicalResearchEnabled": HISTORICAL_RESEARCH_ENABLED,
                     "paidAiEnabled": PAID_AI_ENABLED,
                     "openAiAutomaticEnabled": OPENAI_AUTOMATIC_ENABLED,
                     "pushEnabled": PUSH_ENABLED,

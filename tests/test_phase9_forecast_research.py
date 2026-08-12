@@ -4,10 +4,12 @@ import pytest
 
 from app.forecast_research import (
     ResearchValidationError,
+    deterministic_replay,
     generic_ai_benchmark_status,
     online_regime,
     outcome_distribution,
     persist_feature_reliability,
+    persist_regime_version,
     persist_research_run,
     purged_embargoed_cases,
     validate_feature_registry,
@@ -79,3 +81,29 @@ def test_research_and_feature_profiles_are_append_only_idempotent() -> None:
         "sampleCount": 12, "effectiveSampleCount": 6, "skillDelta": 0.03,
         "status": "STILL_LEARNING", "results": {"withWis": 0.7, "withoutWis": 0.73},
     }) == {**feature, "deduplicated": True}
+
+
+def test_deterministic_replay_is_purged_and_never_uses_future_features() -> None:
+    points = [
+        {"observedAt": (NOW + timedelta(hours=index)).isoformat(), "price": 1.0 + index * 0.01}
+        for index in range(280)
+    ]
+    result = deterministic_replay(points, horizon="24h", lookback=timedelta(hours=24))
+    assert result["noLookahead"] is True
+    assert result["rawCaseCount"] > result["effectiveIndependentSampleCount"]
+    assert result["metrics"]["directionAccuracy"] <= 1.0
+    assert result["metrics"]["persistenceMaePct"] >= 0.0
+
+
+def test_regime_versions_require_online_proof_and_are_idempotent() -> None:
+    payload = {
+        "regimeKey": "fixture-regime", "effectiveFrom": NOW.isoformat(),
+        "effectiveTo": (NOW + timedelta(hours=4)).isoformat(), "detectedAt": (NOW + timedelta(hours=4)).isoformat(),
+        "onlineLabel": "LEVERAGE_ONLY_EXPANSION", "onlineConfidence": 60,
+        "features": {"oiChange": 0.4}, "sourceCoverage": {"futures": "current"},
+        "missingness": {}, "noLookahead": True,
+    }
+    first = persist_regime_version(payload)
+    assert persist_regime_version(payload) == {**first, "deduplicated": True}
+    with pytest.raises(ResearchValidationError):
+        persist_regime_version({**payload, "regimeKey": "unsafe", "noLookahead": False})
