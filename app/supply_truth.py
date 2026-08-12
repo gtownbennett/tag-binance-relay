@@ -119,18 +119,18 @@ def verified_tag_supply_payload(
     }
 
 
-def verified_tag_supply_payload_from_cmc_and_dex(
+def verified_tag_supply_payload_from_cmc_and_gecko(
     *,
     coinmarketcap: Mapping[str, Any],
-    dexscreener: Mapping[str, Any],
+    geckoterminal: Mapping[str, Any],
     bsc_total_supply_hex: str,
     retrieved_at: datetime | str,
     unavailable_sources: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Verify supply when CoinGecko is explicitly unavailable, never by a hidden substitute.
 
-    DexScreener's market-cap field is provider-labelled rather than treated as an
-    on-chain supply fact.  Dividing it by that same response's current price is
+    GeckoTerminal's market-cap field is provider-labelled rather than treated as
+    an on-chain supply fact. Dividing it by that same response's current price is
     therefore only accepted as an independent *cross-check* of CMC's stated
     circulating supply, alongside the BSC totalSupply truth.
     """
@@ -148,37 +148,34 @@ def verified_tag_supply_payload_from_cmc_and_dex(
     if abs(on_chain_total - TAG_TOTAL_SUPPLY) > 0.5:
         raise SupplyTruthError("unexpected TAG on-chain total supply")
 
-    pairs = dexscreener.get("pairs") if isinstance(dexscreener.get("pairs"), list) else []
-    pair = next(
-        (
-            item for item in pairs
-            if isinstance(item, Mapping)
-            and str(item.get("chainId") or "").lower() == "bsc"
-            and str(item.get("pairAddress") or "").lower() == "0xf0750c373ebbb3baeef7e03d8300caad1983d67c"
-            and str((item.get("baseToken") or {}).get("address") or "").lower() == TAG_CONTRACT
-        ),
-        None,
-    )
-    if not isinstance(pair, Mapping):
-        raise SupplyTruthError("canonical TAG DexScreener pair is unavailable")
-    dex_price = _number(pair.get("priceUsd"), "DexScreener priceUsd")
-    dex_market_cap = _number(pair.get("marketCap"), "DexScreener marketCap")
-    dex_implied_circulating = dex_market_cap / dex_price
+    data = geckoterminal.get("data") if isinstance(geckoterminal.get("data"), Mapping) else {}
+    attributes = data.get("attributes") if isinstance(data.get("attributes"), Mapping) else {}
+    relationships = data.get("relationships") if isinstance(data.get("relationships"), Mapping) else {}
+    base_token = relationships.get("base_token") if isinstance(relationships.get("base_token"), Mapping) else {}
+    base_data = base_token.get("data") if isinstance(base_token.get("data"), Mapping) else {}
+    if (
+        str(data.get("id") or "").lower() != "bsc_0xf0750c373ebbb3baeef7e03d8300caad1983d67c"
+        or str(base_data.get("id") or "").lower() != f"bsc_{TAG_CONTRACT}"
+    ):
+        raise SupplyTruthError("canonical TAG GeckoTerminal pool is unavailable")
+    gecko_price = _number(attributes.get("base_token_price_usd"), "GeckoTerminal base_token_price_usd")
+    gecko_market_cap = _number(attributes.get("market_cap_usd"), "GeckoTerminal market_cap_usd")
+    gecko_implied_circulating = gecko_market_cap / gecko_price
     cmc_circulating = _number(cmc_statistics.get("circulatingSupply"), "CoinMarketCap circulatingSupply")
-    if cmc_circulating > on_chain_total or dex_implied_circulating > on_chain_total:
+    if cmc_circulating > on_chain_total or gecko_implied_circulating > on_chain_total:
         raise SupplyTruthError("circulating supply cannot exceed total supply")
-    divergence = abs(cmc_circulating - dex_implied_circulating) / max(cmc_circulating, dex_implied_circulating)
+    divergence = abs(cmc_circulating - gecko_implied_circulating) / max(cmc_circulating, gecko_implied_circulating)
     if divergence > MAX_CIRCULATING_SOURCE_DIVERGENCE:
         raise SupplyTruthError("circulating-supply sources materially conflict")
 
     source_reference = json.dumps(
         {
-            "method": "CoinMarketCap circulating estimate cross-checked against DexScreener provider-labelled marketCap/price and BSC totalSupply",
+            "method": "CoinMarketCap circulating estimate cross-checked against GeckoTerminal provider-labelled marketCap/price and BSC totalSupply",
             "contractAddress": TAG_CONTRACT,
             "coinMarketCapCirculating": cmc_circulating,
-            "dexScreenerMarketCapUsd": dex_market_cap,
-            "dexScreenerPriceUsd": dex_price,
-            "dexScreenerImpliedCirculating": dex_implied_circulating,
+            "geckoTerminalMarketCapUsd": gecko_market_cap,
+            "geckoTerminalPriceUsd": gecko_price,
+            "geckoTerminalImpliedCirculating": gecko_implied_circulating,
             "circulatingDivergencePct": round(divergence * 100, 6),
             "bscTotalSupply": on_chain_total,
             "coinMarketCapUpdatedAt": cmc_timestamp.isoformat(),
@@ -186,7 +183,7 @@ def verified_tag_supply_payload_from_cmc_and_dex(
             "unavailableSources": list(unavailable_sources),
             "sources": [
                 "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger",
-                "https://api.dexscreener.com/latest/dex/pairs/bsc/0xf0750c373EbBB3BaEEF7e03D8300cAaD1983d67c",
+                "https://api.geckoterminal.com/api/v2/networks/bsc/pools/0xf0750c373EbBB3BaEEF7e03D8300cAaD1983d67c",
                 "https://bsc-dataseed.binance.org/ eth_call totalSupply",
             ],
         },
@@ -199,7 +196,7 @@ def verified_tag_supply_payload_from_cmc_and_dex(
         "contractAddress": TAG_CONTRACT,
         "circulatingSupplyTokens": cmc_circulating,
         "fullyDilutedSupplyTokens": on_chain_total,
-        "sourceName": "CoinMarketCap supply truth cross-checked by DexScreener market-cap/price and BSC totalSupply (CoinGecko unavailable)",
+        "sourceName": "CoinMarketCap supply truth cross-checked by GeckoTerminal market-cap/price and BSC totalSupply (CoinGecko unavailable)",
         "sourceReference": source_reference,
         "verificationStatus": "verified",
         "verifiedAt": retrieved.isoformat(),

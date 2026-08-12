@@ -9,7 +9,7 @@ from app.supply_truth import (
     TAG_CONTRACT,
     TAG_TOTAL_SUPPLY,
     verified_tag_supply_payload,
-    verified_tag_supply_payload_from_cmc_and_dex,
+    verified_tag_supply_payload_from_cmc_and_gecko,
 )
 
 
@@ -35,15 +35,13 @@ def _coinmarketcap(*, circulating: float = 108_404_572_594.0, total: float = TAG
     }
 
 
-def _dexscreener(*, price: float = 0.001242, circulating: float = 108_864_805_114.17) -> dict:
+def _geckoterminal(*, price: float = 0.001242, circulating: float = 108_864_805_114.17) -> dict:
     return {
-        "pairs": [{
-            "chainId": "bsc",
-            "pairAddress": "0xf0750c373EbBB3BaEEF7e03D8300cAaD1983d67c",
-            "baseToken": {"address": TAG_CONTRACT},
-            "priceUsd": price,
-            "marketCap": price * circulating,
-        }]
+        "data": {
+            "id": "bsc_0xf0750c373EbBB3BaEEF7e03D8300cAaD1983d67c",
+            "relationships": {"base_token": {"data": {"id": f"bsc_{TAG_CONTRACT}"}}},
+            "attributes": {"base_token_price_usd": price, "market_cap_usd": price * circulating},
+        }
     }
 
 
@@ -60,10 +58,10 @@ def test_cross_checked_current_supply_is_provenance_bearing_and_verified() -> No
     assert "circulatingDivergencePct" in payload["sourceReference"]
 
 
-def test_explicit_cmc_dex_fallback_is_verified_and_records_unavailable_coingecko() -> None:
-    payload = verified_tag_supply_payload_from_cmc_and_dex(
+def test_explicit_cmc_gecko_fallback_is_verified_and_records_unavailable_coingecko() -> None:
+    payload = verified_tag_supply_payload_from_cmc_and_gecko(
         coinmarketcap=_coinmarketcap(),
-        dexscreener=_dexscreener(),
+        geckoterminal=_geckoterminal(),
         bsc_total_supply_hex=_hex_supply(),
         retrieved_at=NOW,
         unavailable_sources=("CoinGecko HTTP 429",),
@@ -73,11 +71,11 @@ def test_explicit_cmc_dex_fallback_is_verified_and_records_unavailable_coingecko
     assert "CoinGecko HTTP 429" in payload["sourceReference"]
 
 
-def test_explicit_cmc_dex_fallback_rejects_conflicting_implied_supply() -> None:
+def test_explicit_cmc_gecko_fallback_rejects_conflicting_implied_supply() -> None:
     with pytest.raises(SupplyTruthError, match="materially conflict"):
-        verified_tag_supply_payload_from_cmc_and_dex(
+        verified_tag_supply_payload_from_cmc_and_gecko(
             coinmarketcap=_coinmarketcap(circulating=90_000_000_000),
-            dexscreener=_dexscreener(circulating=130_000_000_000),
+            geckoterminal=_geckoterminal(circulating=130_000_000_000),
             bsc_total_supply_hex=_hex_supply(),
             retrieved_at=NOW,
         )

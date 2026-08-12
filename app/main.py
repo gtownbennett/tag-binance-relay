@@ -80,7 +80,7 @@ from app.canonical_forecast import (
 from app.supply_truth import (
     SupplyTruthError,
     verified_tag_supply_payload,
-    verified_tag_supply_payload_from_cmc_and_dex,
+    verified_tag_supply_payload_from_cmc_and_gecko,
 )
 from app.phase3_learning import (
     Phase3ValidationError,
@@ -2197,7 +2197,7 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
         raise RuntimeError("HTTP client is unavailable")
 
     async def collect() -> dict[str, Any]:
-        coin_gecko_response, coin_market_cap_response, bsc_response, dex_response = await asyncio.gather(
+        coin_gecko_response, coin_market_cap_response, bsc_response, gecko_response = await asyncio.gather(
             http_client.get(
                 "https://api.coingecko.com/api/v3/coins/tagger",
                 params={
@@ -2223,10 +2223,11 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
                 },
             ),
             http_client.get(
-                f"{DEXSCREENER_BASE}/latest/dex/pairs/{DEX_CHAIN_ID}/{DEX_PAIR_ADDRESS}"
+                f"https://api.geckoterminal.com/api/v2/networks/{DEX_CHAIN_ID}/pools/{DEX_PAIR_ADDRESS}",
+                headers={"Accept": "application/json;version=20230302"},
             ),
         )
-        for response in (coin_market_cap_response, bsc_response, dex_response):
+        for response in (coin_market_cap_response, bsc_response, gecko_response):
             response.raise_for_status()
         cmc_document = coin_market_cap_response.json()
         cmc_payload = cmc_document.get("data") if isinstance(cmc_document, dict) else {}
@@ -2240,9 +2241,9 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
                 retrieved_at=retrieved_at,
             )
         else:
-            payload = verified_tag_supply_payload_from_cmc_and_dex(
+            payload = verified_tag_supply_payload_from_cmc_and_gecko(
                 coinmarketcap=cmc_payload,
-                dexscreener=dex_response.json(),
+                geckoterminal=gecko_response.json(),
                 bsc_total_supply_hex=bsc_total,
                 retrieved_at=retrieved_at,
                 unavailable_sources=(f"CoinGecko HTTP {coin_gecko_response.status_code}",),
