@@ -18,6 +18,7 @@ import hashlib
 import os
 import sqlite3
 import sys
+import time
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,7 @@ from psycopg.rows import dict_row
 WAREHOUSE = Path(__file__).resolve().parents[1] / "phase6-history.sqlite3"
 IMPORT_URL_ENV = "TAGALYSIS_HISTORY_IMPORT_URL"
 BATCH_SIZE = 250
+MAX_BATCH_ATTEMPTS = 4
 
 TABLES: dict[str, tuple[str, tuple[str, ...], str]] = {
     "historical_market_rows": (
@@ -170,6 +172,18 @@ def insert_sql(table: str) -> str:
     return f"INSERT INTO {table} ({names}) VALUES ({parameters}) ON CONFLICT ({conflict_key}) DO NOTHING RETURNING {conflict_key}"
 
 
+def batch_insert_sql(table: str, row_count: int) -> str:
+    """Build one parameterized, bounded statement for a source batch."""
+    _, columns, conflict_key = TABLES[table]
+    names = ", ".join(columns)
+    parameters = "(" + ", ".join(["%s"] * len(columns)) + ")"
+    values = ", ".join([parameters] * row_count)
+    return (
+        f"INSERT INTO {table} ({names}) VALUES {values} "
+        f"ON CONFLICT ({conflict_key}) DO NOTHING RETURNING {conflict_key}"
+    )
+
+
 def destination_table_exists(cursor: psycopg.Cursor[dict], table: str) -> bool:
     cursor.execute(
         "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = %s) AS exists",
@@ -201,28 +215,37 @@ def verify_destination_boundary(connection: psycopg.Connection[dict]) -> None:
 def import_rows(
     destination: psycopg.Connection[dict], table: str, rows: Iterable[sqlite3.Row], *,
     source_hash: str, total_seen_before: int, total_inserted_before: int,
+    checkpoint_batches: bool,
 ) -> ImportResult:
     primary_key, columns, _ = TABLES[table]
     seen = inserted = 0
-    statement = insert_sql(table)
     with destination.cursor() as cursor:
         for batch in chunked(rows):
             seen += len(batch)
-            for row in batch:
-                cursor.execute(statement, tuple(row[column] for column in columns))
-                inserted += int(cursor.fetchone() is not None)
-            destination.commit()
-            # The batch is committed before its cursor is recorded.  If this
-            # second commit is interrupted, rerunning only replays that bounded
-            # batch and ON CONFLICT makes the replay harmless.
-            checkpoint(
-                destination,
-                cursor_value=f"{table}:{row[primary_key]}",
-                seen=total_seen_before + seen,
-                inserted=total_inserted_before + inserted,
-                status="running",
-                source_hash=source_hash,
-            )
+            parameters = [value for row in batch for value in (row[column] for column in columns)]
+            for attempt in range(MAX_BATCH_ATTEMPTS):
+                try:
+                    cursor.execute(batch_insert_sql(table, len(batch)), parameters)
+                    inserted += len(cursor.fetchall())
+                    destination.commit()
+                    break
+                except (psycopg.errors.LockNotAvailable, psycopg.OperationalError):
+                    destination.rollback()
+                    if attempt + 1 == MAX_BATCH_ATTEMPTS:
+                        raise
+                    time.sleep(0.5 * (2 ** attempt))
+            if checkpoint_batches:
+                # The batch is committed before its cursor is recorded.  If
+                # this second commit is interrupted, rerunning only replays
+                # that bounded batch and ON CONFLICT makes it harmless.
+                checkpoint(
+                    destination,
+                    cursor_value=f"{table}:{batch[-1][primary_key]}",
+                    seen=total_seen_before + seen,
+                    inserted=total_inserted_before + inserted,
+                    status="running",
+                    source_hash=source_hash,
+                )
     return ImportResult(table, seen, inserted, seen - inserted)
 
 
@@ -313,6 +336,7 @@ def run_import(*, sample: bool) -> list[ImportResult]:
                 source_hash=source_hash,
                 total_seen_before=total_seen,
                 total_inserted_before=total_inserted,
+                checkpoint_batches=not sample,
             )
             results.append(result)
             total_seen += result.seen

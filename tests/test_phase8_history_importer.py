@@ -38,6 +38,7 @@ def test_importer_requires_direct_tls_least_privilege_uri(monkeypatch: pytest.Mo
 
 
 def test_importer_only_targets_phase6_history_tables() -> None:
+    assert IMPORTER.MAX_BATCH_ATTEMPTS == 4
     assert set(IMPORTER.TABLES) == {
         "historical_market_rows",
         "historical_backfill_ranges",
@@ -50,6 +51,8 @@ def test_importer_only_targets_phase6_history_tables() -> None:
         assert "ON CONFLICT" in statement
         assert "canonical_forecasts" not in statement
         assert "chad_call_audit" not in statement
+        batch_statement = IMPORTER.batch_insert_sql(table, 2)
+        assert batch_statement.count("%s") == len(IMPORTER.TABLES[table][1]) * 2
 
 
 def test_validated_warehouse_is_the_expected_single_source() -> None:
@@ -73,3 +76,72 @@ def test_resume_cursor_reads_only_rows_after_the_last_committed_key() -> None:
         ).fetchone()[0]
         next_row = next(IMPORTER.source_rows_after(warehouse, "historical_market_rows", first_key))
     assert next_row["source_row_key"] > first_key
+
+
+def test_sample_rows_never_advance_the_full_import_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeCursor:
+        def __enter__(self) -> "FakeCursor":
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def execute(self, *_: object) -> None:
+            return None
+
+        def fetchone(self) -> None:
+            return None
+
+        def fetchall(self) -> list[object]:
+            return []
+
+    class FakeDestination:
+        def cursor(self) -> FakeCursor:
+            return FakeCursor()
+
+        def commit(self) -> None:
+            return None
+
+    checkpoints: list[object] = []
+    monkeypatch.setattr(IMPORTER, "checkpoint", lambda *_args, **_kwargs: checkpoints.append(True))
+    with IMPORTER.warehouse_connection() as warehouse:
+        row = warehouse.execute("SELECT * FROM historical_market_rows ORDER BY source_row_key LIMIT 1").fetchone()
+    IMPORTER.import_rows(
+        FakeDestination(), "historical_market_rows", [row],
+        source_hash="ignored", total_seen_before=0, total_inserted_before=0,
+        checkpoint_batches=False,
+    )
+    assert checkpoints == []
+
+
+def test_full_batch_checkpoint_uses_the_batch_final_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeCursor:
+        def __enter__(self) -> "FakeCursor":
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def execute(self, *_: object) -> None:
+            return None
+
+        def fetchall(self) -> list[object]:
+            return []
+
+    class FakeDestination:
+        def cursor(self) -> FakeCursor:
+            return FakeCursor()
+
+        def commit(self) -> None:
+            return None
+
+    checkpoints: list[dict[str, object]] = []
+    monkeypatch.setattr(IMPORTER, "checkpoint", lambda *_args, **kwargs: checkpoints.append(kwargs))
+    with IMPORTER.warehouse_connection() as warehouse:
+        row = warehouse.execute("SELECT * FROM historical_market_rows ORDER BY source_row_key LIMIT 1").fetchone()
+    IMPORTER.import_rows(
+        FakeDestination(), "historical_market_rows", [row],
+        source_hash="ignored", total_seen_before=0, total_inserted_before=0,
+        checkpoint_batches=True,
+    )
+    assert checkpoints[0]["cursor_value"] == f"historical_market_rows:{row['source_row_key']}"
