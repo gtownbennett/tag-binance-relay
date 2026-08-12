@@ -2213,7 +2213,8 @@ async def collect_verified_cex_spot_once() -> list[dict[str, Any]]:
             response.raise_for_status()
             rows = response.json()
             row = rows[0] if isinstance(rows, list) and rows else {}
-            return {"exchange": "Gate", "available": True, "priceUsd": as_float(row.get("last")), "volumeUsd24h": as_float(row.get("quote_volume")), "priceChange24hPct": as_float(row.get("change_percentage")), "observedAt": terminal_utc_now().isoformat(), "marketType": "spot"}
+            observed_at = terminal_utc_now().isoformat()
+            return {"exchange": "Gate", "available": True, "priceUsd": as_float(row.get("last")), "volumeUsd24h": as_float(row.get("quote_volume")), "priceChange24hPct": as_float(row.get("change_percentage")), "observedAt": observed_at, "updatedAt": observed_at, "marketType": "spot"}
         except Exception as exc:
             return {"exchange": "Gate", "available": False, "failureReason": f"{type(exc).__name__}: {exc}"}
 
@@ -2222,7 +2223,8 @@ async def collect_verified_cex_spot_once() -> list[dict[str, Any]]:
             response = await http_client.get("https://api.mexc.com/api/v3/ticker/24hr", params={"symbol": "TAGUSDT"})
             response.raise_for_status()
             row = response.json() if isinstance(response.json(), dict) else {}
-            return {"exchange": "MEXC", "available": True, "priceUsd": as_float(row.get("lastPrice")), "volumeUsd24h": as_float(row.get("quoteVolume")), "priceChange24hPct": as_float(row.get("priceChangePercent")), "observedAt": terminal_utc_now().isoformat(), "marketType": "spot"}
+            observed_at = terminal_utc_now().isoformat()
+            return {"exchange": "MEXC", "available": True, "priceUsd": as_float(row.get("lastPrice")), "volumeUsd24h": as_float(row.get("quoteVolume")), "priceChange24hPct": as_float(row.get("priceChangePercent")), "observedAt": observed_at, "updatedAt": observed_at, "marketType": "spot"}
         except Exception as exc:
             return {"exchange": "MEXC", "available": False, "failureReason": f"{type(exc).__name__}: {exc}"}
 

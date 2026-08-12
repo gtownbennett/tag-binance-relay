@@ -108,6 +108,7 @@ def test_verified_cex_spot_collector_keeps_gate_and_mexc_distinct(monkeypatch: p
     rows = asyncio.run(main.collect_verified_cex_spot_once())
     assert [(row["exchange"], row["marketType"], row["available"]) for row in rows] == [("Gate", "spot", True), ("MEXC", "spot", True)]
     assert rows[0]["priceUsd"] != rows[1]["priceUsd"]
+    assert rows[0]["observedAt"] == rows[0]["updatedAt"]
 
 
 def setup_function() -> None:
