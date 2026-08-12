@@ -109,6 +109,7 @@ from app.historical_memory import (
     chad_history_evidence_package,
     historical_event_report,
     historical_maintenance,
+    historical_production_summary,
 )
 from app.event_driven_chad import (
     chad_usage_report,
@@ -3136,6 +3137,15 @@ async def tag_history_events(
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
     return {"ok": True, "authoritative": True, **await asyncio.to_thread(historical_event_report)}
+
+
+@app.get("/v1/tag/history/summary")
+async def tag_history_summary(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Authenticated compact production-history status; raw warehouse rows remain server-only."""
+    require_relay_key(x_relay_key)
+    return {"ok": True, "authoritative": True, **await asyncio.to_thread(historical_production_summary)}
 
 
 @app.get("/v1/chad/usage")

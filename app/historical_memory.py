@@ -1751,6 +1751,85 @@ def historical_event_report() -> dict[str, Any]:
     }
 
 
+def historical_production_summary() -> dict[str, Any]:
+    """Return the compact, persisted production-memory view for clients.
+
+    This deliberately reads the last persisted coverage report instead of
+    aggregating the immutable warehouse on every authenticated app refresh.
+    It contains no raw observations and does not schedule acquisition,
+    detection, replay, grading, or any paid work.
+    """
+    with session_scope() as session:
+        report_id = session.scalar(
+            select(HistoricalCoverageSnapshotRow.report_id)
+            .order_by(HistoricalCoverageSnapshotRow.generated_at.desc())
+            .limit(1)
+        )
+        cells = (
+            list(
+                session.scalars(
+                    select(HistoricalCoverageSnapshotRow)
+                    .where(HistoricalCoverageSnapshotRow.report_id == report_id)
+                    .order_by(
+                        HistoricalCoverageSnapshotRow.source,
+                        HistoricalCoverageSnapshotRow.month,
+                    )
+                )
+            )
+            if report_id
+            else []
+        )
+        replay_rows = list(
+            session.scalars(
+                select(HistoricalReplayRunRow)
+                .order_by(HistoricalReplayRunRow.created_at.desc())
+                .limit(10)
+            )
+        )
+        event_versions = int(
+            session.scalar(select(func.count(HistoricalEventVersionRow.event_version_id))) or 0
+        )
+    source_rows: dict[str, int] = defaultdict(int)
+    status_counts: dict[str, int] = defaultdict(int)
+    for cell in cells:
+        source_rows[cell.source] += int(cell.row_count)
+        status_counts[cell.coverage_status] += 1
+    event_report = historical_event_report()
+    return {
+        "available": bool(cells),
+        "reportId": report_id,
+        "totalRows": sum(source_rows.values()),
+        "sourceRowCounts": dict(sorted(source_rows.items())),
+        "earliestTimestamp": min(
+            (_aware(cell.first_observed_at).isoformat() for cell in cells if cell.first_observed_at),
+            default=None,
+        ),
+        "latestTimestamp": max(
+            (_aware(cell.last_observed_at).isoformat() for cell in cells if cell.last_observed_at),
+            default=None,
+        ),
+        "coverageCells": len(cells),
+        "coverageStatusCounts": dict(sorted(status_counts.items())),
+        "eventVersions": event_versions,
+        "eventKeys": event_report["totalEvents"],
+        "eventFamilies": event_report["familyCounts"],
+        "namedEpisodes": sorted(event_report["knownEpisodes"]),
+        "replayRuns": [
+            {
+                "runId": row.run_id,
+                "modelVersion": row.model_version,
+                "evaluationKind": row.evaluation_kind,
+                "trainingEndAt": _aware(row.training_end_at).isoformat(),
+                "evaluationStartAt": _aware(row.evaluation_start_at).isoformat(),
+                "evaluationEndAt": _aware(row.evaluation_end_at).isoformat(),
+                "noLookahead": True,
+            }
+            for row in replay_rows
+        ],
+        "sideEffects": "none",
+    }
+
+
 def record_walk_forward_run(payload: Mapping[str, Any]) -> dict[str, Any]:
     train_start = _time(payload.get("trainingStartAt"), "trainingStartAt")
     train_end = _time(payload.get("trainingEndAt"), "trainingEndAt")

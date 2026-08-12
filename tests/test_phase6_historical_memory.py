@@ -38,6 +38,7 @@ from app.historical_memory import (
     detect_and_persist_events,
     find_event_analogs,
     finish_backfill_range,
+    historical_production_summary,
     import_binance_vision_candles,
     normalize_historical_observation,
     persist_event_version,
@@ -651,6 +652,52 @@ def test_coverage_matrix_is_machine_readable_and_restart_persistent() -> None:
     with session_scope() as session:
         assert session.scalar(select(func.count(HistoricalCoverageSnapshotRow.coverage_id))) == 2
         assert session.scalar(select(func.count(HistoricalMarketRow.id))) == 2
+
+
+def test_compact_production_summary_uses_persisted_metadata_not_raw_history() -> None:
+    persist_historical_observations(
+        [
+            _observation(datetime(2025, 8, 1, tzinfo=timezone.utc), 0.001),
+            _observation(
+                datetime(2025, 8, 1, tzinfo=timezone.utc),
+                0.00099,
+                source="CoinGecko",
+                exchange=None,
+                category="aggregate",
+                dataset="market_chart",
+                resolution="1d",
+            ),
+        ]
+    )
+    build_coverage_report(persist=True)
+    persist_event_version(
+        _event(
+            "AUGUST_2025_ATH_CYCLE",
+            datetime(2025, 8, 1, tzinfo=timezone.utc),
+            datetime(2025, 8, 2, tzinfo=timezone.utc),
+            feature=0.4,
+        )
+    )
+    record_walk_forward_run(
+        {
+            "trainingStartAt": "2025-01-01T00:00:00+00:00",
+            "trainingEndAt": "2025-06-30T23:59:59+00:00",
+            "evaluationStartAt": "2025-07-01T00:00:00+00:00",
+            "evaluationEndAt": "2025-08-01T00:00:00+00:00",
+            "baselineMetrics": {},
+            "analogMetrics": {},
+            "comparison": {},
+        }
+    )
+    summary = historical_production_summary()
+    assert summary["available"] is True
+    assert summary["totalRows"] == 2
+    assert summary["sourceRowCounts"] == {"Binance Vision": 1, "CoinGecko": 1}
+    assert summary["eventVersions"] == 1
+    assert summary["namedEpisodes"] == ["AUGUST_2025_ATH_CYCLE"]
+    assert summary["replayRuns"][0]["noLookahead"] is True
+    assert summary["sideEffects"] == "none"
+    assert "rows" not in summary
 
 
 def _auto_payload(event_key: str = "panic-1", evidence: str = "a" * 64) -> dict:
