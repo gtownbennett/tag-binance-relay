@@ -17,6 +17,8 @@ from app.terminal_database import (
     CanonicalEvidenceItemRow,
     CanonicalEvidenceSnapshotRow,
     ForecastHistoricalContextRow,
+    ForecastResearchRunRow,
+    FeatureReliabilityProfileRow,
     HistoricalBackfillRangeRow,
     HistoricalCoverageSnapshotRow,
     HistoricalEventVersionRow,
@@ -1786,6 +1788,20 @@ def historical_production_summary() -> dict[str, Any]:
                 .limit(10)
             )
         )
+        research_rows = list(
+            session.scalars(
+                select(ForecastResearchRunRow)
+                .order_by(ForecastResearchRunRow.evaluation_end_at.desc())
+                .limit(20)
+            )
+        )
+        reliability_rows = list(
+            session.scalars(
+                select(FeatureReliabilityProfileRow)
+                .order_by(FeatureReliabilityProfileRow.created_at.desc())
+                .limit(40)
+            )
+        )
         event_versions = int(
             session.scalar(select(func.count(HistoricalEventVersionRow.event_version_id))) or 0
         )
@@ -1795,6 +1811,17 @@ def historical_production_summary() -> dict[str, Any]:
         source_rows[cell.source] += int(cell.row_count)
         status_counts[cell.coverage_status] += 1
     event_report = historical_event_report()
+    reliability_by_horizon: dict[str, dict[str, Any]] = {}
+    for row in reliability_rows:
+        reliability_by_horizon.setdefault(
+            row.horizon,
+            {
+                "featureFamily": row.feature_family,
+                "effectiveSamples": row.effective_sample_count,
+                "skillDelta": row.skill_delta,
+                "status": row.status,
+            },
+        )
     return {
         "available": bool(cells),
         "reportId": report_id,
@@ -1826,6 +1853,22 @@ def historical_production_summary() -> dict[str, Any]:
             }
             for row in replay_rows
         ],
+        "forecastResearch": {
+            "runCount": len(research_rows),
+            "runs": [
+                {
+                    "runKind": row.run_kind,
+                    "horizon": row.horizon,
+                    "rawCases": row.raw_case_count,
+                    "effectiveIndependentSamples": row.effective_sample_count,
+                    "noLookahead": row.no_lookahead,
+                    "featureReliability": reliability_by_horizon.get(row.horizon or ""),
+                }
+                for row in research_rows
+            ],
+            "genericAiBenchmark": "PENDING_OWNER_APPROVED_ACTUAL_RECORDS",
+            "sideEffects": "none",
+        },
         "sideEffects": "none",
     }
 
