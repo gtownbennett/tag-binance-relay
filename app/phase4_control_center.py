@@ -11,6 +11,7 @@ from app.canonical_forecast import format_canonical_forecast, forecast_freshness
 from app.phase1_reliability import latest_evidence_packet
 from app.phase3_learning import HORIZON_MINIMUM_SAMPLES, active_alerts, current_user_levels
 from app.historical_memory import historical_production_summary
+from app.prospective_learning import prospective_population
 from app.terminal_database import (
     AssetTruthSnapshotRow,
     CanonicalForecastGradeRow,
@@ -274,4 +275,5 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
         "marketCapLevels": current_user_levels(seed_defaults=False),
         "marketTruth": _canonical_market_truth(),
         "historicalProduction": historical_production_summary(),
+        "prospectiveLearning": prospective_population(),
     }

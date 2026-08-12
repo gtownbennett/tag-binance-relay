@@ -208,8 +208,10 @@ def test_server_scheduler_issues_only_deterministic_tagalysis_records_after_veri
     assert issued["automaticPaidAiCalls"] == 0
     with session_scope() as session:
         rows = session.scalars(select(CanonicalForecastRow)).all()
-    assert len(rows) == len(HORIZON_SPECS)
-    assert {row.producer for row in rows} == {"tagalysis"}
+    tag_rows = [row for row in rows if row.producer == "tagalysis"]
+    baseline_rows = [row for row in rows if row.producer == "baseline"]
+    assert len(tag_rows) == len(HORIZON_SPECS)
+    assert len(baseline_rows) == len(HORIZON_SPECS)
     assert {row.evidence_snapshot_id for row in rows} == {packet["snapshotId"]}
 
 

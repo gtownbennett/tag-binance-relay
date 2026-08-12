@@ -114,6 +114,9 @@ from app.historical_memory import (
 )
 from app.forecast_research import production_research_watermark, run_bounded_production_research
 from app.predictive_tournament import persist_bounded_predictive_study
+from app.prospective_learning import (
+    evaluate_prospective_thresholds,
+)
 from app.event_driven_chad import (
     chad_usage_report,
     finish_chad_call,
@@ -2553,6 +2556,8 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
         if not HISTORICAL_RESEARCH_ENABLED:
             return {"enabled": False, "reason": "historical_research_disabled", "automaticPaidAiCalls": 0}
         return await asyncio.to_thread(persist_bounded_predictive_study, max_rows=25_000)
+    if job_type == "evaluate_prospective_learning":
+        return await asyncio.to_thread(evaluate_prospective_thresholds)
     if job_type == "evaluate_event_driven_chad":
         return await evaluate_event_driven_chad()
     raise ValueError(f"Unsupported server job type: {job_type}")
@@ -2640,6 +2645,15 @@ async def phase1_job_loop() -> None:
                     idempotency_key=f"phase6-chad-event:{chad_event_bucket}",
                     origin="server-scheduler",
                     payload={"bucket": chad_event_bucket},
+                    max_attempts=2,
+                )
+                prospective_bucket = int(time.time()) // 3_600 * 3_600
+                await asyncio.to_thread(
+                    enqueue_job,
+                    job_type="evaluate_prospective_learning",
+                    idempotency_key=f"phase12-prospective-learning-v1:{prospective_bucket}",
+                    origin="server-scheduler",
+                    payload={"bucket": prospective_bucket, "priority": "after-live-grading"},
                     max_attempts=2,
                 )
                 processed = 0

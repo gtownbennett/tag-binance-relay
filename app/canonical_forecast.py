@@ -543,6 +543,33 @@ def issue_due_tagalysis_forecasts(*, now: datetime | str | None = None) -> dict[
                 forecast_id=result["forecastId"],
                 deadline=_parse_time(record["deadline"], "deadline"),
             )
+            # Persistence is the single bounded prospective baseline shadow.
+            # It shares the exact frozen cutoff/outcome but is never shown as
+            # the user-facing TAGalysis champion.
+            baseline = build_tagalysis_forecast(
+                horizon=horizon,
+                evidence_snapshot_id=packet["snapshotId"],
+                supply_snapshot=supply,
+                portfolio_snapshot=None,
+                current_price=current_price,
+                data_as_of=packet.get("dataAsOf") or packet.get("serverCreatedAt") or issued,
+                features={"evidenceReferences": list(base_features["evidenceReferences"])},
+                source_availability=source_availability,
+                freshness=freshness,
+                issued_at=issued,
+                producer="baseline",
+                model_version="persistence-baseline-v1",
+            )
+            baseline_result = persist_canonical_forecast(baseline)
+            if baseline_result["stored"]:
+                schedule_exact_deadline_capture(
+                    forecast_id=baseline_result["forecastId"],
+                    deadline=_parse_time(baseline["deadline"], "deadline"),
+                )
+            from .prospective_learning import record_forecast_evidence
+            record_forecast_evidence(result["forecastId"])
+            if baseline_result["stored"]:
+                record_forecast_evidence(baseline_result["forecastId"])
         else:
             skipped.append(horizon)
     return {
