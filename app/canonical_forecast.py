@@ -372,6 +372,94 @@ def _latest_verified_supply_snapshot() -> dict[str, Any] | None:
         }
 
 
+def _bounded_unit(value: Any, *, scale: float) -> float | None:
+    """Return an explicitly scaled finite signal without turning absence into 0."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or scale <= 0:
+        return None
+    return max(-1.0, min(1.0, parsed / scale))
+
+
+def canonical_features_from_evidence_packet(packet: Mapping[str, Any]) -> dict[str, Any]:
+    """Map frozen source-labelled evidence into deterministic forecast inputs.
+
+    Derivative signals remain derivative signals.  A missing venue or a quiet
+    liquidation stream is absent, rather than a fabricated zero or spot proxy.
+    """
+    items = packet.get("items") if isinstance(packet.get("items"), list) else []
+    available = [
+        item for item in items
+        if isinstance(item, Mapping) and item.get("validationStatus") not in {"invalid", "unavailable"}
+    ]
+    references = [str(item.get("sourceId")) for item in available if item.get("sourceId")]
+    by_id = {str(item.get("sourceId")): item for item in available}
+    features: dict[str, Any] = {"evidenceReferences": sorted(references), "featureAvailability": {}}
+
+    def payload(source_id: str) -> Mapping[str, Any]:
+        item = by_id.get(source_id)
+        return item.get("payload") if isinstance(item, Mapping) and isinstance(item.get("payload"), Mapping) else {}
+
+    dex = payload("dex-spot:dexscreener-pancakeswap")
+    changes = dex.get("priceChangePct") if isinstance(dex.get("priceChangePct"), Mapping) else {}
+    volumes = dex.get("volumeUsd") if isinstance(dex.get("volumeUsd"), Mapping) else {}
+    for raw, name, scale in ((changes.get("h1"), "priceChange1h", 5.0), (changes.get("h24"), "priceChange24h", 20.0)):
+        value = _bounded_unit(raw, scale=scale)
+        if value is not None:
+            features[name] = value
+            features["featureAvailability"][name] = "observed_dex_spot"
+    for raw, name, scale in ((volumes.get("h24"), "spotVolume24h", 1_000_000.0), (dex.get("liquidityUsd"), "liquidityChange24h", 2_000_000.0)):
+        value = _bounded_unit(raw, scale=scale)
+        if value is not None:
+            features[name] = value
+            features["featureAvailability"][name] = "observed_dex_spot"
+
+    futures = payload("futures:binance")
+    for raw, name, scale in ((futures.get("oiChange1hPct"), "oiChange1h", 15.0), (futures.get("oiChange4hPct"), "oiChange4h", 30.0), (futures.get("fundingRate"), "fundingTrend4h", 0.30), (futures.get("orderBookImbalancePct"), "orderBookDepth4h", 100.0)):
+        value = _bounded_unit(raw, scale=scale)
+        if value is not None:
+            features[name] = value
+            features["featureAvailability"][name] = "observed_futures"
+    try:
+        ratio = float(futures.get("takerBuySellRatio"))
+        taker = (ratio - 1.0) / (ratio + 1.0) if math.isfinite(ratio) and ratio > 0 else None
+    except (TypeError, ValueError):
+        taker = None
+    if taker is not None:
+        features["takerImbalance1h"] = max(-1.0, min(1.0, taker))
+        features["featureAvailability"]["takerImbalance1h"] = "observed_futures"
+    try:
+        long_liq = float(futures.get("longLiquidation1hUsd"))
+        short_liq = float(futures.get("shortLiquidation1hUsd"))
+    except (TypeError, ValueError):
+        long_liq = short_liq = -1.0
+    if long_liq >= 0 and short_liq >= 0 and long_liq + short_liq > 0:
+        features["liquidationPressure1h"] = max(-1.0, min(1.0, (short_liq - long_liq) / (short_liq + long_liq)))
+        features["featureAvailability"]["liquidationPressure1h"] = "observed_futures_stream"
+
+    # Venue agreement only exists with two independently observed spot venues.
+    dex_price = _finite_positive(dex.get("priceUsd"), "DEX price") if dex.get("priceUsd") is not None else None
+    cex_prices: list[float] = []
+    for item in available:
+        if item.get("category") != "cex_spot" or not isinstance(item.get("payload"), Mapping):
+            continue
+        try:
+            cex_prices.append(_finite_positive(item["payload"].get("priceUsd"), "CEX spot price"))
+        except ForecastValidationError:
+            continue
+    if dex_price is not None and cex_prices:
+        divergence = (sum(cex_prices) / len(cex_prices) / dex_price - 1.0) * 100.0
+        value = _bounded_unit(divergence, scale=5.0)
+        if value is not None:
+            features["cexDexAgreement12h"] = 1.0 - abs(value)
+            features["cexDexAgreement24h"] = 1.0 - abs(value)
+            features["featureAvailability"]["cexDexAgreement12h"] = "observed_cross_venue_spot"
+            features["featureAvailability"]["cexDexAgreement24h"] = "observed_cross_venue_spot"
+    return features
+
+
 def issue_due_tagalysis_forecasts(*, now: datetime | str | None = None) -> dict[str, Any]:
     """Issue due deterministic TAGalysis records from frozen server evidence only."""
 
@@ -421,7 +509,9 @@ def issue_due_tagalysis_forecasts(*, now: datetime | str | None = None) -> dict[
         "missingSources": missing,
     }
     freshness = {"status": freshness_status, "oldestAgeSeconds": None, "staleSources": []}
-    base_features = {"evidenceReferences": [price_source_id]}
+    base_features = canonical_features_from_evidence_packet(packet)
+    if price_source_id not in base_features["evidenceReferences"]:
+        base_features["evidenceReferences"].append(price_source_id)
     created: list[str] = []
     skipped: list[str] = []
     for horizon, spec in HORIZON_SPECS.items():
@@ -446,6 +536,13 @@ def issue_due_tagalysis_forecasts(*, now: datetime | str | None = None) -> dict[
         result = persist_canonical_forecast(record)
         if result["stored"]:
             created.append(horizon)
+            # Exact-deadline grading needs an actively scheduled source read;
+            # no later nearest snapshot is permitted as a substitute.
+            from .phase3_learning import schedule_exact_deadline_capture
+            schedule_exact_deadline_capture(
+                forecast_id=result["forecastId"],
+                deadline=_parse_time(record["deadline"], "deadline"),
+            )
         else:
             skipped.append(horizon)
     return {

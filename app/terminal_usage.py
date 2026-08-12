@@ -31,7 +31,9 @@ REPAIR_MODE = env_bool("REPAIR_MODE", True)
 LIVE_COLLECTORS_ENABLED = env_bool("LIVE_COLLECTORS_ENABLED", False)
 BACKFILL_ENABLED = env_bool("BACKFILL_ENABLED", False)
 SERVER_JOBS_ENABLED = env_bool("SERVER_JOBS_ENABLED", True)
-SERVER_JOB_POLL_SECONDS = env_int("SERVER_JOB_POLL_SECONDS", 30, minimum=5)
+# A five-second heartbeat is required for direct exact-deadline outcome
+# captures.  Collection itself remains separately bucketed at five minutes.
+SERVER_JOB_POLL_SECONDS = env_int("SERVER_JOB_POLL_SECONDS", 5, minimum=5)
 DETERMINISTIC_GRADING_ENABLED = env_bool("DETERMINISTIC_GRADING_ENABLED", True)
 # This bounded, database-only research job has no provider, paid-AI, or
 # forecast-write path. It is independently visible in health and can be

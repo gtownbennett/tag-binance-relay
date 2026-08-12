@@ -85,6 +85,7 @@ from app.supply_truth import (
 from app.phase3_learning import (
     Phase3ValidationError,
     active_alerts as phase3_active_alerts,
+    capture_direct_deadline_outcome,
     capture_exact_due_outcomes,
     current_learning_version,
     current_user_levels,
@@ -2159,6 +2160,10 @@ async def collect_canonical_evidence_once() -> dict[str, Any]:
             market = collected.get("market") if isinstance(collected, dict) else None
             if not isinstance(market, dict):
                 raise RuntimeError("Collector returned no market packet.")
+            # Independent CEX spot is additive evidence.  It is never used as
+            # a fallback price for DEX truth and failures remain visible.
+            market = dict(market)
+            market["cexSpot"] = await collect_verified_cex_spot_once()
             packet = build_canonical_evidence_packet(market)
             storage = await asyncio.to_thread(persist_evidence_packet, packet)
             await asyncio.to_thread(
@@ -2192,6 +2197,33 @@ async def collect_canonical_evidence_once() -> dict[str, Any]:
             phase1_state.get("coalescedRequests") or 0
         ) + 1
     return {**result, "coalesced": coalesced}
+
+
+async def collect_verified_cex_spot_once() -> list[dict[str, Any]]:
+    """Fetch the two confirmed TAG/USDT spot tickers with bounded public I/O."""
+    if http_client is None:
+        return [{"exchange": "Gate", "available": False, "failureReason": "HTTP client unavailable"}, {"exchange": "MEXC", "available": False, "failureReason": "HTTP client unavailable"}]
+
+    async def gate() -> dict[str, Any]:
+        try:
+            response = await http_client.get("https://api.gateio.ws/api/v4/spot/tickers", params={"currency_pair": "TAG_USDT"})
+            response.raise_for_status()
+            rows = response.json()
+            row = rows[0] if isinstance(rows, list) and rows else {}
+            return {"exchange": "Gate", "available": True, "priceUsd": as_float(row.get("last")), "volumeUsd24h": as_float(row.get("quote_volume")), "priceChange24hPct": as_float(row.get("change_percentage")), "observedAt": utc_now().isoformat(), "marketType": "spot"}
+        except Exception as exc:
+            return {"exchange": "Gate", "available": False, "failureReason": f"{type(exc).__name__}: {exc}"}
+
+    async def mexc() -> dict[str, Any]:
+        try:
+            response = await http_client.get("https://api.mexc.com/api/v3/ticker/24hr", params={"symbol": "TAGUSDT"})
+            response.raise_for_status()
+            row = response.json() if isinstance(response.json(), dict) else {}
+            return {"exchange": "MEXC", "available": True, "priceUsd": as_float(row.get("lastPrice")), "volumeUsd24h": as_float(row.get("quoteVolume")), "priceChange24hPct": as_float(row.get("priceChangePercent")), "observedAt": utc_now().isoformat(), "marketType": "spot"}
+        except Exception as exc:
+            return {"exchange": "MEXC", "available": False, "failureReason": f"{type(exc).__name__}: {exc}"}
+
+    return list(await asyncio.gather(gate(), mexc()))
 
 
 async def collect_verified_tag_supply_once() -> dict[str, Any]:
@@ -2488,6 +2520,14 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
         return await asyncio.to_thread(validate_helper_candidate, candidate_id)
     if job_type == "grade_due_canonical_forecasts":
         return await asyncio.to_thread(capture_exact_due_outcomes)
+    if job_type == "capture_canonical_deadline_observation":
+        forecast_id = str((job.get("payload") or {}).get("forecastId") or "")
+        if not forecast_id:
+            raise ValueError("deadline-capture job is missing forecastId")
+        # Force one fresh DEX read only at the scheduled immutable deadline.
+        # This is deterministic market collection, never a paid-AI call.
+        spot = await cached_spot(force=True)
+        return await asyncio.to_thread(capture_direct_deadline_outcome, forecast_id, spot=spot)
     if job_type == "maintain_pattern_memory":
         return await asyncio.to_thread(maintain_pattern_memory_from_latest_evidence)
     if job_type == "process_staged_alerts":

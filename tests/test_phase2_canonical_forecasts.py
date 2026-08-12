@@ -14,6 +14,7 @@ from app.canonical_forecast import (
     PRODUCERS,
     ForecastValidationError,
     build_tagalysis_forecast,
+    canonical_features_from_evidence_packet,
     canonicalize_forecast,
     forecast_freshness,
     format_canonical_forecast,
@@ -52,6 +53,9 @@ def _market_fixture() -> dict:
                     "openInterestUsd": 1_000_000.0,
                     "fundingRate": 0.0001,
                     "volumeUsd24h": 2_000_000.0,
+                    "oiChange1hPct": 3.0,
+                    "oiChange4hPct": 5.0,
+                    "takerBuySellRatio": 1.2,
                     "updatedAt": observed,
                 }
                 for name, symbol in (
@@ -67,6 +71,7 @@ def _market_fixture() -> dict:
             "available": True,
             "priceUsd": 0.001,
             "volumeUsd": {"h1": 1_000.0, "h24": 20_000.0},
+            "priceChangePct": {"h1": 0.5, "h24": 1.5},
             "transactions": {"h1": {"buys": 5, "sells": 4}},
             "liquidityUsd": 500_000.0,
             "pairAddress": "0xf0750c373ebbb3baeef7e03d8300caad1983d67c",
@@ -206,6 +211,15 @@ def test_server_scheduler_issues_only_deterministic_tagalysis_records_after_veri
     assert len(rows) == len(HORIZON_SPECS)
     assert {row.producer for row in rows} == {"tagalysis"}
     assert {row.evidence_snapshot_id for row in rows} == {packet["snapshotId"]}
+
+
+def test_evidence_feature_adapter_preserves_spot_futures_and_missingness() -> None:
+    packet = build_canonical_evidence_packet(_market_fixture(), server_now=NOW)
+    features = canonical_features_from_evidence_packet(packet)
+    assert features["featureAvailability"]["priceChange1h"] == "observed_dex_spot"
+    assert features["featureAvailability"]["oiChange1h"] == "observed_futures"
+    assert "spotConfirmation4h" not in features
+    assert "cexDexAgreement12h" not in features
 
 
 def test_all_six_producers_are_separate_and_deterministic_builder_cannot_impersonate_chad() -> None:

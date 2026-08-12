@@ -35,6 +35,10 @@ PATTERN_VERSION = "tag-pattern-sequence-v1"
 ANALOG_VERSION = "tag-analog-v1"
 LEARNING_VERSION = "tag-learning-v1"
 ALERT_VERSION = "canonical-staged-alert-v1"
+# A deadline outcome is an actively scheduled source capture, never a later
+# convenient historical snapshot.  The small allowance covers scheduler wake
+# and network-response latency and is retained in immutable provenance.
+EXACT_DEADLINE_CAPTURE_MAX_LAG_SECONDS = 45
 
 GRADE_PRODUCERS = (
     "tagalysis",
@@ -143,6 +147,15 @@ def persist_verified_outcome(payload: Mapping[str, Any]) -> dict[str, Any]:
         "sourceReference": str(payload.get("sourceReference") or "").strip(),
         "evidenceSnapshotId": str(payload.get("evidenceSnapshotId") or "").strip() or None,
         "verificationStatus": str(payload.get("verificationStatus") or "").lower(),
+        "capturePolicy": str(payload.get("capturePolicy") or "stored_exact_snapshot").strip(),
+        "capturedAt": (
+            _parse_time(payload["capturedAt"], "capturedAt").isoformat()
+            if payload.get("capturedAt") is not None else None
+        ),
+        "captureLagSeconds": (
+            _finite(payload["captureLagSeconds"], "captureLagSeconds")
+            if payload.get("captureLagSeconds") is not None else None
+        ),
     }
     if not normalized["sourceName"] or not normalized["sourceReference"]:
         raise Phase3ValidationError("verified outcome source provenance is required")
@@ -176,6 +189,70 @@ def persist_verified_outcome(payload: Mapping[str, Any]) -> dict[str, Any]:
             )
         )
     return {"outcomeId": outcome_id, "outcomeHash": outcome_hash, "deduplicated": False}
+
+
+def schedule_exact_deadline_capture(*, forecast_id: str, deadline: datetime) -> dict[str, Any]:
+    """Schedule a direct source capture at a forecast's immutable deadline."""
+    due = _aware(deadline)
+    return enqueue_job(
+        job_type="capture_canonical_deadline_observation",
+        idempotency_key=f"phase3-deadline-capture-v1:{forecast_id}",
+        origin="canonical-forecast-issuance",
+        payload={"forecastId": forecast_id, "deadline": due.isoformat()},
+        available_at=due,
+        max_attempts=1,
+    )
+
+
+def capture_direct_deadline_outcome(
+    forecast_id: str,
+    *,
+    spot: Mapping[str, Any],
+    captured_at: datetime | None = None,
+    max_lag_seconds: int = EXACT_DEADLINE_CAPTURE_MAX_LAG_SECONDS,
+) -> dict[str, Any]:
+    """Persist/grade a direct, timestamp-bounded DEX observation at deadline.
+
+    This deliberately does not look for the closest saved row.  The caller
+    must obtain a fresh source response only after the scheduled deadline;
+    the immutable payload discloses the capture latency.
+    """
+    captured = _aware(captured_at or utc_now())
+    with session_scope() as session:
+        forecast = session.get(CanonicalForecastRow, forecast_id)
+        if forecast is None:
+            raise Phase3ValidationError("deadline capture forecast does not exist")
+        deadline = _aware(forecast.deadline)
+        existing = session.scalar(select(CanonicalForecastGradeRow).where(
+            CanonicalForecastGradeRow.forecast_id == forecast_id,
+            CanonicalForecastGradeRow.evaluation_kind == "live",
+            CanonicalForecastGradeRow.grade_version == GRADE_VERSION,
+        ))
+        if existing is not None:
+            return {"captured": False, "graded": False, "deduplicated": True, "reason": "already_graded"}
+    lag_seconds = (captured - deadline).total_seconds()
+    if lag_seconds < 0 or lag_seconds > max(1, int(max_lag_seconds)):
+        return {"captured": False, "graded": False, "reason": "outside_exact_capture_window", "captureLagSeconds": round(lag_seconds, 3)}
+    if spot.get("available") is not True:
+        return {"captured": False, "graded": False, "reason": "spot_source_unavailable"}
+    try:
+        price = _finite(spot.get("priceUsd"), "spot.priceUsd", positive=True)
+    except Phase3ValidationError:
+        return {"captured": False, "graded": False, "reason": "spot_price_unavailable"}
+    source_name = str(spot.get("source") or "direct DEX spot deadline capture")
+    outcome = persist_verified_outcome({
+        "assetSymbol": "TAG",
+        "observedAt": deadline.isoformat(),
+        "priceUsd": price,
+        "sourceName": source_name,
+        "sourceReference": f"deadline-capture:{forecast_id}:{deadline.isoformat()}",
+        "verificationStatus": "verified",
+        "capturePolicy": "direct_server_capture_at_exact_deadline",
+        "capturedAt": captured.isoformat(),
+        "captureLagSeconds": round(lag_seconds, 3),
+    })
+    grade = grade_canonical_forecast(forecast_id, outcome["outcomeId"], evaluation_kind="live")
+    return {"captured": not outcome["deduplicated"], "graded": not grade["deduplicated"], "captureLagSeconds": round(lag_seconds, 3), "grade": grade}
 
 
 def _interval_score(low: float, high: float, actual: float, alpha: float) -> float:
@@ -328,6 +405,7 @@ def grade_canonical_forecast(
             return {"gradeId": existing.grade_id, "deduplicated": True, "gradeLabel": existing.grade_label}
 
         record = _row_payload(forecast)
+        outcome_payload = json.loads(outcome.payload_json or "{}")
         actual = outcome.price_usd
         point = forecast.point_forecast
         tolerance = _volatility_tolerance(record)
@@ -445,6 +523,9 @@ def grade_canonical_forecast(
                         "forecastEvidenceSnapshotId": forecast.evidence_snapshot_id,
                         "outcomeSource": outcome.source_name,
                         "outcomeReference": outcome.source_reference,
+                        "outcomeCapturePolicy": outcome_payload.get("capturePolicy"),
+                        "outcomeCapturedAt": outcome_payload.get("capturedAt"),
+                        "outcomeCaptureLagSeconds": outcome_payload.get("captureLagSeconds"),
                         "metrics": metrics,
                     }
                 ),

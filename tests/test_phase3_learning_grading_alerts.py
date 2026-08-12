@@ -19,10 +19,12 @@ from app.canonical_forecast import (
 from app.phase1_reliability import build_canonical_evidence_packet, persist_evidence_packet
 from app.phase3_learning import (
     ALERT_STAGES,
+    EXACT_DEADLINE_CAPTURE_MAX_LAG_SECONDS,
     DEFAULT_USER_LEVELS,
     Phase3ValidationError,
     active_alerts,
     capture_exact_due_outcomes,
+    capture_direct_deadline_outcome,
     current_learning_version,
     current_user_levels,
     enqueue_phase3_jobs,
@@ -526,6 +528,27 @@ def test_exact_due_capture_never_uses_nearest_snapshot(monkeypatch: pytest.Monke
         session.add(SpotSnapshotRow(recorded_at=deadline, price=0.0011, market_cap=118_800_000, liquidity_usd=1, price_change_1h=1, payload_json="{}"))
     result = capture_exact_due_outcomes()
     assert result == {"capturedOutcomes": 1, "gradedForecasts": 1, "approximateOutcomesUsed": 0}
+
+
+def test_direct_deadline_capture_is_fresh_bounded_and_not_a_nearest_snapshot() -> None:
+    forecast = _forecast(horizon="1h", issued_at=NOW + timedelta(minutes=1), point=0.0011)
+    persist_canonical_forecast(forecast)
+    deadline = datetime.fromisoformat(forecast["deadline"])
+    too_late = capture_direct_deadline_outcome(
+        forecast["forecastId"], spot={"available": True, "priceUsd": 0.0011},
+        captured_at=deadline + timedelta(seconds=EXACT_DEADLINE_CAPTURE_MAX_LAG_SECONDS + 1),
+    )
+    assert too_late["reason"] == "outside_exact_capture_window"
+    captured = capture_direct_deadline_outcome(
+        forecast["forecastId"],
+        spot={"available": True, "priceUsd": 0.0011, "source": "fixture DEX"},
+        captured_at=deadline + timedelta(seconds=2),
+    )
+    assert captured["captured"] is True and captured["graded"] is True
+    with session_scope() as session:
+        grade = session.scalar(select(CanonicalForecastGradeRow).where(CanonicalForecastGradeRow.forecast_id == forecast["forecastId"]))
+    assert grade is not None
+    assert "direct_server_capture_at_exact_deadline" in grade.payload_json
 
 
 def test_phase3_migration_is_additive_immutable_and_covers_all_domains() -> None:
