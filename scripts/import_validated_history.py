@@ -169,7 +169,10 @@ def insert_sql(table: str) -> str:
     _, columns, conflict_key = TABLES[table]
     names = ", ".join(columns)
     parameters = ", ".join(["%s"] * len(columns))
-    return f"INSERT INTO {table} ({names}) VALUES ({parameters}) ON CONFLICT ({conflict_key}) DO NOTHING RETURNING {conflict_key}"
+    # Production has extra immutable uniqueness constraints on some metadata
+    # tables (for example event_key/event_version).  Deduplicate every such
+    # immutable identity rather than silently failing halfway through a resume.
+    return f"INSERT INTO {table} ({names}) VALUES ({parameters}) ON CONFLICT DO NOTHING RETURNING {conflict_key}"
 
 
 def batch_insert_sql(table: str, row_count: int) -> str:
@@ -180,7 +183,7 @@ def batch_insert_sql(table: str, row_count: int) -> str:
     values = ", ".join([parameters] * row_count)
     return (
         f"INSERT INTO {table} ({names}) VALUES {values} "
-        f"ON CONFLICT ({conflict_key}) DO NOTHING RETURNING {conflict_key}"
+        f"ON CONFLICT DO NOTHING RETURNING {conflict_key}"
     )
 
 

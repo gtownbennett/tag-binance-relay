@@ -48,7 +48,7 @@ def test_importer_only_targets_phase6_history_tables() -> None:
     }
     for table in IMPORTER.TABLES:
         statement = IMPORTER.insert_sql(table)
-        assert "ON CONFLICT" in statement
+        assert "ON CONFLICT DO NOTHING" in statement
         assert "canonical_forecasts" not in statement
         assert "chad_call_audit" not in statement
         batch_statement = IMPORTER.batch_insert_sql(table, 2)

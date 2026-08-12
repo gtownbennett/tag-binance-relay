@@ -8,7 +8,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -1592,50 +1592,70 @@ def chad_history_evidence_package(
 
 
 def build_coverage_report(*, persist: bool = False) -> dict[str, Any]:
+    """Build coverage from database aggregates, never a warehouse-sized ORM load."""
     with session_scope() as session:
-        rows = list(
-            session.scalars(
-                select(HistoricalMarketRow).order_by(
-                    HistoricalMarketRow.observed_at.asc(), HistoricalMarketRow.source.asc()
-                )
-            ).all()
+        dialect = session.bind.dialect.name if session.bind is not None else ""
+        month_value = (
+            func.date_trunc("month", HistoricalMarketRow.observed_at)
+            if dialect == "postgresql"
+            else func.strftime("%Y-%m-01T00:00:00", HistoricalMarketRow.observed_at)
         )
-    grouped: dict[tuple[str, str], list[HistoricalMarketRow]] = defaultdict(list)
-    for row in rows:
-        grouped[(_aware(row.observed_at).strftime("%Y-%m"), row.source)].append(row)
+        resolutions = (
+            func.array_agg(HistoricalMarketRow.resolution.distinct())
+            if dialect == "postgresql"
+            else func.group_concat(HistoricalMarketRow.resolution.distinct())
+        )
+        present = lambda condition: func.max(case((condition, 1), else_=0))
+        query = select(
+            month_value.label("month"),
+            HistoricalMarketRow.source.label("source"),
+            func.min(HistoricalMarketRow.observed_at).label("first_observed_at"),
+            func.max(HistoricalMarketRow.observed_at).label("last_observed_at"),
+            func.count().label("row_count"),
+            resolutions.label("resolutions"),
+            present(HistoricalMarketRow.close_price.is_not(None) | HistoricalMarketRow.mark_price.is_not(None)).label("price"),
+            present(HistoricalMarketRow.base_volume.is_not(None) | HistoricalMarketRow.quote_volume.is_not(None)).label("volume"),
+            present(HistoricalMarketRow.market_cap_usd.is_not(None)).label("market_cap"),
+            present(HistoricalMarketRow.circulating_supply.is_not(None)).label("supply"),
+            present(HistoricalMarketRow.category.in_(("cex_spot", "dex_spot"))).label("spot"),
+            present(HistoricalMarketRow.category == "futures").label("futures"),
+            present(HistoricalMarketRow.open_interest_usd.is_not(None) | HistoricalMarketRow.open_interest_tokens.is_not(None)).label("open_interest"),
+            present(HistoricalMarketRow.funding_rate.is_not(None)).label("funding"),
+            present(HistoricalMarketRow.global_long_short_ratio.is_not(None) | HistoricalMarketRow.top_position_ratio.is_not(None)).label("long_short"),
+            present(HistoricalMarketRow.taker_ratio.is_not(None) | HistoricalMarketRow.taker_buy_quote.is_not(None)).label("taker"),
+            present(HistoricalMarketRow.long_liquidations_usd.is_not(None) | HistoricalMarketRow.short_liquidations_usd.is_not(None)).label("liquidations"),
+            present(HistoricalMarketRow.category == "dex_spot").label("dex"),
+            present(HistoricalMarketRow.category == "on_chain").label("on_chain"),
+            present(HistoricalMarketRow.category == "catalyst").label("catalysts"),
+        ).group_by(month_value, HistoricalMarketRow.source).order_by(month_value, HistoricalMarketRow.source)
+        grouped = list(session.execute(query).mappings())
     cells: list[dict[str, Any]] = []
-    for (month, source), source_rows in sorted(grouped.items()):
-        categories = {row.category for row in source_rows}
+    source_counts: dict[str, int] = defaultdict(int)
+    for row in grouped:
         fields = {
-            "price": any(row.close_price is not None or row.mark_price is not None for row in source_rows),
-            "volume": any(row.base_volume is not None or row.quote_volume is not None for row in source_rows),
-            "marketCap": any(row.market_cap_usd is not None for row in source_rows),
-            "supply": any(row.circulating_supply is not None for row in source_rows),
-            "spot": bool(categories & {"cex_spot", "dex_spot"}),
-            "futures": "futures" in categories,
-            "openInterest": any(row.open_interest_usd is not None or row.open_interest_tokens is not None for row in source_rows),
-            "funding": any(row.funding_rate is not None for row in source_rows),
-            "longShort": any(row.global_long_short_ratio is not None or row.top_position_ratio is not None for row in source_rows),
-            "taker": any(row.taker_ratio is not None or row.taker_buy_quote is not None for row in source_rows),
-            "liquidations": any(row.long_liquidations_usd is not None or row.short_liquidations_usd is not None for row in source_rows),
-            "dex": "dex_spot" in categories,
-            "onChain": "on_chain" in categories,
-            "catalysts": "catalyst" in categories,
+            "price": bool(row["price"]), "volume": bool(row["volume"]),
+            "marketCap": bool(row["market_cap"]), "supply": bool(row["supply"]),
+            "spot": bool(row["spot"]), "futures": bool(row["futures"]),
+            "openInterest": bool(row["open_interest"]), "funding": bool(row["funding"]),
+            "longShort": bool(row["long_short"]), "taker": bool(row["taker"]),
+            "liquidations": bool(row["liquidations"]), "dex": bool(row["dex"]),
+            "onChain": bool(row["on_chain"]), "catalysts": bool(row["catalysts"]),
         }
         ratio = sum(fields.values()) / len(HISTORY_FIELDS)
         status = "COMPLETE" if ratio >= 0.85 else "STRONG" if ratio >= 0.65 else "PARTIAL" if ratio >= 0.35 else "MINIMAL" if ratio > 0 else "MISSING"
+        raw_resolutions = row["resolutions"]
+        resolution_values = raw_resolutions if isinstance(raw_resolutions, list) else str(raw_resolutions or "").split(",")
         cell = {
-            "month": month,
-            "source": source,
-            "firstObservedAt": _aware(source_rows[0].observed_at).isoformat(),
-            "lastObservedAt": _aware(source_rows[-1].observed_at).isoformat(),
-            "rowCount": len(source_rows),
-            "resolutions": sorted({row.resolution for row in source_rows}),
+            "month": _time(row["month"], "coverage month").strftime("%Y-%m"), "source": row["source"],
+            "firstObservedAt": _aware(row["first_observed_at"]).isoformat(),
+            "lastObservedAt": _aware(row["last_observed_at"]).isoformat(), "rowCount": int(row["row_count"]),
+            "resolutions": sorted({str(value) for value in resolution_values if value}),
             "fields": fields,
             "coverageStatus": status,
             "missing": [name for name in HISTORY_FIELDS if not fields[name]],
         }
         cells.append(cell)
+        source_counts[cell["source"]] += cell["rowCount"]
     generated = utc_now()
     report_hash = _hash(cells)
     report_id = f"coverage_{report_hash[:32]}"
@@ -1664,17 +1684,14 @@ def build_coverage_report(*, persist: bool = False) -> dict[str, Any]:
                     )
                     for cell in cells
                 )
-    source_counts: dict[str, int] = defaultdict(int)
-    for row in rows:
-        source_counts[row.source] += 1
     return {
         "reportId": report_id,
         "generatedAt": generated.isoformat(),
-        "earliestTimestamp": _aware(rows[0].observed_at).isoformat() if rows else None,
-        "latestTimestamp": _aware(rows[-1].observed_at).isoformat() if rows else None,
-        "totalRows": len(rows),
+        "earliestTimestamp": min((cell["firstObservedAt"] for cell in cells), default=None),
+        "latestTimestamp": max((cell["lastObservedAt"] for cell in cells), default=None),
+        "totalRows": sum(source_counts.values()),
         "sourceRowCounts": dict(sorted(source_counts.items())),
-        "resolutions": sorted({row.resolution for row in rows}),
+        "resolutions": sorted({resolution for cell in cells for resolution in cell["resolutions"]}),
         "matrix": cells,
     }
 
