@@ -87,6 +87,29 @@ def test_phase1_server_loop_has_the_phase1_enqueue_job() -> None:
     assert "phase9-bounded-research-v5" in source
 
 
+def test_verified_cex_spot_collector_keeps_gate_and_mexc_distinct(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Response:
+        def __init__(self, payload: object) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> object:
+            return self.payload
+
+    class Client:
+        async def get(self, url: str, *, params: dict[str, str]) -> Response:
+            if "gateio" in url:
+                return Response([{"last": "0.0012", "quote_volume": "20", "change_percentage": "1.5"}])
+            return Response({"lastPrice": "0.0011", "quoteVolume": "15", "priceChangePercent": "-1"})
+
+    monkeypatch.setattr(main, "http_client", Client())
+    rows = asyncio.run(main.collect_verified_cex_spot_once())
+    assert [(row["exchange"], row["marketType"], row["available"]) for row in rows] == [("Gate", "spot", True), ("MEXC", "spot", True)]
+    assert rows[0]["priceUsd"] != rows[1]["priceUsd"]
+
+
 def setup_function() -> None:
     with session_scope() as session:
         for model in (
