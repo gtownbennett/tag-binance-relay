@@ -2565,7 +2565,7 @@ async def phase1_job_loop() -> None:
                     await asyncio.to_thread(
                         enqueue_job,
                         job_type="run_bounded_forecast_research",
-                        idempotency_key=f"phase9-bounded-research:{research_watermark}",
+                        idempotency_key=f"phase9-bounded-research-v2:{research_watermark}",
                         origin="server-scheduler",
                         payload={"historyWatermark": research_watermark, "priority": "lowest"},
                         max_attempts=1,

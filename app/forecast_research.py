@@ -389,7 +389,23 @@ def run_bounded_production_research(*, max_observations: int = 120_000, persist:
                 "noLookahead": True, "results": result,
             }) if persist else {"stored": False, "reason": "dry_run"}
         )
-        stored[horizon] = {**result, "persistence": persisted}
+        metrics = result.get("metrics") if isinstance(result.get("metrics"), Mapping) else {}
+        model_mae = _finite(metrics.get("maePct"))
+        persistence_mae = _finite(metrics.get("persistenceMaePct"))
+        skill_delta = (persistence_mae - model_mae) if model_mae is not None and persistence_mae is not None else None
+        effective = int(result.get("effectiveIndependentSampleCount") or 0)
+        reliability_status = (
+            "DISQUALIFIED" if skill_delta is not None and skill_delta <= 0
+            else "STILL_LEARNING" if effective < 20 else "EVALUATED"
+        )
+        reliability = persist_feature_reliability({
+            "featureFamily": "trailing_momentum_proxy", "horizon": horizon, "regime": "ALL",
+            "sampleCount": int(result.get("rawCaseCount") or 0), "effectiveSampleCount": effective,
+            "skillDelta": skill_delta, "status": reliability_status,
+            "results": {"modelMaePct": model_mae, "persistenceMaePct": persistence_mae,
+                        "metric": "persistence MAE minus proxy MAE; positive is better"},
+        }) if persist else {"stored": False, "reason": "dry_run"}
+        stored[horizon] = {**result, "persistence": persisted, "featureReliability": reliability}
     return {
         "model": "deterministic-research-proxy-v1", "sourceRows": {"futures": len(futures_points), "dailyAggregate": len(daily_points)},
         "replays": stored, "automaticPaidAiCalls": 0, "liveForecastWeightsChanged": False,
