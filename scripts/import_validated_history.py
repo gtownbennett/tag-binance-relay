@@ -199,9 +199,10 @@ def verify_destination_boundary(connection: psycopg.Connection[dict]) -> None:
 
 
 def import_rows(
-    destination: psycopg.Connection[dict], table: str, rows: Iterable[sqlite3.Row]
+    destination: psycopg.Connection[dict], table: str, rows: Iterable[sqlite3.Row], *,
+    source_hash: str, total_seen_before: int, total_inserted_before: int,
 ) -> ImportResult:
-    _, columns, _ = TABLES[table]
+    primary_key, columns, _ = TABLES[table]
     seen = inserted = 0
     statement = insert_sql(table)
     with destination.cursor() as cursor:
@@ -211,6 +212,17 @@ def import_rows(
                 cursor.execute(statement, tuple(row[column] for column in columns))
                 inserted += int(cursor.fetchone() is not None)
             destination.commit()
+            # The batch is committed before its cursor is recorded.  If this
+            # second commit is interrupted, rerunning only replays that bounded
+            # batch and ON CONFLICT makes the replay harmless.
+            checkpoint(
+                destination,
+                cursor_value=f"{table}:{row[primary_key]}",
+                seen=total_seen_before + seen,
+                inserted=total_inserted_before + inserted,
+                status="running",
+                source_hash=source_hash,
+            )
     return ImportResult(table, seen, inserted, seen - inserted)
 
 
@@ -244,27 +256,71 @@ def checkpoint(
         destination.commit()
 
 
+def resume_state(destination: psycopg.Connection[dict]) -> tuple[str, str] | None:
+    """Return the active full-import table and its last durable key, if any."""
+    basis = "phase6-valid-local-warehouse-v1"
+    range_id = "history_range_" + hashlib.sha256(basis.encode()).hexdigest()[:32]
+    with destination.cursor() as cursor:
+        cursor.execute(
+            "SELECT status, cursor FROM historical_backfill_ranges WHERE range_id = %s",
+            (range_id,),
+        )
+        state = cursor.fetchone()
+    if not state or state["status"] != "running" or not state["cursor"]:
+        return None
+    table, separator, cursor_value = state["cursor"].partition(":")
+    if not separator or table not in TABLES or not cursor_value:
+        return None
+    return table, cursor_value
+
+
+def source_rows_after(
+    source: sqlite3.Connection, table: str, cursor_value: str | None
+) -> Iterable[sqlite3.Row]:
+    primary_key, _, _ = TABLES[table]
+    if cursor_value is None:
+        return source.execute(f"SELECT * FROM {table} ORDER BY {primary_key}")
+    return source.execute(
+        f"SELECT * FROM {table} WHERE {primary_key} > ? ORDER BY {primary_key}",
+        (cursor_value,),
+    )
+
+
 def run_import(*, sample: bool) -> list[ImportResult]:
     url = validated_import_url()
     with warehouse_connection() as source, psycopg.connect(url, row_factory=dict_row, autocommit=False) as destination:
+        # SQLite source timestamps are UTC by contract.  Pin the session so a
+        # workstation or database default cannot reinterpret naive values.
+        destination.execute("SET TIME ZONE 'UTC'")
         verify_destination_boundary(destination)
         source_hash = warehouse_hash()
         results: list[ImportResult] = []
         total_seen = total_inserted = 0
-        for table in TABLES:
-            rows = source_sample(source, table) if sample else source.execute(f"SELECT * FROM {table} ORDER BY 1")
-            result = import_rows(destination, table, rows)
+        active_resume = None if sample else resume_state(destination)
+        table_names = tuple(TABLES)
+        resume_index = table_names.index(active_resume[0]) if active_resume else None
+        for table_index, table in enumerate(table_names):
+            if active_resume and table_index < resume_index:
+                rows: Iterable[sqlite3.Row] = ()
+            elif active_resume and table_index == resume_index:
+                rows = source_rows_after(source, table, active_resume[1])
+            elif sample:
+                rows = source_sample(source, table)
+            else:
+                rows = source_rows_after(source, table, None)
+            result = import_rows(
+                destination, table, rows,
+                source_hash=source_hash,
+                total_seen_before=total_seen,
+                total_inserted_before=total_inserted,
+            )
             results.append(result)
             total_seen += result.seen
             total_inserted += result.inserted
-            checkpoint(
-                destination,
-                cursor_value=f"{table}:{result.seen}",
-                seen=total_seen,
-                inserted=total_inserted,
-                status="partial" if sample else "running",
-                source_hash=source_hash,
-            )
+            if sample:
+                # Samples exercise dedupe independently; they must never move
+                # the full-import resume cursor.
+                continue
         if not sample:
             checkpoint(
                 destination, cursor_value="complete", seen=total_seen, inserted=total_inserted,

@@ -59,3 +59,17 @@ def test_validated_warehouse_is_the_expected_single_source() -> None:
     assert {row["source"] for row in sample} == {
         "Binance Vision", "CoinMarketCap Data API", "Gate API", "GeckoTerminal", "MEXC API"
     }
+
+
+def test_resume_cursor_reads_only_rows_after_the_last_committed_key() -> None:
+    with IMPORTER.warehouse_connection() as warehouse:
+        last_key = warehouse.execute(
+            "SELECT source_row_key FROM historical_market_rows ORDER BY source_row_key DESC LIMIT 1"
+        ).fetchone()[0]
+        assert list(IMPORTER.source_rows_after(warehouse, "historical_market_rows", last_key)) == []
+
+        first_key = warehouse.execute(
+            "SELECT source_row_key FROM historical_market_rows ORDER BY source_row_key LIMIT 1"
+        ).fetchone()[0]
+        next_row = next(IMPORTER.source_rows_after(warehouse, "historical_market_rows", first_key))
+    assert next_row["source_row_key"] > first_key
