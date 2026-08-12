@@ -613,6 +613,75 @@ class HistoricalReplayRunRow(Base):
     payload_json: Mapped[str] = mapped_column(Text)
 
 
+class MarketStructureRegimeVersionRow(Base):
+    """Immutable online/retrospective regime evidence for research and replay."""
+
+    __tablename__ = "market_structure_regime_versions"
+    __table_args__ = (
+        UniqueConstraint("regime_key", "version", name="uq_market_structure_regime_version"),
+        CheckConstraint("effective_to >= effective_from", name="ck_market_structure_regime_time_order"),
+    )
+
+    regime_version_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    regime_key: Mapped[str] = mapped_column(String(120), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    detector_version: Mapped[str] = mapped_column(String(80), index=True)
+    online_label: Mapped[str] = mapped_column(String(80), index=True)
+    retrospective_label: Mapped[str | None] = mapped_column(String(80), index=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    effective_to: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    online_confidence: Mapped[float] = mapped_column(Float)
+    retrospective_confidence: Mapped[float | None] = mapped_column(Float)
+    features_json: Mapped[str] = mapped_column(Text)
+    source_coverage_json: Mapped[str] = mapped_column(Text)
+    missingness_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class ForecastResearchRunRow(Base):
+    """Immutable deterministic replay, ablation, benchmark, or drift result."""
+
+    __tablename__ = "forecast_research_runs"
+    __table_args__ = (UniqueConstraint("run_hash", name="uq_forecast_research_run_hash"),)
+
+    research_run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_hash: Mapped[str] = mapped_column(String(64), index=True)
+    run_kind: Mapped[str] = mapped_column(String(48), index=True)
+    model_version: Mapped[str] = mapped_column(String(120))
+    horizon: Mapped[str | None] = mapped_column(String(12), index=True)
+    evaluation_start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    evaluation_end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    raw_case_count: Mapped[int] = mapped_column(Integer)
+    effective_sample_count: Mapped[int] = mapped_column(Integer)
+    no_lookahead: Mapped[bool] = mapped_column(Boolean)
+    payload_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class FeatureReliabilityProfileRow(Base):
+    """Versioned out-of-sample reliability by feature, horizon, and regime."""
+
+    __tablename__ = "feature_reliability_profiles"
+    __table_args__ = (
+        UniqueConstraint("profile_hash", name="uq_feature_reliability_profile_hash"),
+        CheckConstraint("sample_count >= 0", name="ck_feature_reliability_samples"),
+    )
+
+    profile_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    profile_hash: Mapped[str] = mapped_column(String(64), index=True)
+    feature_family: Mapped[str] = mapped_column(String(80), index=True)
+    horizon: Mapped[str] = mapped_column(String(12), index=True)
+    regime: Mapped[str] = mapped_column(String(80), index=True)
+    sample_count: Mapped[int] = mapped_column(Integer)
+    effective_sample_count: Mapped[int] = mapped_column(Integer)
+    skill_delta: Mapped[float | None] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 class ChadCallAuditRow(Base):
     """Durable manual/automatic paid-call reservation and provider-usage audit."""
 

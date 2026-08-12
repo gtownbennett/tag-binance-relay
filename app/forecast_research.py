@@ -9,12 +9,30 @@ from __future__ import annotations
 
 import math
 import statistics
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
+
+from app.terminal_database import (
+    FeatureReliabilityProfileRow,
+    ForecastResearchRunRow,
+    MarketStructureRegimeVersionRow,
+    json_dumps,
+    session_scope,
+    utc_now,
+)
 
 
 class ResearchValidationError(ValueError):
     pass
+
+
+RESEARCH_VERSION = "tag-forecast-research-v1"
+
+
+def _hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
 
 def _time(value: datetime | str, name: str) -> datetime:
@@ -156,3 +174,70 @@ def generic_ai_benchmark_status(records: Sequence[Mapping[str, Any]]) -> dict[st
         "claimAllowed": False,
         "reason": "No superiority claim is allowed without sufficient frozen, graded actual generic-AI records.",
     }
+
+
+def persist_research_run(payload: Mapping[str, Any]) -> dict[str, Any]:
+    start = _time(payload.get("evaluationStartAt"), "evaluationStartAt")
+    end = _time(payload.get("evaluationEndAt"), "evaluationEndAt")
+    if end < start:
+        raise ResearchValidationError("evaluation window must be time ordered")
+    raw = int(payload.get("rawCaseCount") or 0)
+    effective = int(payload.get("effectiveSampleCount") or 0)
+    if raw < 0 or effective < 0 or effective > raw:
+        raise ResearchValidationError("research sample counts are invalid")
+    normalized = {
+        "runKind": str(payload.get("runKind") or "replay"),
+        "modelVersion": str(payload.get("modelVersion") or RESEARCH_VERSION),
+        "horizon": str(payload.get("horizon") or "") or None,
+        "evaluationStartAt": start.isoformat(), "evaluationEndAt": end.isoformat(),
+        "rawCaseCount": raw, "effectiveSampleCount": effective,
+        "noLookahead": bool(payload.get("noLookahead") is True),
+        "results": dict(payload.get("results") or {}),
+    }
+    if not normalized["noLookahead"]:
+        raise ResearchValidationError("research persistence requires an explicit no-lookahead proof")
+    run_hash = _hash(normalized)
+    run_id = f"research_{run_hash[:32]}"
+    with session_scope() as session:
+        existing = session.get(ForecastResearchRunRow, run_id)
+        if existing is not None:
+            return {"researchRunId": existing.research_run_id, "deduplicated": True}
+        session.add(ForecastResearchRunRow(
+            research_run_id=run_id, run_hash=run_hash, run_kind=normalized["runKind"],
+            model_version=normalized["modelVersion"], horizon=normalized["horizon"],
+            evaluation_start_at=start, evaluation_end_at=end, raw_case_count=raw,
+            effective_sample_count=effective, no_lookahead=True,
+            payload_json=json_dumps(normalized), created_at=utc_now(),
+        ))
+    return {"researchRunId": run_id, "deduplicated": False}
+
+
+def persist_feature_reliability(payload: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = {
+        "featureFamily": str(payload.get("featureFamily") or "").strip(),
+        "horizon": str(payload.get("horizon") or "").strip().lower(),
+        "regime": str(payload.get("regime") or "ALL").strip(),
+        "sampleCount": int(payload.get("sampleCount") or 0),
+        "effectiveSampleCount": int(payload.get("effectiveSampleCount") or 0),
+        "skillDelta": _finite(payload.get("skillDelta")),
+        "status": str(payload.get("status") or "STILL_LEARNING").upper(),
+        "results": dict(payload.get("results") or {}),
+    }
+    if not normalized["featureFamily"] or not normalized["horizon"]:
+        raise ResearchValidationError("feature reliability requires a feature family and horizon")
+    if not 0 <= normalized["effectiveSampleCount"] <= normalized["sampleCount"]:
+        raise ResearchValidationError("feature reliability sample counts are invalid")
+    profile_hash = _hash(normalized)
+    profile_id = f"feature_reliability_{profile_hash[:32]}"
+    with session_scope() as session:
+        existing = session.get(FeatureReliabilityProfileRow, profile_id)
+        if existing is not None:
+            return {"profileId": existing.profile_id, "deduplicated": True}
+        session.add(FeatureReliabilityProfileRow(
+            profile_id=profile_id, profile_hash=profile_hash,
+            feature_family=normalized["featureFamily"], horizon=normalized["horizon"],
+            regime=normalized["regime"], sample_count=normalized["sampleCount"],
+            effective_sample_count=normalized["effectiveSampleCount"], skill_delta=normalized["skillDelta"],
+            status=normalized["status"], payload_json=json_dumps(normalized), created_at=utc_now(),
+        ))
+    return {"profileId": profile_id, "deduplicated": False}

@@ -7,12 +7,19 @@ from app.forecast_research import (
     generic_ai_benchmark_status,
     online_regime,
     outcome_distribution,
+    persist_feature_reliability,
+    persist_research_run,
     purged_embargoed_cases,
     validate_feature_registry,
 )
+from app.terminal_database import init_db
 
 
 NOW = datetime(2026, 8, 12, tzinfo=timezone.utc)
+
+
+def setup_module() -> None:
+    init_db()
 
 
 def _feature(value: float, *, available_at: datetime = NOW) -> dict:
@@ -52,3 +59,23 @@ def test_outcome_distribution_and_generic_ai_status_are_honest() -> None:
     status = generic_ai_benchmark_status([])
     assert status["actualGenericAiRecords"] == 0
     assert status["claimAllowed"] is False
+
+
+def test_research_and_feature_profiles_are_append_only_idempotent() -> None:
+    replay = {
+        "runKind": "blind_replay", "horizon": "30d", "evaluationStartAt": NOW.isoformat(),
+        "evaluationEndAt": (NOW + timedelta(days=30)).isoformat(), "rawCaseCount": 12,
+        "effectiveSampleCount": 3, "noLookahead": True, "results": {"wis": 0.7},
+    }
+    first = persist_research_run(replay)
+    assert persist_research_run(replay) == {**first, "deduplicated": True}
+    feature = persist_feature_reliability({
+        "featureFamily": "open_interest", "horizon": "4h", "regime": "LEVERAGE_ONLY_EXPANSION",
+        "sampleCount": 12, "effectiveSampleCount": 6, "skillDelta": 0.03,
+        "status": "STILL_LEARNING", "results": {"withWis": 0.7, "withoutWis": 0.73},
+    })
+    assert persist_feature_reliability({
+        "featureFamily": "open_interest", "horizon": "4h", "regime": "LEVERAGE_ONLY_EXPANSION",
+        "sampleCount": 12, "effectiveSampleCount": 6, "skillDelta": 0.03,
+        "status": "STILL_LEARNING", "results": {"withWis": 0.7, "withoutWis": 0.73},
+    }) == {**feature, "deduplicated": True}
