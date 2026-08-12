@@ -592,6 +592,24 @@ def test_phase4_control_center_uses_newest_issue_and_same_producer_revision() ->
     assert envelope["record"]["issuedAt"] > envelope["previousRecord"]["issuedAt"]
 
 
+def test_phase4_current_call_falls_back_to_a_fresh_shorter_horizon() -> None:
+    expired_24h = _forecast(horizon="24h")
+    expired_24h["issuedAt"] = (NOW - timedelta(days=2)).isoformat()
+    expired_24h["dataAsOf"] = (NOW - timedelta(days=2, minutes=1)).isoformat()
+    expired_24h["deadline"] = (NOW - timedelta(days=1)).isoformat()
+    expired_24h.pop("forecastHash", None)
+    expired_24h.pop("forecastId", None)
+    expired_24h = canonicalize_forecast(expired_24h)
+    fresh_4h = _forecast(horizon="4h", issued_at=NOW)
+    persist_canonical_forecast(expired_24h)
+    persist_canonical_forecast(fresh_4h)
+
+    snapshot = canonical_control_center_snapshot(now=NOW + timedelta(minutes=2))
+    assert snapshot["currentCall"]["producer"] == "tagalysis"
+    assert snapshot["currentCall"]["forecastId"] == fresh_4h["forecastId"]
+    assert snapshot["currentCall"]["message"] == CHAD_PENDING_MESSAGE
+
+
 def test_phase4_control_center_is_honest_when_exact_deadline_grade_is_missing() -> None:
     forecast = _forecast(horizon="1h")
     persist_canonical_forecast(forecast)

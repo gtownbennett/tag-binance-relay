@@ -213,22 +213,32 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
             }
         )
 
-    def fresh(producer: str, horizon: str = "24h") -> dict[str, Any] | None:
-        item = next(
-            (
-                value
-                for value in forecasts
-                if value["record"]["producer"] == producer and value["record"]["horizon"] == horizon
-            ),
-            None,
-        )
-        if item is None or item["record"]["freshnessState"]["status"] != "fresh":
+    def fresh(producer: str, horizon: str | None = None) -> dict[str, Any] | None:
+        items = [
+            value
+            for value in forecasts
+            if value["record"]["producer"] == producer
+            and (horizon is None or value["record"]["horizon"] == horizon)
+            and value["record"]["freshnessState"]["status"] == "fresh"
+        ]
+        if not items:
             return None
-        return item
+        # The 24H call remains the normal headline.  When it is stale, a
+        # fresh canonical 4H/1H call is still authoritative and must not be
+        # hidden behind a false "no current forecast" state.
+        priority = {name: index for index, name in enumerate(("24h", "4h", "1h", "12h", "3d", "7d", "30d", "3m", "1y", "5y"))}
+        return min(
+            items,
+            key=lambda item: (
+                priority.get(item["record"]["horizon"], len(priority)),
+                -datetime.fromisoformat(item["record"]["issuedAt"].replace("Z", "+00:00")).timestamp(),
+            ),
+        )
 
     tagalysis = fresh("tagalysis")
-    chad = fresh("chad")
-    final_call = fresh("final_call")
+    active_horizon = tagalysis["record"]["horizon"] if tagalysis else None
+    chad = fresh("chad", active_horizon)
+    final_call = fresh("final_call", active_horizon)
     # Event-driven Chad is an additional independent layer, not a dependency
     # for continuous deterministic operation. A persisted deterministic Final
     # Call may therefore use the same frozen TAG evidence without a fresh Chad
