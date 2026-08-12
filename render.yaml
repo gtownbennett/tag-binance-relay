@@ -8,8 +8,16 @@ services:
     autoDeployTrigger: commit
     envVars:
       - key: REPAIR_MODE
-        value: "true"
+        value: "false"
       - key: LIVE_COLLECTORS_ENABLED
+        value: "true"
+      - key: SERVER_JOBS_ENABLED
+        value: "true"
+      - key: SERVER_JOB_POLL_SECONDS
+        value: "30"
+      - key: DETERMINISTIC_GRADING_ENABLED
+        value: "true"
+      - key: PAID_AI_ENABLED
         value: "false"
       - key: BACKFILL_ENABLED
         value: "false"
@@ -30,7 +38,7 @@ services:
       - key: PUSH_ENABLED
         value: "false"
       - key: DB_BOOTSTRAP_ON_START
-        value: "false"
+        value: "true"
       - key: MANUAL_REFRESH_DAILY_LIMIT
         value: "25"
       - key: MANUAL_REFRESH_MONTHLY_LIMIT
@@ -44,13 +52,21 @@ services:
       - key: MANUAL_RESPONSE_BUDGET_SECONDS
         value: "24"
       - key: CHAD_DAILY_REQUEST_LIMIT
-        value: "2"
+        value: "0"
       - key: CHAD_MONTHLY_REQUEST_LIMIT
-        value: "20"
+        value: "0"
       - key: OPENAI_DAILY_CALL_LIMIT
-        value: "2"
+        value: "0"
       - key: OPENAI_MONTHLY_CALL_LIMIT
-        value: "20"
+        value: "0"
+      - key: OPENAI_AUTO_RESERVE_DAILY
+        value: "1"
+      - key: OPENAI_AUTO_RESERVE_MONTHLY
+        value: "4"
+      - key: OPENAI_AUTO_EVENT_COOLDOWN_SECONDS
+        value: "21600"
+      - key: OPENAI_AUTO_MIN_CONFIRMATIONS
+        value: "2"
       - key: CHAD_MIN_REQUEST_INTERVAL_SECONDS
         value: "300"
       - key: CHAD_FORECAST_MIN_INTERVAL_SECONDS

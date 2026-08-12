@@ -30,6 +30,12 @@ def env_int(name: str, default: int, minimum: int = 0) -> int:
 REPAIR_MODE = env_bool("REPAIR_MODE", True)
 LIVE_COLLECTORS_ENABLED = env_bool("LIVE_COLLECTORS_ENABLED", False)
 BACKFILL_ENABLED = env_bool("BACKFILL_ENABLED", False)
+SERVER_JOBS_ENABLED = env_bool("SERVER_JOBS_ENABLED", True)
+SERVER_JOB_POLL_SECONDS = env_int("SERVER_JOB_POLL_SECONDS", 30, minimum=5)
+DETERMINISTIC_GRADING_ENABLED = env_bool("DETERMINISTIC_GRADING_ENABLED", True)
+# Phase 1 is a zero-paid-call phase. This is a separate, fail-closed gate so a
+# stale collection of legacy Chad flags cannot accidentally enable a request.
+PAID_AI_ENABLED = env_bool("PAID_AI_ENABLED", False)
 OPENAI_AUTOMATIC_ENABLED = env_bool("OPENAI_AUTOMATIC_ENABLED", False)
 PUSH_ENABLED = env_bool("PUSH_ENABLED", False)
 CHAD_REACTIVATION_ENABLED = env_bool("CHAD_REACTIVATION_ENABLED", False)
@@ -74,6 +80,17 @@ BUILD_ID = (
     or os.getenv("SOURCE_BUILD_ID")
     or "source-package"
 ).strip()
+
+OPENAI_DAILY_CALL_LIMIT = env_int("OPENAI_DAILY_CALL_LIMIT", 1)
+OPENAI_MONTHLY_CALL_LIMIT = env_int("OPENAI_MONTHLY_CALL_LIMIT", 20)
+OPENAI_AUTO_RESERVE_DAILY = env_int("OPENAI_AUTO_RESERVE_DAILY", 1)
+OPENAI_AUTO_RESERVE_MONTHLY = env_int("OPENAI_AUTO_RESERVE_MONTHLY", 4)
+OPENAI_AUTO_EVENT_COOLDOWN_SECONDS = env_int(
+    "OPENAI_AUTO_EVENT_COOLDOWN_SECONDS", 21_600, minimum=900
+)
+OPENAI_AUTO_MIN_CONFIRMATIONS = env_int(
+    "OPENAI_AUTO_MIN_CONFIRMATIONS", 2, minimum=2
+)
 
 
 class RequestBudgetExceeded(RuntimeError):
@@ -166,8 +183,8 @@ class UsageGovernor:
         self._last_bounded_test_at: str | None = None
         self._limits = {
             "openai_call": (
-                env_int("OPENAI_DAILY_CALL_LIMIT", 2),
-                env_int("OPENAI_MONTHLY_CALL_LIMIT", 20),
+                OPENAI_DAILY_CALL_LIMIT,
+                OPENAI_MONTHLY_CALL_LIMIT,
             ),
             "chad_request": (
                 env_int("CHAD_DAILY_REQUEST_LIMIT", 2),
@@ -226,6 +243,9 @@ class UsageGovernor:
             if automatic and category == "openai_call" and not OPENAI_AUTOMATIC_ENABLED:
                 self._blocked[category] += 1
                 return False, "automatic_openai_disabled"
+            if category in {"openai_call", "chad_request"} and not PAID_AI_ENABLED:
+                self._blocked[category] += 1
+                return False, "paid_ai_disabled"
             if automatic and category == "notification_attempt" and not PUSH_ENABLED:
                 self._blocked[category] += 1
                 return False, "push_disabled"
@@ -275,6 +295,9 @@ class UsageGovernor:
                 "flags": {
                     "liveCollectorsEnabled": LIVE_COLLECTORS_ENABLED,
                     "backfillEnabled": BACKFILL_ENABLED,
+                    "serverJobsEnabled": SERVER_JOBS_ENABLED,
+                    "deterministicGradingEnabled": DETERMINISTIC_GRADING_ENABLED,
+                    "paidAiEnabled": PAID_AI_ENABLED,
                     "openAiAutomaticEnabled": OPENAI_AUTOMATIC_ENABLED,
                     "pushEnabled": PUSH_ENABLED,
                     "databaseBootstrapOnStart": DB_BOOTSTRAP_ON_START,

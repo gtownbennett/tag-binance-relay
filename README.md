@@ -13,7 +13,7 @@ Every successful grade retains its exact sample timestamp, offset, tolerance,
 and source. Another exchange is never silently substituted. Binance archive
 timestamps are normalized across seconds, milliseconds, and microseconds.
 
-This release preserves the fail-closed, manual-only Chad reactivation gate and
+This release preserves the fail-closed Chad reactivation gate and
 extends the structured result to the terminal's complete 25-horizon forecast.
 The existing Render `OPENAI_API_KEY` is referenced only at runtime; no key is
 included in this repository and no live OpenAI call is made by the test suite.
@@ -39,11 +39,20 @@ The Render blueprint sets the same values explicitly. Provider spending limits r
 
 ## Chad reactivation safety
 
-- Chad remains unavailable unless all six independent reactivation/budget/write
+- Manual Chad remains an explicit `Ask Chad / Run Chad Now` action. Automatic
+  Chad is event-driven only; elapsed calendar days never trigger a call.
+- Chad remains unavailable unless all independent reactivation/budget/write
   switches agree and the relay token plus existing server-side OpenAI key are
   configured.
-- The endpoint stays authenticated, manual-only, and requires explicit paid,
+- The endpoint stays authenticated and requires explicit paid,
   forecast-lock, and grading approval on each request.
+- Automatic calls require a defined extreme-event family, severity of at least
+  75, at least two independent signal families, event/evidence deduplication,
+  and cooldown. The same event cannot call again without a genuinely new event
+  or material regime change.
+- Manual and automatic calls have separate durable audit labels, event reason,
+  event ID, tokens, estimated cost, and daily/monthly counters. A configurable
+  automatic reserve prevents manual requests from consuming emergency quota.
 - One request can make at most one OpenAI attempt. Network and API failures are
   never retried automatically.
 - One Chad request may run at a time, requests have a five-minute cooldown, and

@@ -93,10 +93,12 @@ class ChadReactivationGate:
         *,
         key_configured: bool,
         relay_token_configured: bool,
+        call_mode: str = "manual",
     ) -> list[str]:
         blockers: list[str] = []
-        if not REPAIR_MODE:
-            blockers.append("repair_mode_must_remain_enabled")
+        mode = call_mode.lower()
+        if mode not in {"manual", "automatic"}:
+            blockers.append("invalid_call_mode")
         if not CHAD_REACTIVATION_ENABLED:
             blockers.append("chad_reactivation_disabled")
         if CHAD_KILL_SWITCH:
@@ -109,14 +111,8 @@ class ChadReactivationGate:
             blockers.append("durable_cache_writes_disabled")
         if not OPENAI_PROJECT_BUDGET_CONFIRMED:
             blockers.append("openai_project_budget_unconfirmed")
-        if OPENAI_AUTOMATIC_ENABLED:
-            blockers.append("automatic_openai_must_remain_disabled")
-        if LIVE_COLLECTORS_ENABLED:
-            blockers.append("live_collectors_must_remain_disabled")
-        if BACKFILL_ENABLED:
-            blockers.append("backfills_must_remain_disabled")
-        if PUSH_ENABLED:
-            blockers.append("push_must_remain_disabled")
+        if mode == "automatic" and not OPENAI_AUTOMATIC_ENABLED:
+            blockers.append("automatic_openai_disabled")
         if not key_configured:
             blockers.append("openai_key_missing")
         if not relay_token_configured:
@@ -128,12 +124,14 @@ class ChadReactivationGate:
         *,
         key_configured: bool,
         relay_token_configured: bool,
+        call_mode: str = "manual",
         now: float | None = None,
     ) -> tuple[str | None, str | None]:
         current = time.time() if now is None else float(now)
         blockers = self.blockers(
             key_configured=key_configured,
             relay_token_configured=relay_token_configured,
+            call_mode=call_mode,
         )
         if blockers:
             reason = blockers[0]
@@ -153,7 +151,9 @@ class ChadReactivationGate:
                 self._telemetry["blocked"]["cooldown"] += 1
                 return None, "cooldown"
 
-            allowed, reason = usage_governor.authorize("chad_request")
+            allowed, reason = usage_governor.authorize(
+                "chad_request", automatic=call_mode.lower() == "automatic"
+            )
             if not allowed:
                 safe_reason = f"request_{reason or 'limit'}"
                 self._telemetry["blocked"][safe_reason] += 1

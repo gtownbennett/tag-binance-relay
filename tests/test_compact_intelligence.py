@@ -357,6 +357,7 @@ class CompactIntelligenceTests(unittest.IsolatedAsyncioTestCase):
             return build_compact_terminal_payload()
 
         with (
+            patch.object(main, "RELAY_TOKEN", "test-relay-token"),
             patch.object(main, "collect_terminal_market", new=market_read),
             patch.object(
                 main,
@@ -366,7 +367,7 @@ class CompactIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await main.terminal_bundle_endpoint(
                 manual=True,
-                x_relay_key=None,
+                x_relay_key="test-relay-token",
             )
 
         self.assertEqual(result["spot"]["priceUsd"], 0.001)
@@ -388,6 +389,7 @@ class CompactIntelligenceTests(unittest.IsolatedAsyncioTestCase):
             return build_compact_terminal_payload()
 
         with (
+            patch.object(main, "RELAY_TOKEN", "test-relay-token"),
             patch.object(
                 main,
                 "collect_terminal_market",
@@ -402,7 +404,7 @@ class CompactIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await main.terminal_bundle_endpoint(
                 manual=True,
-                x_relay_key=None,
+                x_relay_key="test-relay-token",
             )
             await asyncio.sleep(0.12)
 
@@ -429,6 +431,7 @@ class CompactIntelligenceTests(unittest.IsolatedAsyncioTestCase):
             return build_compact_terminal_payload()
 
         with (
+            patch.object(main, "RELAY_TOKEN", "test-relay-token"),
             patch.object(main, "collect_terminal_market", new=market_read),
             patch.object(
                 main,
@@ -438,11 +441,11 @@ class CompactIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         ):
             first = await main.terminal_bundle_endpoint(
                 manual=True,
-                x_relay_key=None,
+                x_relay_key="test-relay-token",
             )
             second = await main.terminal_bundle_endpoint(
                 manual=True,
-                x_relay_key=None,
+                x_relay_key="test-relay-token",
             )
 
         self.assertIs(first, second)

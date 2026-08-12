@@ -164,13 +164,16 @@ class ChadReactivationTests(unittest.IsolatedAsyncioTestCase):
         original_client = main.openai_client
         main.openai_client = client
         try:
-            with request_budget_scope(
-                {
-                    "database_query": 0,
-                    "database_write": 0,
-                    "external_request": 0,
-                    "openai_call": 1,
-                }
+            with (
+                patch.object(main, "PAID_AI_ENABLED", True),
+                request_budget_scope(
+                    {
+                        "database_query": 0,
+                        "database_write": 0,
+                        "external_request": 0,
+                        "openai_call": 1,
+                    }
+                ),
             ):
                 with self.assertRaises(HTTPException) as caught:
                     await main.request_chad_analysis(
@@ -261,6 +264,12 @@ class ChadReactivationTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch.object(main, "OPENAI_API_KEY", "configured-test-key"),
                 patch.object(main, "RELAY_TOKEN", "configured-relay-token"),
+                patch.object(main, "PAID_AI_ENABLED", True),
+                patch.object(
+                    main,
+                    "authorize_persistent_usage",
+                    return_value=(True, None),
+                ),
                 patch.object(main, "prediction_ledger", ledger),
                 patch.object(
                     main,

@@ -413,15 +413,21 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(audit["sampleOffsetSeconds"], 15 * 60)
 
     async def test_repair_mode_blocks_paid_and_mutating_routes(self) -> None:
-        blocked_calls = (
-            main.terminal_test_alert_endpoint(x_relay_key=None),
-            main.terminal_paper_order_endpoint(payload={}, x_relay_key=None),
-            main.chad_analyze(main.ChadAnalyzeRequest(allowPaidCall=True), x_relay_key=None),
-        )
-        for call in blocked_calls:
-            with self.assertRaises(HTTPException) as caught:
-                await call
-            self.assertEqual(caught.exception.status_code, 423)
+        with patch.object(main, "RELAY_TOKEN", "test-relay-token"):
+            blocked_calls = (
+                main.terminal_test_alert_endpoint(x_relay_key="test-relay-token"),
+                main.terminal_paper_order_endpoint(
+                    payload={}, x_relay_key="test-relay-token"
+                ),
+                main.chad_analyze(
+                    main.ChadAnalyzeRequest(allowPaidCall=True),
+                    x_relay_key="test-relay-token",
+                ),
+            )
+            for call in blocked_calls:
+                with self.assertRaises(HTTPException) as caught:
+                    await call
+                self.assertEqual(caught.exception.status_code, 423)
 
     async def test_repair_stored_read_never_calls_live_sources(self) -> None:
         stored = {
@@ -678,6 +684,7 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
             "serverOiHistory": {},
         }
         with (
+            patch.object(main, "RELAY_TOKEN", "test-relay-token"),
             patch.object(main, "collect_terminal_market", new=AsyncMock(return_value=market)),
             patch.object(
                 terminal_addon,
@@ -694,7 +701,7 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await main.terminal_bundle_endpoint(
                 manual=True,
-                x_relay_key=None,
+                x_relay_key="test-relay-token",
             )
 
         self.assertEqual(result["spot"]["priceUsd"], 0.001)

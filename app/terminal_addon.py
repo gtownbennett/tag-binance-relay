@@ -92,6 +92,14 @@ class TerminalAddon:
         self.collector_task: asyncio.Task[Any] | None = None
         self.market_cache: dict[str, Any] = {"time": 0.0, "value": None}
         self.cache_lock = asyncio.Lock()
+        self.collector_state: dict[str, Any] = {
+            "running": False,
+            "lastStartedAt": None,
+            "lastCompletedAt": None,
+            "lastError": None,
+            "consecutiveFailures": 0,
+            "lastSourceErrors": [],
+        }
 
     async def start(
         self,
@@ -121,6 +129,7 @@ class TerminalAddon:
         if self.external_clients_started:
             await multi_exchange_service.stop()
             self.external_clients_started = False
+        self.collector_state["running"] = False
         self.started = False
 
     def start_collector(
@@ -143,34 +152,120 @@ class TerminalAddon:
         spot_provider: Callable[..., Awaitable[dict[str, Any]]],
     ) -> None:
         await asyncio.sleep(5)
+        self.collector_state["running"] = True
         while True:
             allowed, _ = usage_governor.authorize("collector", automatic=True)
             if not allowed:
                 await asyncio.sleep(COLLECT_SECONDS)
                 continue
             try:
-                binance, spot = await asyncio.gather(
-                    snapshot_provider(force=True),
-                    spot_provider(force=True),
-                )
-                await self.collect_market(binance, spot, force=True, persist=True)
-                report = build_chad_report(store=True)
-                evaluate_alerts(report)
-                prediction_ledger(limit=5)
-                evaluate_paper_orders()
-                grade_social_calls()
-                update_caller_stats()
-                # CMC polling is optional and exact timestamps are accepted only
-                # when the official API supplies post_time. No time is inferred.
-                await poll_cmc_social_calls()
-                await enrich_social_calls_with_cmc_quotes(limit=3)
+                await self.collect_once(snapshot_provider, spot_provider)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                # Every pass retries each source independently. A temporary
-                # source failure must not stop the history collector.
-                pass
+            except Exception as exc:
+                self.collector_state["lastError"] = f"{type(exc).__name__}: {str(exc)[:500]}"
+                self.collector_state["consecutiveFailures"] = int(
+                    self.collector_state.get("consecutiveFailures") or 0
+                ) + 1
             await asyncio.sleep(COLLECT_SECONDS)
+
+    async def collect_once(
+        self,
+        snapshot_provider: Callable[..., Awaitable[dict[str, Any]]],
+        spot_provider: Callable[..., Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Run one bounded, observable collection pass.
+
+        Futures and DEX failures remain separate unavailable records. A failed
+        source never borrows another source's value, and optional maintenance
+        failures do not erase an otherwise valid evidence packet.
+        """
+
+        self.collector_state["lastStartedAt"] = utc_now().isoformat()
+        source_results = await asyncio.gather(
+            snapshot_provider(force=True),
+            spot_provider(force=True),
+            return_exceptions=True,
+        )
+        source_errors: list[str] = []
+        binance_result, spot_result = source_results
+        if isinstance(binance_result, BaseException):
+            source_errors.append(
+                f"Binance futures: {type(binance_result).__name__}: {str(binance_result)[:240]}"
+            )
+            binance: dict[str, Any] = {
+                "available": False,
+                "sourceStatus": "unavailable",
+                "relayGeneratedAt": utc_now().isoformat(),
+                "failureReason": source_errors[-1],
+            }
+        else:
+            binance = binance_result
+        if isinstance(spot_result, BaseException):
+            source_errors.append(
+                f"DEX spot: {type(spot_result).__name__}: {str(spot_result)[:240]}"
+            )
+            spot: dict[str, Any] = {
+                "available": False,
+                "sourceStatus": "unavailable",
+                "generatedAt": utc_now().isoformat(),
+                "failureReason": source_errors[-1],
+            }
+        else:
+            spot = spot_result
+
+        market = await self.collect_market(
+            binance,
+            spot,
+            force=True,
+            persist=True,
+        )
+        maintenance_errors: list[str] = []
+
+        def run_step(label: str, callback: Callable[[], Any]) -> Any:
+            try:
+                return callback()
+            except Exception as exc:
+                maintenance_errors.append(
+                    f"{label}: {type(exc).__name__}: {str(exc)[:240]}"
+                )
+                return None
+
+        report = run_step("deterministic report", lambda: build_chad_report(store=True))
+        if isinstance(report, dict):
+            run_step("alert evaluation", lambda: evaluate_alerts(report))
+        run_step("prediction ledger", lambda: prediction_ledger(limit=5))
+        run_step("paper evaluation", evaluate_paper_orders)
+        run_step("social grading", grade_social_calls)
+        run_step("social caller stats", update_caller_stats)
+        try:
+            await poll_cmc_social_calls()
+        except Exception as exc:
+            maintenance_errors.append(
+                f"social poll: {type(exc).__name__}: {str(exc)[:240]}"
+            )
+        try:
+            await enrich_social_calls_with_cmc_quotes(limit=3)
+        except Exception as exc:
+            maintenance_errors.append(
+                f"social enrichment: {type(exc).__name__}: {str(exc)[:240]}"
+            )
+
+        self.collector_state.update(
+            {
+                "running": True,
+                "lastCompletedAt": utc_now().isoformat(),
+                "lastError": None,
+                "consecutiveFailures": 0,
+                "lastSourceErrors": source_errors,
+                "lastMaintenanceErrors": maintenance_errors,
+            }
+        )
+        return {
+            "market": market,
+            "sourceErrors": source_errors,
+            "maintenanceErrors": maintenance_errors,
+        }
 
     async def collect_market(
         self,

@@ -8,14 +8,17 @@ from typing import Any, Iterator
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
+    ForeignKey,
     Integer,
     String,
     Text,
     UniqueConstraint,
     create_engine,
     event,
+    func,
     select,
     text,
 )
@@ -391,6 +394,283 @@ class VisionRow(Base):
     payload_json: Mapped[str] = mapped_column(Text)
 
 
+class HistoricalMarketRow(Base):
+    """Source-specific, point-in-time TAG history; conflicting venues never merge."""
+
+    __tablename__ = "historical_market_rows"
+    __table_args__ = (
+        UniqueConstraint("source_row_key", name="uq_historical_market_source_key"),
+        CheckConstraint("observed_at <= retrieved_at", name="ck_historical_market_time_order"),
+        CheckConstraint(
+            "category IN ('futures','cex_spot','dex_spot','liquidity','on_chain','catalyst','social','aggregate')",
+            name="ck_historical_market_category",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_row_key: Mapped[str] = mapped_column(String(64), index=True)
+    observation_hash: Mapped[str] = mapped_column(String(64), index=True)
+    source: Mapped[str] = mapped_column(String(100), index=True)
+    source_type: Mapped[str] = mapped_column(String(40), index=True)
+    exchange: Mapped[str | None] = mapped_column(String(60), index=True)
+    symbol: Mapped[str] = mapped_column(String(80), index=True)
+    contract_address: Mapped[str | None] = mapped_column(String(100), index=True)
+    category: Mapped[str] = mapped_column(String(24), index=True)
+    dataset: Mapped[str] = mapped_column(String(60), index=True)
+    resolution: Mapped[str] = mapped_column(String(16), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    retrieved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    reliability_status: Mapped[str] = mapped_column(String(24), index=True)
+    validation_status: Mapped[str] = mapped_column(String(24), index=True)
+    open_price: Mapped[float | None] = mapped_column(Float)
+    high_price: Mapped[float | None] = mapped_column(Float)
+    low_price: Mapped[float | None] = mapped_column(Float)
+    close_price: Mapped[float | None] = mapped_column(Float)
+    base_volume: Mapped[float | None] = mapped_column(Float)
+    quote_volume: Mapped[float | None] = mapped_column(Float)
+    trade_count: Mapped[int | None] = mapped_column(Integer)
+    taker_buy_quote: Mapped[float | None] = mapped_column(Float)
+    taker_sell_quote: Mapped[float | None] = mapped_column(Float)
+    market_cap_usd: Mapped[float | None] = mapped_column(Float)
+    circulating_supply: Mapped[float | None] = mapped_column(Float)
+    fdv_usd: Mapped[float | None] = mapped_column(Float)
+    liquidity_usd: Mapped[float | None] = mapped_column(Float)
+    mark_price: Mapped[float | None] = mapped_column(Float)
+    index_price: Mapped[float | None] = mapped_column(Float)
+    open_interest_usd: Mapped[float | None] = mapped_column(Float)
+    open_interest_tokens: Mapped[float | None] = mapped_column(Float)
+    funding_rate: Mapped[float | None] = mapped_column(Float)
+    global_long_short_ratio: Mapped[float | None] = mapped_column(Float)
+    top_account_ratio: Mapped[float | None] = mapped_column(Float)
+    top_position_ratio: Mapped[float | None] = mapped_column(Float)
+    taker_ratio: Mapped[float | None] = mapped_column(Float)
+    long_liquidations_usd: Mapped[float | None] = mapped_column(Float)
+    short_liquidations_usd: Mapped[float | None] = mapped_column(Float)
+    basis_pct: Mapped[float | None] = mapped_column(Float)
+    provenance_json: Mapped[str] = mapped_column(Text)
+    values_json: Mapped[str] = mapped_column(Text)
+
+
+class HistoricalBackfillRangeRow(Base):
+    """Mutable operational checkpoint for resumable, bounded archive acquisition."""
+
+    __tablename__ = "historical_backfill_ranges"
+    __table_args__ = (
+        UniqueConstraint(
+            "source", "dataset", "symbol", "resolution", "range_start", "range_end",
+            name="uq_historical_backfill_range",
+        ),
+        CheckConstraint("range_end > range_start", name="ck_historical_backfill_time_order"),
+        CheckConstraint(
+            "status IN ('pending','running','complete','partial','unavailable','failed')",
+            name="ck_historical_backfill_status",
+        ),
+    )
+
+    range_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source: Mapped[str] = mapped_column(String(100), index=True)
+    dataset: Mapped[str] = mapped_column(String(60), index=True)
+    symbol: Mapped[str] = mapped_column(String(80), index=True)
+    resolution: Mapped[str] = mapped_column(String(16), index=True)
+    range_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    range_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    rows_seen: Mapped[int] = mapped_column(Integer, default=0)
+    rows_stored: Mapped[int] = mapped_column(Integer, default=0)
+    cursor: Mapped[str | None] = mapped_column(String(200))
+    archive_reference: Mapped[str | None] = mapped_column(Text)
+    archive_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class HistoricalEventVersionRow(Base):
+    """Append-only version of a detected or named TAG historical episode."""
+
+    __tablename__ = "historical_event_versions"
+    __table_args__ = (
+        UniqueConstraint("event_key", "event_version", name="uq_historical_event_version"),
+        CheckConstraint("end_at >= start_at", name="ck_historical_event_time_order"),
+        CheckConstraint("evidence_cutoff_at <= end_at", name="ck_historical_event_cutoff"),
+    )
+
+    event_version_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    event_key: Mapped[str] = mapped_column(String(120), index=True)
+    event_version: Mapped[int] = mapped_column(Integer)
+    event_name: Mapped[str] = mapped_column(String(160), index=True)
+    event_family: Mapped[str] = mapped_column(String(60), index=True)
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    ignition_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    breakout_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    peak_trough_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    evidence_cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    start_price: Mapped[float] = mapped_column(Float)
+    peak_price: Mapped[float] = mapped_column(Float)
+    trough_price: Mapped[float] = mapped_column(Float)
+    end_price: Mapped[float] = mapped_column(Float)
+    percent_move: Mapped[float] = mapped_column(Float)
+    duration_seconds: Mapped[int] = mapped_column(BigInteger)
+    detection_version: Mapped[str] = mapped_column(String(80), index=True)
+    success_classification: Mapped[str] = mapped_column(String(80), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    timeline_json: Mapped[str] = mapped_column(Text)
+    features_json: Mapped[str] = mapped_column(Text)
+    confirmation_json: Mapped[str] = mapped_column(Text)
+    invalidation_json: Mapped[str] = mapped_column(Text)
+    outcome_json: Mapped[str] = mapped_column(Text)
+    provenance_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class HistoricalCoverageSnapshotRow(Base):
+    __tablename__ = "historical_coverage_snapshots"
+    __table_args__ = (
+        UniqueConstraint("report_id", "month", "source", name="uq_historical_coverage_cell"),
+        CheckConstraint(
+            "coverage_status IN ('COMPLETE','STRONG','PARTIAL','MINIMAL','MISSING')",
+            name="ck_historical_coverage_status",
+        ),
+    )
+
+    coverage_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    report_id: Mapped[str] = mapped_column(String(64), index=True)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    month: Mapped[str] = mapped_column(String(7), index=True)
+    source: Mapped[str] = mapped_column(String(100), index=True)
+    first_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    row_count: Mapped[int] = mapped_column(Integer)
+    resolutions_json: Mapped[str] = mapped_column(Text)
+    fields_json: Mapped[str] = mapped_column(Text)
+    coverage_status: Mapped[str] = mapped_column(String(16), index=True)
+    missing_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class ForecastHistoricalContextRow(Base):
+    """Frozen historical-memory run attached to one immutable canonical forecast."""
+
+    __tablename__ = "forecast_historical_contexts"
+    __table_args__ = (
+        UniqueConstraint("forecast_id", name="uq_forecast_historical_context"),
+        CheckConstraint(
+            "status IN ('available','degraded','unavailable')",
+            name="ck_forecast_historical_context_status",
+        ),
+    )
+
+    context_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    context_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    forecast_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("canonical_forecasts.forecast_id"), index=True
+    )
+    producer: Mapped[str] = mapped_column(String(24), index=True)
+    horizon: Mapped[str] = mapped_column(String(12), index=True)
+    evidence_snapshot_id: Mapped[str] = mapped_column(String(64), index=True)
+    engine_version: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    data_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    considered_count: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    analogs_json: Mapped[str] = mapped_column(Text)
+    influenced_json: Mapped[str] = mapped_column(Text)
+    override_json: Mapped[str] = mapped_column(Text)
+    failure_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class HistoricalReplayRunRow(Base):
+    __tablename__ = "historical_replay_runs"
+    __table_args__ = (
+        UniqueConstraint("run_hash", name="uq_historical_replay_run_hash"),
+        CheckConstraint("training_end_at < evaluation_start_at", name="ck_historical_replay_no_lookahead"),
+        CheckConstraint("evaluation_end_at >= evaluation_start_at", name="ck_historical_replay_eval_order"),
+    )
+
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_hash: Mapped[str] = mapped_column(String(64), index=True)
+    model_version: Mapped[str] = mapped_column(String(120))
+    evaluation_kind: Mapped[str] = mapped_column(String(32), default="historical_replay")
+    training_start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    training_end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    evaluation_start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    evaluation_end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    baseline_metrics_json: Mapped[str] = mapped_column(Text)
+    analog_metrics_json: Mapped[str] = mapped_column(Text)
+    comparison_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class ChadCallAuditRow(Base):
+    """Durable manual/automatic paid-call reservation and provider-usage audit."""
+
+    __tablename__ = "chad_call_audit"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_chad_call_audit_idempotency"),
+        CheckConstraint("call_mode IN ('manual','automatic')", name="ck_chad_call_mode"),
+        CheckConstraint(
+            "status IN ('reserved','completed','failed','blocked')",
+            name="ck_chad_call_status",
+        ),
+    )
+
+    call_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160), index=True)
+    call_mode: Mapped[str] = mapped_column(String(16), index=True)
+    label: Mapped[str] = mapped_column(String(40))
+    trigger_reason: Mapped[str] = mapped_column(Text)
+    event_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    evidence_hash: Mapped[str] = mapped_column(String(64), index=True)
+    regime_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    reserved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost_usd: Mapped[float | None] = mapped_column(Float)
+    provider_request_id: Mapped[str | None] = mapped_column(String(160))
+    confirmations_json: Mapped[str] = mapped_column(Text)
+    evidence_json: Mapped[str] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class ChadAutoEventStateRow(Base):
+    """One deterministic major-event decision used for auto-call dedupe/cooldown."""
+
+    __tablename__ = "chad_auto_event_states"
+    __table_args__ = (
+        UniqueConstraint("event_key", "evidence_hash", name="uq_chad_auto_event_evidence"),
+        CheckConstraint("confirmation_count >= 0", name="ck_chad_auto_confirmation_count"),
+    )
+
+    state_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    event_key: Mapped[str] = mapped_column(String(120), index=True)
+    event_family: Mapped[str] = mapped_column(String(60), index=True)
+    evidence_hash: Mapped[str] = mapped_column(String(64), index=True)
+    regime_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    confirmation_count: Mapped[int] = mapped_column(Integer)
+    severity_score: Mapped[float] = mapped_column(Float)
+    eligible: Mapped[bool] = mapped_column(Boolean, index=True)
+    decision_reason: Mapped[str] = mapped_column(Text)
+    cooldown_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    call_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("chad_call_audit.call_id"), index=True)
+    confirmations_json: Mapped[str] = mapped_column(Text)
+    evidence_json: Mapped[str] = mapped_column(Text)
+
+
 class OpenAIAnalysisCacheRow(Base):
     __tablename__ = "openai_analysis_cache"
 
@@ -404,6 +684,574 @@ class OpenAIAnalysisCacheRow(Base):
     estimated_cost_usd: Mapped[float | None] = mapped_column(Float)
     cache_hit_count: Mapped[int] = mapped_column(Integer, default=0)
     response_json: Mapped[str] = mapped_column(Text)
+
+
+class CanonicalEvidenceSnapshotRow(Base):
+    """One immutable server-owned evidence packet.
+
+    The evidence hash is the idempotency boundary shared by every producer.
+    Device and helper clocks are retained only inside provenance payloads; the
+    database/server timestamp is authoritative for receipt and persistence.
+    """
+
+    __tablename__ = "canonical_evidence_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    evidence_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    origin: Mapped[str] = mapped_column(String(40), index=True)
+    producer_id: Mapped[str] = mapped_column(String(80))
+    data_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    source_count: Mapped[int] = mapped_column(Integer, default=0)
+    available_source_count: Mapped[int] = mapped_column(Integer, default=0)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class CanonicalEvidenceItemRow(Base):
+    __tablename__ = "canonical_evidence_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_id",
+            "source_id",
+            "category",
+            name="uq_canonical_evidence_item",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("canonical_evidence_snapshots.snapshot_id", ondelete="CASCADE"),
+        index=True,
+    )
+    source_id: Mapped[str] = mapped_column(String(100), index=True)
+    source_name: Mapped[str] = mapped_column(String(100))
+    source_type: Mapped[str] = mapped_column(String(40), index=True)
+    category: Mapped[str] = mapped_column(String(40), index=True)
+    priority: Mapped[int] = mapped_column(Integer)
+    symbol_identity: Mapped[str] = mapped_column(String(160))
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    retrieved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    freshness: Mapped[str] = mapped_column(String(24), index=True)
+    validation_status: Mapped[str] = mapped_column(String(24), index=True)
+    degradation_status: Mapped[str] = mapped_column(String(24), index=True)
+    origin: Mapped[str] = mapped_column(String(40), index=True)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    provenance_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class AssetTruthSnapshotRow(Base):
+    """Immutable verified asset-supply input used by issued forecasts."""
+
+    __tablename__ = "asset_truth_snapshots"
+    __table_args__ = (
+        CheckConstraint("circulating_supply > 0", name="ck_asset_truth_positive_supply"),
+        CheckConstraint(
+            "verification_status = 'verified'",
+            name="ck_asset_truth_verified",
+        ),
+    )
+
+    snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    asset_symbol: Mapped[str] = mapped_column(String(30), index=True)
+    network: Mapped[str] = mapped_column(String(80))
+    contract_address: Mapped[str] = mapped_column(String(100), index=True)
+    circulating_supply: Mapped[float] = mapped_column(Float)
+    fully_diluted_supply: Mapped[float | None] = mapped_column(Float)
+    source_name: Mapped[str] = mapped_column(String(160))
+    source_reference: Mapped[str] = mapped_column(Text)
+    verification_status: Mapped[str] = mapped_column(String(24), index=True)
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class PortfolioPositionSnapshotRow(Base):
+    """Immutable persisted quantity/cost-basis snapshot; never a UI default."""
+
+    __tablename__ = "portfolio_position_snapshots"
+    __table_args__ = (
+        CheckConstraint("quantity >= 0", name="ck_portfolio_snapshot_quantity"),
+        CheckConstraint(
+            "verification_status = 'verified'",
+            name="ck_portfolio_snapshot_verified",
+        ),
+    )
+
+    snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    portfolio_key: Mapped[str] = mapped_column(String(80), index=True)
+    asset_symbol: Mapped[str] = mapped_column(String(30), index=True)
+    quantity: Mapped[float] = mapped_column(Float)
+    cost_basis_usd: Mapped[float | None] = mapped_column(Float)
+    source_name: Mapped[str] = mapped_column(String(160))
+    source_reference: Mapped[str] = mapped_column(Text)
+    verification_status: Mapped[str] = mapped_column(String(24), index=True)
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class CanonicalForecastRow(Base):
+    """One immutable forecast contract shared by every named producer."""
+
+    __tablename__ = "canonical_forecasts"
+    __table_args__ = (
+        CheckConstraint(
+            "producer IN ('tagalysis','chad','final_call','baseline','champion','challenger')",
+            name="ck_canonical_forecast_producer",
+        ),
+        CheckConstraint(
+            "horizon IN ('1h','4h','12h','24h','3d','7d','30d','3m','1y','5y')",
+            name="ck_canonical_forecast_horizon",
+        ),
+        CheckConstraint(
+            "direction IN ('HIGHER','LOWER','SIDEWAYS','NEUTRAL')",
+            name="ck_canonical_forecast_direction",
+        ),
+        CheckConstraint(
+            "status IN ('issued','active','completed','superseded','invalid','rejected')",
+            name="ck_canonical_forecast_status",
+        ),
+        CheckConstraint("deadline > issued_at", name="ck_canonical_forecast_deadline"),
+        CheckConstraint("data_as_of <= issued_at", name="ck_canonical_forecast_data_as_of"),
+        CheckConstraint("current_price > 0", name="ck_canonical_forecast_current_price"),
+        CheckConstraint("verified_supply > 0", name="ck_canonical_forecast_supply"),
+        CheckConstraint("point_forecast > 0", name="ck_canonical_forecast_point"),
+        CheckConstraint("p50 > 0", name="ck_canonical_forecast_p50"),
+        CheckConstraint("q10 <= q25 AND q25 <= p50 AND p50 <= q75 AND q75 <= q90", name="ck_canonical_forecast_quantiles"),
+        CheckConstraint(
+            "probability_up >= 0 AND probability_up <= 1 "
+            "AND probability_down >= 0 AND probability_down <= 1 "
+            "AND probability_sideways >= 0 AND probability_sideways <= 1",
+            name="ck_canonical_forecast_probabilities",
+        ),
+        CheckConstraint("confidence >= 0 AND confidence <= 100", name="ck_canonical_forecast_confidence"),
+    )
+
+    forecast_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    forecast_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    producer: Mapped[str] = mapped_column(String(24), index=True)
+    evidence_snapshot_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("canonical_evidence_snapshots.snapshot_id"),
+        index=True,
+    )
+    supply_snapshot_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("asset_truth_snapshots.snapshot_id"),
+        index=True,
+    )
+    portfolio_snapshot_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("portfolio_position_snapshots.snapshot_id"),
+        index=True,
+    )
+    revision_parent_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("canonical_forecasts.forecast_id"),
+        index=True,
+    )
+    forecast_version: Mapped[str] = mapped_column(String(80))
+    model_version: Mapped[str] = mapped_column(String(120))
+    prompt_version: Mapped[str | None] = mapped_column(String(120))
+    horizon: Mapped[str] = mapped_column(String(12), index=True)
+    horizon_minutes: Mapped[int] = mapped_column(Integer)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    data_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    current_price: Mapped[float] = mapped_column(Float)
+    verified_supply: Mapped[float] = mapped_column(Float)
+    fully_diluted_supply: Mapped[float | None] = mapped_column(Float)
+    portfolio_quantity: Mapped[float | None] = mapped_column(Float)
+    portfolio_cost_basis_usd: Mapped[float | None] = mapped_column(Float)
+    point_forecast: Mapped[float] = mapped_column(Float)
+    p50: Mapped[float] = mapped_column(Float)
+    q10: Mapped[float] = mapped_column(Float)
+    q25: Mapped[float] = mapped_column(Float)
+    q75: Mapped[float] = mapped_column(Float)
+    q90: Mapped[float] = mapped_column(Float)
+    probability_up: Mapped[float] = mapped_column(Float)
+    probability_down: Mapped[float] = mapped_column(Float)
+    probability_sideways: Mapped[float] = mapped_column(Float)
+    direction: Mapped[str] = mapped_column(String(16), index=True)
+    confidence: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    scenarios_json: Mapped[str] = mapped_column(Text)
+    source_availability_json: Mapped[str] = mapped_column(Text)
+    field_completeness_json: Mapped[str] = mapped_column(Text)
+    freshness_json: Mapped[str] = mapped_column(Text)
+    confidence_penalties_json: Mapped[str] = mapped_column(Text)
+    green_confirmation_json: Mapped[str] = mapped_column(Text)
+    red_invalidation_json: Mapped[str] = mapped_column(Text)
+    evidence_summary: Mapped[str] = mapped_column(Text)
+    evidence_references_json: Mapped[str] = mapped_column(Text)
+    calibration_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class VerifiedOutcomeRow(Base):
+    """Immutable exact-deadline price observation used for live grading."""
+
+    __tablename__ = "verified_outcomes"
+    __table_args__ = (
+        UniqueConstraint("asset_symbol", "observed_at", "source_name", name="uq_verified_outcome_observation"),
+        CheckConstraint("price_usd > 0", name="ck_verified_outcome_price"),
+        CheckConstraint("verification_status = 'verified'", name="ck_verified_outcome_status"),
+    )
+
+    outcome_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    outcome_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    asset_symbol: Mapped[str] = mapped_column(String(30), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    retrieved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    price_usd: Mapped[float] = mapped_column(Float)
+    source_name: Mapped[str] = mapped_column(String(160))
+    source_reference: Mapped[str] = mapped_column(Text)
+    evidence_snapshot_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("canonical_evidence_snapshots.snapshot_id"), index=True
+    )
+    verification_status: Mapped[str] = mapped_column(String(24), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class CanonicalForecastGradeRow(Base):
+    """Immutable grade; live, historical, producer and social memories never merge."""
+
+    __tablename__ = "canonical_forecast_grades"
+    __table_args__ = (
+        UniqueConstraint(
+            "subject_type", "subject_id", "evaluation_kind", "grade_version",
+            name="uq_canonical_grade_subject_version",
+        ),
+        CheckConstraint(
+            "producer IN ('tagalysis','chad','final_call','baseline','champion','challenger','social_call')",
+            name="ck_canonical_grade_producer",
+        ),
+        CheckConstraint(
+            "evaluation_kind IN ('live','historical_backtest')",
+            name="ck_canonical_grade_kind",
+        ),
+        CheckConstraint("composite_score >= 0 AND composite_score <= 100", name="ck_canonical_grade_composite"),
+    )
+
+    grade_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    grade_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    subject_type: Mapped[str] = mapped_column(String(24), index=True)
+    subject_id: Mapped[str] = mapped_column(String(80), index=True)
+    forecast_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("canonical_forecasts.forecast_id"), index=True
+    )
+    outcome_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("verified_outcomes.outcome_id"), index=True
+    )
+    producer: Mapped[str] = mapped_column(String(24), index=True)
+    horizon: Mapped[str] = mapped_column(String(12), index=True)
+    evaluation_kind: Mapped[str] = mapped_column(String(24), index=True)
+    grade_version: Mapped[str] = mapped_column(String(80))
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    graded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    independent_sample: Mapped[bool] = mapped_column(Boolean, index=True)
+    independence_group: Mapped[str] = mapped_column(String(80), index=True)
+    direction_correct: Mapped[bool] = mapped_column(Boolean)
+    point_error_pct: Mapped[float] = mapped_column(Float)
+    market_cap_error_pct: Mapped[float] = mapped_column(Float)
+    position_value_error_pct: Mapped[float | None] = mapped_column(Float)
+    interval_covered: Mapped[bool] = mapped_column(Boolean)
+    interval_sharpness_pct: Mapped[float] = mapped_column(Float)
+    weighted_interval_score: Mapped[float] = mapped_column(Float)
+    probability_brier_score: Mapped[float] = mapped_column(Float)
+    baseline_relative_skill: Mapped[float | None] = mapped_column(Float)
+    volatility_tolerance_pct: Mapped[float] = mapped_column(Float)
+    composite_score: Mapped[float] = mapped_column(Float)
+    grade_label: Mapped[str] = mapped_column(String(32), index=True)
+    metrics_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class MarketRegimeRow(Base):
+    __tablename__ = "market_regimes"
+    __table_args__ = (UniqueConstraint("evidence_snapshot_id", "detector_version", name="uq_market_regime_snapshot_version"),)
+
+    regime_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    evidence_snapshot_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("canonical_evidence_snapshots.snapshot_id"), index=True
+    )
+    detector_version: Mapped[str] = mapped_column(String(80))
+    regime: Mapped[str] = mapped_column(String(80), index=True)
+    confidence: Mapped[float] = mapped_column(Float)
+    data_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    features_json: Mapped[str] = mapped_column(Text)
+    reasons_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class PatternSequenceRow(Base):
+    __tablename__ = "pattern_sequences"
+    __table_args__ = (
+        CheckConstraint("memory_kind IN ('live','historical_backtest')", name="ck_pattern_sequence_memory_kind"),
+        CheckConstraint("ended_at >= started_at", name="ck_pattern_sequence_time_order"),
+    )
+
+    sequence_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    sequence_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    evidence_snapshot_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("canonical_evidence_snapshots.snapshot_id"), index=True
+    )
+    regime_id: Mapped[str] = mapped_column(String(64), ForeignKey("market_regimes.regime_id"), index=True)
+    memory_kind: Mapped[str] = mapped_column(String(24), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    ended_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    precursor_json: Mapped[str] = mapped_column(Text)
+    timeline_json: Mapped[str] = mapped_column(Text)
+    outcome_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class HistoricalAnalogRow(Base):
+    __tablename__ = "historical_analogs"
+    __table_args__ = (UniqueConstraint("current_sequence_id", "historical_sequence_id", "matcher_version", name="uq_historical_analog_pair"),)
+
+    analog_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    current_sequence_id: Mapped[str] = mapped_column(String(64), ForeignKey("pattern_sequences.sequence_id"), index=True)
+    historical_sequence_id: Mapped[str] = mapped_column(String(64), ForeignKey("pattern_sequences.sequence_id"), index=True)
+    matcher_version: Mapped[str] = mapped_column(String(80))
+    similarity_score: Mapped[float] = mapped_column(Float, index=True)
+    sample_size: Mapped[int] = mapped_column(Integer)
+    current_validity: Mapped[str] = mapped_column(String(24), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    matching_conditions_json: Mapped[str] = mapped_column(Text)
+    differences_json: Mapped[str] = mapped_column(Text)
+    prior_outcomes_json: Mapped[str] = mapped_column(Text)
+    failure_reasons_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class LearningVersionRow(Base):
+    __tablename__ = "learning_versions"
+    __table_args__ = (
+        CheckConstraint("decision IN ('candidate','champion','rollback')", name="ck_learning_version_decision"),
+        CheckConstraint("minimum_samples > 0 AND independent_samples >= 0", name="ck_learning_version_samples"),
+    )
+
+    version_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    parent_version_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("learning_versions.version_id"), index=True)
+    rollback_of_version_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("learning_versions.version_id"), index=True)
+    component: Mapped[str] = mapped_column(String(80), index=True)
+    producer: Mapped[str] = mapped_column(String(24), index=True)
+    horizon: Mapped[str] = mapped_column(String(12), index=True)
+    regime: Mapped[str] = mapped_column(String(80), index=True)
+    decision: Mapped[str] = mapped_column(String(24), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    minimum_samples: Mapped[int] = mapped_column(Integer)
+    independent_samples: Mapped[int] = mapped_column(Integer)
+    out_of_sample_improvement: Mapped[float | None] = mapped_column(Float)
+    weights_json: Mapped[str] = mapped_column(Text)
+    walk_forward_json: Mapped[str] = mapped_column(Text)
+    comparison_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class AlertCaseRow(Base):
+    __tablename__ = "canonical_alert_cases"
+
+    alert_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    alert_type: Mapped[str] = mapped_column(String(80), index=True)
+    first_detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    initial_evidence_snapshot_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("canonical_evidence_snapshots.snapshot_id"), index=True
+    )
+    level_version_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("user_market_cap_level_versions.level_version_id"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class AlertStageEventRow(Base):
+    __tablename__ = "canonical_alert_stage_events"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_canonical_alert_event_idempotency"),
+        UniqueConstraint("alert_id", "sequence_number", name="uq_canonical_alert_event_sequence"),
+        CheckConstraint(
+            "stage IN ('OBSERVING','EARLY WATCH','DEVELOPING','CONFIRMED','URGENT ACTION')",
+            name="ck_canonical_alert_event_stage",
+        ),
+        CheckConstraint("signal_score >= 0 AND signal_score <= 100", name="ck_canonical_alert_event_score"),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    alert_id: Mapped[str] = mapped_column(String(64), ForeignKey("canonical_alert_cases.alert_id"), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160), index=True)
+    sequence_number: Mapped[int] = mapped_column(Integer)
+    stage: Mapped[str] = mapped_column(String(32), index=True)
+    stage_changed: Mapped[bool] = mapped_column(Boolean)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    evidence_snapshot_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("canonical_evidence_snapshots.snapshot_id"), index=True
+    )
+    evidence_hash: Mapped[str] = mapped_column(String(64), index=True)
+    signal_score: Mapped[float] = mapped_column(Float)
+    price_usd: Mapped[float | None] = mapped_column(Float)
+    market_cap_usd: Mapped[float | None] = mapped_column(Float)
+    notification_allowed: Mapped[bool] = mapped_column(Boolean)
+    reason: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class AlertOutcomeRow(Base):
+    __tablename__ = "canonical_alert_outcomes"
+    __table_args__ = (
+        CheckConstraint(
+            "result_class IN ('early','timely','late','false_alarm','missed')",
+            name="ck_canonical_alert_outcome_class",
+        ),
+    )
+
+    outcome_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    audit_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    alert_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("canonical_alert_cases.alert_id"), index=True)
+    finalized_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    final_outcome: Mapped[str] = mapped_column(String(80), index=True)
+    result_class: Mapped[str] = mapped_column(String(24), index=True)
+    confirmation_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expiration_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    invalidation_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lead_time_seconds: Mapped[float | None] = mapped_column(Float)
+    maximum_favorable_pct: Mapped[float | None] = mapped_column(Float)
+    maximum_adverse_pct: Mapped[float | None] = mapped_column(Float)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class UserMarketCapLevelVersionRow(Base):
+    __tablename__ = "user_market_cap_level_versions"
+    __table_args__ = (
+        UniqueConstraint("owner_key", "level_key", "version", name="uq_user_level_version"),
+        CheckConstraint("low_usd > 0 AND high_usd >= low_usd", name="ck_user_level_range"),
+        CheckConstraint("version > 0", name="ck_user_level_version_positive"),
+    )
+
+    level_version_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    parent_version_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("user_market_cap_level_versions.level_version_id"), index=True)
+    owner_key: Mapped[str] = mapped_column(String(80), index=True)
+    level_key: Mapped[str] = mapped_column(String(80), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    label: Mapped[str] = mapped_column(String(160))
+    low_usd: Mapped[float] = mapped_column(Float)
+    high_usd: Mapped[float] = mapped_column(Float)
+    meaning: Mapped[str] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean)
+    source: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class ServerJobRow(Base):
+    __tablename__ = "server_jobs"
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_type: Mapped[str] = mapped_column(String(80), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    origin: Mapped[str] = mapped_column(String(40), index=True)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    locked_by: Mapped[str | None] = mapped_column(String(120), index=True)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    evidence_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    result_json: Mapped[str | None] = mapped_column(Text)
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class HelperCandidateRow(Base):
+    __tablename__ = "helper_candidates"
+
+    candidate_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    job_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    evidence_snapshot_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    producer_id: Mapped[str] = mapped_column(String(100))
+    model_version: Mapped[str] = mapped_column(String(100))
+    origin: Mapped[str] = mapped_column(String(24), index=True)
+    client_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    server_received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+    validation_json: Mapped[str | None] = mapped_column(Text)
+
+
+class UsageCounterRow(Base):
+    __tablename__ = "usage_counters"
+
+    category: Mapped[str] = mapped_column(String(80), primary_key=True)
+    window_type: Mapped[str] = mapped_column(String(16), primary_key=True)
+    window_key: Mapped[str] = mapped_column(String(16), primary_key=True)
+    used_count: Mapped[int] = mapped_column(Integer, default=0)
+    byte_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class RequestCacheRow(Base):
+    __tablename__ = "request_cache"
+
+    cache_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    category: Mapped[str] = mapped_column(String(80), index=True)
+    evidence_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    origin: Mapped[str] = mapped_column(String(40), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
 
 
 connect_args: dict[str, Any] = {}

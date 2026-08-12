@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import time
+import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -18,7 +19,7 @@ from app.chad_reactivation import (
     FORECAST_GRADE_TOLERANCE_SECONDS,
     chad_reactivation_gate,
 )
-from app.terminal_config import DATABASE_URL as TERMINAL_DATABASE_URL
+from app.terminal_config import COLLECT_SECONDS, DATABASE_URL as TERMINAL_DATABASE_URL
 from app.terminal_addon import (
     APP_VERSION as TERMINAL_ADDON_VERSION,
     alert_feed as terminal_alert_feed,
@@ -50,6 +51,64 @@ from app.terminal_database import (
     session_scope,
     utc_now as terminal_utc_now,
 )
+from app.phase1_reliability import (
+    AsyncCoalescingCache,
+    authorize_persistent_usage,
+    bounded_retry,
+    build_canonical_evidence_packet,
+    cache_put as phase1_cache_put,
+    claim_due_job,
+    complete_job,
+    fail_job,
+    latest_evidence_packet,
+    persist_evidence_packet,
+    persist_helper_candidate,
+    schedule_current_evidence_job,
+    stable_hash,
+    validate_helper_candidate,
+)
+from app.canonical_forecast import (
+    ForecastValidationError,
+    format_canonical_forecast,
+    latest_canonical_forecast,
+    persist_asset_truth_snapshot,
+    persist_canonical_forecast,
+    persist_portfolio_position_snapshot,
+)
+from app.phase3_learning import (
+    Phase3ValidationError,
+    active_alerts as phase3_active_alerts,
+    capture_exact_due_outcomes,
+    current_learning_version,
+    current_user_levels,
+    enqueue_phase3_jobs,
+    finalize_alert,
+    find_historical_analogs,
+    grade_canonical_forecast,
+    grade_report,
+    grade_social_call,
+    maintain_pattern_memory_from_latest_evidence,
+    persist_learning_version,
+    persist_pattern_sequence,
+    persist_user_level_revision,
+    persist_verified_outcome,
+    process_alert_signal,
+    process_level_alerts_from_latest_evidence,
+    rollback_learning_version,
+)
+from app.phase4_control_center import canonical_control_center_snapshot
+from app.historical_memory import (
+    build_coverage_report,
+    chad_history_evidence_package,
+    historical_event_report,
+    historical_maintenance,
+)
+from app.event_driven_chad import (
+    chad_usage_report,
+    finish_chad_call,
+    record_auto_event_decision,
+    reserve_chad_call,
+)
 from app.terminal_paper_social import (
     alert_timeline as terminal_alert_timeline,
     cancel_paper_trade,
@@ -69,10 +128,16 @@ from app.terminal_usage import (
     CHAD_CACHE_WRITES_ENABLED,
     CHAD_GRADING_ENABLED,
     DB_BOOTSTRAP_ON_START,
+    DETERMINISTIC_GRADING_ENABLED,
     LIVE_COLLECTORS_ENABLED,
+    OPENAI_DAILY_CALL_LIMIT,
+    OPENAI_MONTHLY_CALL_LIMIT,
     OPENAI_AUTOMATIC_ENABLED,
+    PAID_AI_ENABLED,
     PUSH_ENABLED,
     REPAIR_MODE,
+    SERVER_JOB_POLL_SECONDS,
+    SERVER_JOBS_ENABLED,
     RequestBudgetExceeded,
     consume_request_budget,
     operating_status,
@@ -88,7 +153,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.8.7-rc6.5"
+SERVICE_VERSION = "2.11.0-phase3"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -119,9 +184,6 @@ DEX_CHAIN_ID = os.getenv("DEX_CHAIN_ID", "bsc").strip() or "bsc"
 DEX_PAIR_ADDRESS = os.getenv(
     "DEX_PAIR_ADDRESS", "0xf0750c373EbBB3BaEEF7e03D8300cAaD1983d67c"
 ).strip()
-TAG_CIRCULATING_SUPPLY = float(
-    os.getenv("TAG_CIRCULATING_SUPPLY", "108404572594")
-)
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip().lower()
 OPENAI_MAX_OUTPUT_TOKENS = min(
     5_000,
@@ -164,6 +226,16 @@ grader_state: dict[str, Any] = {
     "lastError": None,
     "intervalSeconds": LEDGER_AUTO_GRADE_SECONDS,
 }
+phase1_state: dict[str, Any] = {
+    "running": False,
+    "lastRunAt": None,
+    "lastCompletedJob": None,
+    "lastEvidenceHash": None,
+    "lastPacket": None,
+    "lastError": None,
+    "coalescedRequests": 0,
+}
+phase1_coalescer = AsyncCoalescingCache()
 prediction_ledger = PredictionLedger(
     LEDGER_DB_PATH,
     deadband_pct=LEDGER_DEADBAND_PCT,
@@ -214,6 +286,17 @@ class ChadAnalyzeRequest(BaseModel):
         description="Must be true to grade due locked forecasts.",
     )
     trigger: str = Field(default="explicit-user-request", max_length=80)
+
+
+class HelperResultRequest(BaseModel):
+    idempotencyKey: str = Field(min_length=8, max_length=160)
+    jobId: str | None = Field(default=None, max_length=64)
+    evidenceSnapshotId: str | None = Field(default=None, max_length=64)
+    producerId: str = Field(min_length=1, max_length=100)
+    modelVersion: str = Field(min_length=1, max_length=100)
+    origin: str = Field(pattern="^(android|windows)$")
+    createdAt: str | None = Field(default=None, max_length=80)
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 FULL_FORECAST_HORIZONS = (
@@ -425,6 +508,19 @@ def utc_iso(ms: int | None = None) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
+def _parse_time_for_api(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def timestamp_seconds(value: Any) -> float | None:
     if value is None:
         return None
@@ -607,7 +703,10 @@ def latest_item(value: Any) -> dict[str, Any] | None:
 
 def require_relay_key(x_relay_key: str | None) -> None:
     if not RELAY_TOKEN:
-        return
+        raise HTTPException(
+            status_code=503,
+            detail="Authenticated API is unavailable until RELAY_TOKEN is configured server-side.",
+        )
     supplied = (x_relay_key or "").strip()
     if not supplied or not hmac.compare_digest(supplied, RELAY_TOKEN):
         raise HTTPException(status_code=401, detail="Missing or invalid X-Relay-Key.")
@@ -722,17 +821,11 @@ async def collect_spot_data() -> dict[str, Any]:
 
     price_usd = as_float(pair.get("priceUsd"))
     api_market_cap = as_float(pair.get("marketCap"))
-    estimated_market_cap = (
-        price_usd * TAG_CIRCULATING_SUPPLY if price_usd is not None else None
-    )
 
-    # DEX Screener currently reports TAG's fully diluted/maximum-supply value in
-    # both `marketCap` and `fdv` for this pair. TAG Terminal's historical alert
-    # levels use the configured circulating supply, so the canonical market cap
-    # must be price × circulating supply whenever price is available. Preserve
-    # the raw DEX value separately for transparency instead of using it for
-    # alerts, levels, position context, or Chad's market-cap conclusions.
-    market_cap = estimated_market_cap if estimated_market_cap is not None else api_market_cap
+    # The collector cannot infer circulating supply. Preserve the provider's
+    # labelled pair value; canonical forecasts derive their own market-cap and
+    # portfolio values only from an immutable verified supply snapshot.
+    market_cap = api_market_cap
 
     liquidity = pair.get("liquidity") if isinstance(pair.get("liquidity"), dict) else {}
     volume = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
@@ -778,9 +871,7 @@ async def collect_spot_data() -> dict[str, Any]:
         "priceNative": as_float(pair.get("priceNative")),
         "marketCapUsd": market_cap,
         "marketCapSource": (
-            "price × configured circulating supply"
-            if estimated_market_cap is not None
-            else "DEX Screener fallback"
+            "DEX Screener pair.marketCap (provider-labelled; supply not inferred)"
         ),
         "dexScreenerMarketCapUsd": api_market_cap,
         "fdvUsd": as_float(pair.get("fdv")),
@@ -1115,6 +1206,7 @@ def _analysis_evidence_hash(
     history: dict[str, Any],
     liquidation_data: dict[str, Any],
     spot: dict[str, Any],
+    historical_memory: dict[str, Any] | None = None,
 ) -> str:
     material = {
         "question": " ".join(question.lower().split()),
@@ -1122,6 +1214,7 @@ def _analysis_evidence_hash(
         "history": compact_history_for_chad(history),
         "liquidations": liquidation_data,
         "spot": spot,
+        "historicalMemory": historical_memory or {},
     }
     normalized = json.dumps(
         _stable_evidence(material),
@@ -1207,7 +1300,13 @@ async def request_chad_analysis(
     calibration_profile: dict[str, Any],
     similar_setups: list[dict[str, Any]],
     freshness: dict[str, Any],
+    historical_memory: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not PAID_AI_ENABLED:
+        raise HTTPException(
+            status_code=423,
+            detail="Paid AI is disabled by the Phase 2 server gate.",
+        )
     if openai_client is None:
         raise RuntimeError("OpenAI client has not started.")
 
@@ -1228,6 +1327,10 @@ async def request_chad_analysis(
         "history": compact_history_for_chad(history),
         "liquidations": liquidation_data,
         "freshness": freshness,
+        "tagHistoricalMemory": historical_memory or {
+            "historicalMemoryStatus": "unavailable",
+            "failure": {"reason": "Canonical TAG historical memory was unavailable."},
+        },
         "predictionLedger": {
             "performance": ledger_performance,
             "calibrationProfile": calibration_profile,
@@ -2034,6 +2137,356 @@ async def ledger_grader_loop() -> None:
         grader_state["running"] = False
 
 
+async def collect_canonical_evidence_once() -> dict[str, Any]:
+    """Collect and persist one coalesced server-authoritative evidence packet."""
+
+    bucket = int(time.time()) // max(60, COLLECT_SECONDS)
+
+    async def operation() -> dict[str, Any]:
+        async def collect() -> dict[str, Any]:
+            collected = await terminal_addon.collect_once(cached_snapshot, cached_spot)
+            market = collected.get("market") if isinstance(collected, dict) else None
+            if not isinstance(market, dict):
+                raise RuntimeError("Collector returned no market packet.")
+            packet = build_canonical_evidence_packet(market)
+            storage = await asyncio.to_thread(persist_evidence_packet, packet)
+            await asyncio.to_thread(
+                phase1_cache_put,
+                cache_key=f"canonical-evidence:{packet['evidenceHash']}",
+                category="canonical_evidence",
+                payload=packet,
+                ttl_seconds=max(60, COLLECT_SECONDS),
+                evidence_hash=packet["evidenceHash"],
+                origin="server",
+            )
+            result = {
+                "packet": packet,
+                "storage": storage,
+                "sourceErrors": collected.get("sourceErrors", []),
+                "maintenanceErrors": collected.get("maintenanceErrors", []),
+            }
+            phase1_state["lastPacket"] = packet
+            phase1_state["lastEvidenceHash"] = packet["evidenceHash"]
+            return result
+
+        return await bounded_retry(collect, attempts=2)
+
+    result, coalesced = await phase1_coalescer.run(
+        f"canonical-evidence-bucket:{bucket}",
+        operation,
+        ttl_seconds=min(60, max(15, COLLECT_SECONDS // 5)),
+    )
+    if coalesced:
+        phase1_state["coalescedRequests"] = int(
+            phase1_state.get("coalescedRequests") or 0
+        ) + 1
+    return {**result, "coalesced": coalesced}
+
+
+async def evaluate_event_driven_chad() -> dict[str, Any]:
+    """Evaluate deterministic major-event gates; never call Chad for ordinary noise."""
+
+    packet = await asyncio.to_thread(latest_evidence_packet)
+    if not isinstance(packet, dict):
+        return {"evaluated": False, "automaticCall": False, "reason": "no canonical evidence"}
+    alerts = await asyncio.to_thread(phase3_active_alerts, limit=20)
+    major = next(
+        (
+            row
+            for row in alerts
+            if row.get("stage") in {"CONFIRMED", "URGENT ACTION"}
+            and float(row.get("signalScore") or 0.0) >= 75.0
+        ),
+        None,
+    )
+    items = packet.get("items") if isinstance(packet.get("items"), list) else []
+    futures = [
+        row for row in items
+        if isinstance(row, dict)
+        and row.get("category") == "futures"
+        and row.get("validationStatus") not in {"invalid", "unavailable"}
+    ]
+    spot = next(
+        (
+            row for row in items
+            if isinstance(row, dict)
+            and row.get("category") == "dex_spot"
+            and row.get("validationStatus") not in {"invalid", "unavailable"}
+        ),
+        None,
+    )
+    compact_features: dict[str, Any] = {}
+    for row in futures:
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        for source, target in (
+            ("oiChange1hPct", "openInterestChange"),
+            ("fundingRate", "funding"),
+            ("takerBuySellRatio", "takerImbalance"),
+        ):
+            if source in payload and target not in compact_features:
+                compact_features[target] = payload[source]
+    if isinstance(spot, dict) and isinstance(spot.get("payload"), dict):
+        spot_payload = spot["payload"]
+        compact_features["spotConfirmation"] = (spot_payload.get("priceChangePct") or {}).get("h1") if isinstance(spot_payload.get("priceChangePct"), dict) else None
+        compact_features["liquidity"] = spot_payload.get("liquidityUsd")
+    historical = await asyncio.to_thread(
+        chad_history_evidence_package,
+        compact_features,
+        data_as_of=packet.get("dataAsOf") or packet.get("serverCreatedAt"),
+        evidence_snapshot_id=packet["snapshotId"],
+    )
+    top_analog = next(iter(historical.get("rankedTagHistoricalAnalogs") or []), None)
+    exceptional_analog = isinstance(top_analog, dict) and float(top_analog.get("similarityScore") or 0.0) >= 85.0
+    if major is None and not exceptional_analog:
+        return {
+            "evaluated": True,
+            "automaticCall": False,
+            "reason": "ordinary market conditions; no defined major event threshold",
+            "routineDailyCall": False,
+        }
+
+    reason_text = f"{major.get('alertType')} {major.get('reason')}".upper() if major else ""
+    family = "EXCEPTIONAL_HISTORICAL_ANALOG" if exceptional_analog and major is None else "HISTORICALLY_UNUSUAL_SETUP"
+    for needle, candidate in (
+        ("ATH", "ATH_BREAK"),
+        ("PANIC", "PANIC_CAPITULATION"),
+        ("LIQUIDATION", "LIQUIDATION_CASCADE"),
+        ("SHORT SQUEEZE", "SHORT_SQUEEZE"),
+        ("LONG SQUEEZE", "LONG_SQUEEZE"),
+        ("BREAKDOWN", "EXTREME_BREAKDOWN"),
+        ("BREAKOUT", "EXTREME_BREAKOUT"),
+        ("SUPPORT", "MAJOR_SUPPORT_FAILURE"),
+        ("RECLAIM", "MAJOR_RECLAIM"),
+        ("VOLUME", "ABNORMAL_VOLUME_EXPANSION"),
+        ("OPEN INTEREST", "ABNORMAL_OI_EXPANSION"),
+        ("OI FLUSH", "OI_FLUSH"),
+        ("REGIME", "MATERIAL_REGIME_CHANGE"),
+    ):
+        if needle in reason_text:
+            family = candidate
+            break
+    confirmations: list[dict[str, Any]] = []
+    if major is not None:
+        confirmations.append(
+            {
+                "signalFamily": "technical_structure",
+                "source": "canonical staged alert",
+                "evidence": {"alertId": major["alertId"], "score": major["signalScore"]},
+            }
+        )
+    if futures:
+        confirmations.append(
+            {
+                "signalFamily": "leverage",
+                "source": ", ".join(sorted({str(row.get('sourceName') or row.get('sourceId')) for row in futures})),
+                "evidence": compact_features,
+            }
+        )
+    if spot is not None:
+        confirmations.append(
+            {
+                "signalFamily": "spot",
+                "source": str(spot.get("sourceName") or spot.get("sourceId")),
+                "evidence": compact_features.get("spotConfirmation"),
+            }
+        )
+    if top_analog is not None:
+        confirmations.append(
+            {
+                "signalFamily": "historical_analog",
+                "source": historical["engineVersion"],
+                "evidence": {
+                    "eventVersionId": top_analog.get("eventVersionId"),
+                    "similarityScore": top_analog.get("similarityScore"),
+                },
+            }
+        )
+    event_key = (
+        str(major.get("alertId"))
+        if major is not None
+        else f"analog:{top_analog.get('eventVersionId')}"
+    )
+    decision = await asyncio.to_thread(
+        record_auto_event_decision,
+        {
+            "eventKey": event_key,
+            "eventFamily": family,
+            "evidenceHash": packet["evidenceHash"],
+            "regimeFingerprint": stable_hash(compact_features),
+            "detectedAt": major.get("firstDetectedAt") if major else packet.get("dataAsOf"),
+            "severityScore": max(
+                float(major.get("signalScore") or 0.0) if major else 0.0,
+                float(top_analog.get("similarityScore") or 0.0) if top_analog else 0.0,
+            ),
+            "historicalAnalogScore": float(top_analog.get("similarityScore") or 0.0) if top_analog else 0.0,
+            "confirmations": confirmations,
+            "evidence": {
+                "snapshotId": packet["snapshotId"],
+                "alert": major,
+                "historicalAnalog": top_analog,
+            },
+        },
+    )
+    if not decision.get("eligible") or not PAID_AI_ENABLED or not OPENAI_AUTOMATIC_ENABLED:
+        return {
+            "evaluated": True,
+            "automaticCall": False,
+            "decision": decision,
+            "reason": (
+                decision.get("decisionReason")
+                if not decision.get("eligible")
+                else "event qualified, but automatic paid Chad is disabled"
+            ),
+        }
+
+    blockers = chad_reactivation_gate.blockers(
+        key_configured=bool(OPENAI_API_KEY),
+        relay_token_configured=bool(RELAY_TOKEN),
+        call_mode="automatic",
+    )
+    if blockers:
+        return {"evaluated": True, "automaticCall": False, "decision": decision, "reason": blockers[0]}
+    request_id, blocked_reason = chad_reactivation_gate.begin_request(
+        key_configured=bool(OPENAI_API_KEY),
+        relay_token_configured=bool(RELAY_TOKEN),
+        call_mode="automatic",
+    )
+    if request_id is None:
+        return {"evaluated": True, "automaticCall": False, "decision": decision, "reason": blocked_reason}
+    started_at = time.time()
+    error: BaseException | None = None
+    success = False
+    budget_summary: dict[str, Any] | None = None
+    try:
+        with request_budget_scope() as budget:
+            result = await _run_chad_analysis(
+                ChadAnalyzeRequest(
+                    question=(
+                        "An extreme TAG event was detected. Independently analyze the frozen evidence, "
+                        "historical analogs, differences, risks, and invalidation."
+                    ),
+                    allowPaidCall=True,
+                    allowForecastWrite=True,
+                    allowGrading=True,
+                    trigger="auto-extreme-event",
+                ),
+                call_mode="automatic",
+                auto_event=decision,
+            )
+            budget_summary = budget.summary()
+        success = True
+        return {"evaluated": True, "automaticCall": True, "decision": decision, "result": result}
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        chad_reactivation_gate.finish_request(
+            request_id,
+            success=success,
+            started_at=started_at,
+            budget=budget_summary,
+            error=error,
+        )
+
+
+async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
+    job_type = str(job.get("jobType") or "")
+    if job_type == "collect_canonical_evidence":
+        return await collect_canonical_evidence_once()
+    if job_type == "validate_helper_candidate":
+        candidate_id = str((job.get("payload") or {}).get("candidateId") or "")
+        if not candidate_id:
+            raise ValueError("Helper validation job is missing candidateId.")
+        return await asyncio.to_thread(validate_helper_candidate, candidate_id)
+    if job_type == "grade_due_canonical_forecasts":
+        return await asyncio.to_thread(capture_exact_due_outcomes)
+    if job_type == "maintain_pattern_memory":
+        return await asyncio.to_thread(maintain_pattern_memory_from_latest_evidence)
+    if job_type == "process_staged_alerts":
+        return await asyncio.to_thread(process_level_alerts_from_latest_evidence)
+    if job_type == "maintain_historical_memory":
+        archive_catch_up: dict[str, Any] = {
+            "enabled": bool(BACKFILL_ENABLED and not REPAIR_MODE),
+            "paidAiCalls": 0,
+        }
+        if BACKFILL_ENABLED and not REPAIR_MODE:
+            archive_catch_up["result"] = await terminal_backfill_recent(2, "5m")
+        maintenance = await asyncio.to_thread(historical_maintenance)
+        return {**maintenance, "archiveCatchUp": archive_catch_up}
+    if job_type == "evaluate_event_driven_chad":
+        return await evaluate_event_driven_chad()
+    raise ValueError(f"Unsupported server job type: {job_type}")
+
+
+async def phase1_job_loop() -> None:
+    """Run persistent, idempotent jobs and catch up expired work after wake."""
+
+    worker_id = f"render:{BUILD_ID}:{uuid.uuid4().hex[:12]}"
+    phase1_state["running"] = True
+    try:
+        await asyncio.sleep(2)
+        while True:
+            phase1_state["lastRunAt"] = utc_iso()
+            try:
+                await asyncio.to_thread(
+                    schedule_current_evidence_job,
+                    interval_seconds=COLLECT_SECONDS,
+                )
+                await asyncio.to_thread(
+                    enqueue_phase3_jobs,
+                    interval_seconds=max(300, COLLECT_SECONDS),
+                )
+                history_bucket = int(time.time()) // 3_600 * 3_600
+                await asyncio.to_thread(
+                    enqueue_job,
+                    job_type="maintain_historical_memory",
+                    idempotency_key=f"phase6-history:{history_bucket}",
+                    origin="server-scheduler",
+                    payload={"bucket": history_bucket},
+                    max_attempts=2,
+                )
+                chad_event_bucket = int(time.time()) // max(300, COLLECT_SECONDS) * max(300, COLLECT_SECONDS)
+                await asyncio.to_thread(
+                    enqueue_job,
+                    job_type="evaluate_event_driven_chad",
+                    idempotency_key=f"phase6-chad-event:{chad_event_bucket}",
+                    origin="server-scheduler",
+                    payload={"bucket": chad_event_bucket},
+                    max_attempts=2,
+                )
+                processed = 0
+                while processed < 20:
+                    job = await asyncio.to_thread(
+                        claim_due_job,
+                        worker_id=worker_id,
+                        lock_seconds=max(120, COLLECT_SECONDS),
+                    )
+                    if job is None:
+                        break
+                    try:
+                        result = await _run_claimed_phase1_job(job)
+                        await asyncio.to_thread(complete_job, job["jobId"], result)
+                        phase1_state["lastCompletedJob"] = {
+                            "jobId": job["jobId"],
+                            "jobType": job["jobType"],
+                            "completedAt": utc_iso(),
+                        }
+                        phase1_state["lastError"] = None
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        await asyncio.to_thread(fail_job, job["jobId"], exc)
+                        phase1_state["lastError"] = f"{type(exc).__name__}: {str(exc)[:500]}"
+                    processed += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                phase1_state["lastError"] = f"{type(exc).__name__}: {str(exc)[:500]}"
+            await asyncio.sleep(SERVER_JOB_POLL_SECONDS)
+    finally:
+        phase1_state["running"] = False
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global http_client, openai_client
@@ -2068,10 +2521,17 @@ async def lifespan(_: FastAPI):
     )
     grader_task = (
         asyncio.create_task(ledger_grader_loop())
-        if LEDGER_ENABLED and automatic_live_work
+        if LEDGER_ENABLED and automatic_live_work and DETERMINISTIC_GRADING_ENABLED
         else None
     )
-    if automatic_live_work:
+    phase1_task = (
+        asyncio.create_task(phase1_job_loop(), name="tagalysis-phase1-server-jobs")
+        if automatic_live_work and SERVER_JOBS_ENABLED
+        else None
+    )
+    # Retain the legacy loop only as an optional fallback. Phase 1 server jobs
+    # own collection when enabled so two schedulers cannot create duplicate work.
+    if automatic_live_work and not SERVER_JOBS_ENABLED:
         terminal_addon.start_collector(cached_snapshot, cached_spot)
 
     try:
@@ -2083,9 +2543,11 @@ async def lifespan(_: FastAPI):
             depth_task.cancel()
         if grader_task is not None:
             grader_task.cancel()
+        if phase1_task is not None:
+            phase1_task.cancel()
         tasks = [
             task
-            for task in (market_task, depth_task, grader_task)
+            for task in (market_task, depth_task, grader_task, phase1_task)
             if task is not None
         ]
         await asyncio.gather(
@@ -2136,6 +2598,8 @@ async def root() -> dict[str, Any]:
         "health": "/health",
         "sourceHealth": "/v1/tag/source-health",
         "connection": "/v1/tag/connection",
+        "canonicalEvidence": "/v1/tag/evidence/current",
+        "helperCandidate": "/v1/tag/assist/results",
         "snapshot": "/v1/tag/snapshot",
         "spot": "/v1/tag/spot",
         "history": "/v1/tag/history?period=5m&limit=100",
@@ -2162,6 +2626,16 @@ async def root() -> dict[str, Any]:
         "visionBackfill": "/v1/admin/binance-vision/backfill",
         "operatingStatus": operating_status(SERVICE_VERSION),
     }
+
+
+def phase1_health_state() -> dict[str, Any]:
+    """Small in-memory snapshot safe for side-effect-free health routes."""
+
+    return {
+        key: value
+        for key, value in phase1_state.items()
+        if key != "lastPacket"
+    } | {"lastPacketAvailable": phase1_state.get("lastPacket") is not None}
 
 
 @app.get("/health")
@@ -2216,7 +2690,11 @@ async def health() -> dict[str, Any]:
         },
         "automaticGrader": dict(grader_state) if LEDGER_ENABLED else None,
         "terminalAddonVersion": TERMINAL_ADDON_VERSION,
-        "terminalCollectorRunning": bool(terminal_addon.collector_task and not terminal_addon.collector_task.done()),
+        "terminalCollectorRunning": bool(
+            phase1_state.get("running")
+            or (terminal_addon.collector_task and not terminal_addon.collector_task.done())
+        ),
+        "phase1ServerJobs": phase1_health_state(),
         "terminalHistoryCounts": None,
         "terminalStoragePersistent": terminal_storage_persistent,
         "terminalStorageWarning": (
@@ -2248,8 +2726,11 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         )
     )
     collector_running = bool(
-        terminal_addon.collector_task
-        and not terminal_addon.collector_task.done()
+        phase1_state.get("running")
+        or (
+            terminal_addon.collector_task
+            and not terminal_addon.collector_task.done()
+        )
     )
     grader_running = bool(grader_state.get("running", False))
     grader_last_result = (
@@ -2269,7 +2750,7 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         and not REPAIR_MODE
         and flags["liveCollectorsEnabled"]
         and collector_running
-        and flags["chadGradingEnabled"]
+        and flags["deterministicGradingEnabled"]
         and grader_healthy
         and storage_persistent
     )
@@ -2282,7 +2763,7 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         blockers.append("Current-data collection is paused")
     elif not collector_running:
         blockers.append("Collector job is not running")
-    if not flags["chadGradingEnabled"]:
+    if not flags["deterministicGradingEnabled"]:
         blockers.append("Deterministic grading is disabled")
     elif not grader_running:
         blockers.append("Forecast grader is not running")
@@ -2307,9 +2788,15 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
             "collection": {
                 "enabled": flags["liveCollectorsEnabled"],
                 "running": collector_running,
+                "authoritativeScheduler": (
+                    "server_jobs" if flags.get("serverJobsEnabled") else "legacy_collector"
+                ),
+                "lastCompletedAt": terminal_addon.collector_state.get("lastCompletedAt"),
+                "lastError": terminal_addon.collector_state.get("lastError"),
+                "sourceErrors": terminal_addon.collector_state.get("lastSourceErrors", []),
             },
             "grading": {
-                "enabled": flags["chadGradingEnabled"],
+                "enabled": flags["deterministicGradingEnabled"],
                 "running": grader_running,
                 "healthy": grader_healthy,
                 "lastRunAt": grader_state.get("lastRunAt"),
@@ -2320,7 +2807,7 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
             },
             "backfill": {"enabled": flags["backfillEnabled"]},
             "optionalAiSynthesis": {
-                "enabled": flags["openAiAutomaticEnabled"],
+                "enabled": flags["openAiAutomaticEnabled"] and flags.get("paidAiEnabled", False),
             },
             "notifications": {"enabled": flags["pushEnabled"]},
             "forecastWrites": {
@@ -2348,6 +2835,7 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
             "persistent": storage_persistent,
             "databaseCheckedByThisRequest": False,
         },
+        "serverJobs": phase1_health_state(),
         "nextAction": (
             "Minimum live services are ready"
             if minimum_ready
@@ -2367,6 +2855,405 @@ async def tag_connection(
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
     return await source_health_payload(authenticated=True)
+
+
+@app.get("/v1/tag/evidence/current")
+async def tag_current_evidence(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Return last durable evidence and coalesce one safe wake/catch-up job."""
+
+    require_relay_key(x_relay_key)
+    read_error: str | None = None
+    try:
+        packet = await asyncio.to_thread(latest_evidence_packet)
+    except Exception as exc:
+        packet = phase1_state.get("lastPacket")
+        read_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+
+    packet_created = _parse_time_for_api(
+        packet.get("serverCreatedAt") if isinstance(packet, dict) else None
+    )
+    age_seconds = (
+        max(0.0, (datetime.now(timezone.utc) - packet_created).total_seconds())
+        if packet_created is not None
+        else None
+    )
+    needs_catch_up = packet is None or age_seconds is None or age_seconds > COLLECT_SECONDS
+    wake_job: dict[str, Any] | None = None
+    wake_error: str | None = None
+    if needs_catch_up and SERVER_JOBS_ENABLED and not REPAIR_MODE:
+        try:
+            wake_job = await asyncio.to_thread(
+                schedule_current_evidence_job,
+                interval_seconds=COLLECT_SECONDS,
+            )
+        except Exception as exc:
+            wake_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+
+    return {
+        "ok": packet is not None,
+        "authoritative": True,
+        "authority": "TAGalysis server / Neon PostgreSQL",
+        "serverTime": utc_iso(),
+        "packet": packet,
+        "freshness": {
+            "ageSeconds": round(age_seconds, 3) if age_seconds is not None else None,
+            "status": (
+                "current"
+                if age_seconds is not None and age_seconds <= COLLECT_SECONDS
+                else "stale" if packet is not None else "unavailable"
+            ),
+        },
+        "catchUp": {
+            "needed": needs_catch_up,
+            "job": wake_job,
+            "error": wake_error,
+            "coalescing": "database idempotency key per collection window",
+        },
+        "storageReadError": read_error,
+        "lastValidRetained": packet is not None,
+    }
+
+
+@app.post("/v1/tag/assist/results")
+async def tag_assist_result(
+    request: HelperResultRequest,
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("helper candidate uploads")
+    try:
+        result = await asyncio.to_thread(
+            persist_helper_candidate,
+            request.model_dump(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "accepted": True,
+        "authoritative": False,
+        "message": "Helper output is a non-authoritative candidate until server validation completes.",
+        **result,
+    }
+
+
+@app.post("/v1/tag/forecast/truth/supply")
+async def tag_forecast_supply_truth(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("verified supply snapshot writes")
+    try:
+        result = await asyncio.to_thread(persist_asset_truth_snapshot, payload)
+    except ForecastValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, **result}
+
+
+@app.post("/v1/tag/forecast/truth/portfolio")
+async def tag_forecast_portfolio_truth(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("verified portfolio snapshot writes")
+    try:
+        result = await asyncio.to_thread(persist_portfolio_position_snapshot, payload)
+    except ForecastValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, **result}
+
+
+@app.post("/v1/tag/forecasts/canonical")
+async def tag_canonical_forecast_write(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("canonical forecast writes")
+    try:
+        result = await asyncio.to_thread(persist_canonical_forecast, payload)
+    except ForecastValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, "immutable": True, **result}
+
+
+@app.get("/v1/tag/forecasts/canonical/latest")
+async def tag_canonical_forecast_latest(
+    producer: str = Query("tagalysis"),
+    horizon: str = Query("24h"),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    try:
+        record = await asyncio.to_thread(
+            latest_canonical_forecast,
+            producer=producer.lower(),
+            horizon=horizon.lower(),
+        )
+        formatted = format_canonical_forecast(record) if record is not None else None
+    except ForecastValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "ok": record is not None,
+        "authoritative": True,
+        "record": record,
+        "presentation": formatted,
+    }
+
+
+@app.get("/v1/tag/control-center")
+async def tag_control_center(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """One authenticated, side-effect-free payload for the Phase 4 Android UI."""
+    require_relay_key(x_relay_key)
+    return {
+        "ok": True,
+        **await asyncio.to_thread(canonical_control_center_snapshot),
+    }
+
+
+@app.get("/v1/tag/history/coverage")
+async def tag_history_coverage(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Authenticated read-only history coverage; missing fields remain explicit."""
+    require_relay_key(x_relay_key)
+    return {"ok": True, "authoritative": True, **await asyncio.to_thread(build_coverage_report)}
+
+
+@app.get("/v1/tag/history/events")
+async def tag_history_events(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, "authoritative": True, **await asyncio.to_thread(historical_event_report)}
+
+
+@app.get("/v1/chad/usage")
+async def tag_chad_usage(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, **await asyncio.to_thread(chad_usage_report)}
+
+
+@app.post("/v1/tag/outcomes/verified")
+async def tag_verified_outcome_write(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("verified exact-deadline outcome writes")
+    try:
+        result = await asyncio.to_thread(persist_verified_outcome, payload)
+    except Phase3ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, "immutable": True, **result}
+
+
+@app.post("/v1/tag/forecasts/{forecast_id}/grade")
+async def tag_canonical_forecast_grade(
+    forecast_id: str,
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("canonical deterministic grading")
+    try:
+        result = await asyncio.to_thread(
+            grade_canonical_forecast,
+            forecast_id,
+            str(payload.get("outcomeId") or ""),
+            evaluation_kind=str(payload.get("evaluationKind") or "live"),
+        )
+    except Phase3ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, "immutable": True, **result}
+
+
+@app.post("/v1/tag/social-calls/{social_call_id}/grade")
+async def tag_canonical_social_call_grade(
+    social_call_id: str,
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("canonical social-call grading")
+    frozen_call = payload.get("frozenCall") if isinstance(payload.get("frozenCall"), dict) else {}
+    frozen_call = {**frozen_call, "socialCallId": social_call_id}
+    try:
+        result = await asyncio.to_thread(
+            grade_social_call,
+            frozen_call,
+            str(payload.get("outcomeId") or ""),
+            evaluation_kind=str(payload.get("evaluationKind") or "live"),
+        )
+    except Phase3ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, "immutable": True, **result}
+
+
+@app.get("/v1/tag/grades/report")
+async def tag_canonical_grade_report(
+    producer: str = Query("tagalysis"),
+    horizon: str = Query("24h"),
+    evaluation_kind: str = Query("live", alias="evaluationKind"),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    try:
+        result = await asyncio.to_thread(
+            grade_report,
+            producer=producer.lower(),
+            horizon=horizon.lower(),
+            evaluation_kind=evaluation_kind.lower(),
+        )
+    except (Phase3ValidationError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, **result}
+
+
+@app.post("/v1/tag/patterns/sequences")
+async def tag_pattern_sequence_write(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("canonical ChadTAG pattern memory writes")
+    try:
+        result = await asyncio.to_thread(persist_pattern_sequence, payload)
+    except Phase3ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, "memoryOwner": "canonical-chadtag-memory", **result}
+
+
+@app.get("/v1/tag/patterns/{sequence_id}/analogs")
+async def tag_pattern_analogs(
+    sequence_id: str,
+    limit: int = Query(5, ge=1, le=20),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    try:
+        results = await asyncio.to_thread(find_historical_analogs, sequence_id, limit=limit)
+    except Phase3ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, "analogs": results}
+
+
+@app.post("/v1/tag/learning/versions")
+async def tag_learning_version_write(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("bounded adaptive-learning version writes")
+    try:
+        result = await asyncio.to_thread(persist_learning_version, payload)
+    except Phase3ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, "immutable": True, **result}
+
+
+@app.get("/v1/tag/learning/versions/current")
+async def tag_learning_version_current(
+    component: str = Query("canonical-forecast-weighting"),
+    producer: str = Query("champion"),
+    horizon: str = Query("24h"),
+    regime: str = Query("ALL"),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    result = await asyncio.to_thread(
+        current_learning_version,
+        component=component,
+        producer=producer.lower(),
+        horizon=horizon.lower(),
+        regime=regime,
+    )
+    return {"ok": result is not None, "authoritative": True, "version": result}
+
+
+@app.post("/v1/tag/learning/versions/{version_id}/rollback")
+async def tag_learning_version_rollback(
+    version_id: str,
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("adaptive-learning rollback version writes")
+    try:
+        result = await asyncio.to_thread(
+            rollback_learning_version,
+            version_id,
+            reason=str(payload.get("reason") or "manual rollback"),
+        )
+    except Phase3ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, "immutable": True, **result}
+
+
+@app.post("/v1/tag/alerts/canonical/process")
+async def tag_canonical_alert_process(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("canonical staged-alert processing")
+    try:
+        result = await asyncio.to_thread(process_alert_signal, payload)
+    except Phase3ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, "immutableTimeline": True, **result}
+
+
+@app.post("/v1/tag/alerts/canonical/finalize")
+async def tag_canonical_alert_finalize(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("canonical alert outcome writes")
+    try:
+        result = await asyncio.to_thread(finalize_alert, payload)
+    except Phase3ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, "immutable": True, **result}
+
+
+@app.get("/v1/tag/alerts/canonical/active")
+async def tag_canonical_alert_active(
+    limit: int = Query(50, ge=1, le=200),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, "authoritative": True, "alerts": await asyncio.to_thread(phase3_active_alerts, limit=limit)}
+
+
+@app.get("/v1/tag/settings/market-cap-levels")
+async def tag_market_cap_levels(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, "authoritative": True, "levels": await asyncio.to_thread(current_user_levels)}
+
+
+@app.post("/v1/tag/settings/market-cap-levels")
+async def tag_market_cap_level_write(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("authenticated market-cap level revisions")
+    try:
+        result = await asyncio.to_thread(persist_user_level_revision, payload)
+    except Phase3ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "authoritative": True, "immutableRevision": True, **result}
 
 
 @app.get("/v1/tag/snapshot")
@@ -2570,7 +3457,12 @@ async def chad_ledger_export(
     return prediction_ledger.export_data(limit=min(limit, 200) if REPAIR_MODE else limit)
 
 
-async def _run_chad_analysis(request: ChadAnalyzeRequest) -> dict[str, Any]:
+async def _run_chad_analysis(
+    request: ChadAnalyzeRequest,
+    *,
+    call_mode: str = "manual",
+    auto_event: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if request.historyPeriod not in VALID_PERIODS:
         raise HTTPException(
             status_code=400,
@@ -2596,12 +3488,41 @@ async def _run_chad_analysis(request: ChadAnalyzeRequest) -> dict[str, Any]:
         "summary": await liquidation_summary(),
         "recentEvents": recent_events,
     }
+    features = current_market_features(snapshot, spot)
+    history_audit_warning: str | None = None
+    try:
+        canonical_packet = await asyncio.to_thread(latest_evidence_packet)
+    except Exception as exc:
+        # Migration-safe rollout: a manual request may still use the already
+        # collected live evidence, but the missing durable history is explicit.
+        canonical_packet = None
+        history_audit_warning = (
+            "Canonical historical evidence was unavailable: "
+            f"{type(exc).__name__}: {str(exc)[:240]}"
+        )
+    history_data_as_of = (
+        canonical_packet.get("dataAsOf") or canonical_packet.get("serverCreatedAt")
+        if isinstance(canonical_packet, dict)
+        else utc_iso()
+    )
+    history_evidence_id = (
+        str(canonical_packet.get("snapshotId") or "")
+        if isinstance(canonical_packet, dict)
+        else "unpersisted-live-evidence"
+    )
+    historical_memory = await asyncio.to_thread(
+        chad_history_evidence_package,
+        features,
+        data_as_of=history_data_as_of,
+        evidence_snapshot_id=history_evidence_id,
+    )
     evidence_hash = _analysis_evidence_hash(
         question=request.question,
         snapshot=snapshot,
         history=history,
         liquidation_data=liquidation_data,
         spot=spot,
+        historical_memory=historical_memory,
     )
 
     cached_analysis = _cached_openai_analysis(evidence_hash)
@@ -2631,7 +3552,6 @@ async def _run_chad_analysis(request: ChadAnalyzeRequest) -> dict[str, Any]:
     grading_before = await grade_due_ledger_predictions(
         limit=CHAD_GRADING_MAX_PER_BATCH
     )
-    features = current_market_features(snapshot, spot)
     freshness = build_freshness_report(snapshot, spot, history)
     ledger_performance = (
         prediction_ledger.performance_summary()
@@ -2653,26 +3573,100 @@ async def _run_chad_analysis(request: ChadAnalyzeRequest) -> dict[str, Any]:
     if cached_analysis is not None:
         analysis, raw_response = cached_analysis
     else:
-        allowed, reason = usage_governor.authorize("openai_call")
+        allowed, reason = usage_governor.authorize(
+            "openai_call", automatic=call_mode == "automatic"
+        )
         if not allowed:
             raise HTTPException(
                 status_code=429,
                 detail=f"OpenAI cost circuit is open ({reason}).",
             )
+        try:
+            reservation = await asyncio.to_thread(
+                reserve_chad_call,
+                call_mode=call_mode,
+                idempotency_key=(
+                    f"auto:{auto_event.get('eventKey')}:{evidence_hash}"
+                    if call_mode == "automatic" and isinstance(auto_event, dict)
+                    else f"manual:{evidence_hash}"
+                ),
+                evidence_hash=evidence_hash,
+                trigger_reason=(
+                    str(auto_event.get("decisionReason") or auto_event.get("eventFamily") or "major TAG event")
+                    if call_mode == "automatic" and isinstance(auto_event, dict)
+                    else "User explicitly selected Ask Chad / Run Chad Now."
+                ),
+                event_id=(str(auto_event.get("eventKey")) if isinstance(auto_event, dict) else None),
+                regime_fingerprint=(
+                    str(auto_event.get("regimeFingerprint")) if isinstance(auto_event, dict) else None
+                ),
+                confirmations=(auto_event.get("confirmations") if isinstance(auto_event, dict) else []),
+                evidence={
+                    "historicalMemory": historical_memory,
+                    "snapshotId": history_evidence_id,
+                },
+                paid_enabled=PAID_AI_ENABLED,
+                automatic_enabled=OPENAI_AUTOMATIC_ENABLED,
+            )
+        except Exception as exc:
+            # During a migration rollout the new detailed audit table may not
+            # exist yet. Retain the pre-existing durable hard limit, disclose
+            # the degraded audit state, and never use this fallback for auto.
+            if call_mode != "manual":
+                raise HTTPException(
+                    status_code=503,
+                    detail="Automatic Chad is disabled until its event audit schema is available.",
+                ) from exc
+            legacy_allowed, legacy_reason = await asyncio.to_thread(
+                authorize_persistent_usage,
+                "openai_call",
+                daily_limit=OPENAI_DAILY_CALL_LIMIT,
+                monthly_limit=OPENAI_MONTHLY_CALL_LIMIT,
+            )
+            reservation = {
+                "reserved": legacy_allowed,
+                "reason": legacy_reason,
+                "callId": None,
+                "auditStatus": "degraded-migration-pending",
+                "auditError": f"{type(exc).__name__}: {str(exc)[:240]}",
+            }
+        if not reservation.get("reserved"):
+            raise HTTPException(
+                status_code=429,
+                detail=f"Central OpenAI usage limit is closed ({reservation.get('reason')}).",
+            )
         usage_governor.mark_bounded_test()
-        analysis, raw_response = await request_chad_analysis(
-            question=request.question,
-            snapshot=snapshot,
-            history=history,
-            liquidation_data=liquidation_data,
-            spot_data=spot,
-            position_tag=request.positionTag,
-            average_entry_usd=request.averageEntryUsd,
-            ledger_performance=ledger_performance,
-            calibration_profile=calibration_profile,
-            similar_setups=similar_setups,
-            freshness=freshness,
-        )
+        try:
+            analysis, raw_response = await request_chad_analysis(
+                question=request.question,
+                snapshot=snapshot,
+                history=history,
+                liquidation_data=liquidation_data,
+                spot_data=spot,
+                position_tag=request.positionTag,
+                average_entry_usd=request.averageEntryUsd,
+                ledger_performance=ledger_performance,
+                calibration_profile=calibration_profile,
+                similar_setups=similar_setups,
+                freshness=freshness,
+                historical_memory=historical_memory,
+            )
+        except Exception as exc:
+            if reservation.get("callId"):
+                await asyncio.to_thread(
+                    finish_chad_call,
+                    reservation["callId"],
+                    status="failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            raise
+        if reservation.get("callId"):
+            await asyncio.to_thread(
+                finish_chad_call,
+                reservation["callId"],
+                status="completed",
+                provider_response=raw_response,
+            )
         _store_openai_analysis(
             evidence_hash=evidence_hash,
             trigger=request.trigger,
@@ -2826,6 +3820,23 @@ async def _run_chad_analysis(request: ChadAnalyzeRequest) -> dict[str, Any]:
             "historyLimit": request.historyLimit,
             "historyErrors": history.get("errors", []),
             "liquidationSummary": liquidation_data["summary"],
+            "historicalMemory": historical_memory,
+        },
+        "chadCall": {
+            "mode": call_mode,
+            "label": "MANUAL CHAD" if call_mode == "manual" else "AUTO CHAD — EXTREME EVENT",
+            "triggerReason": (
+                auto_event.get("decisionReason") if isinstance(auto_event, dict)
+                else "User explicitly requested analysis."
+            ),
+            "eventId": auto_event.get("eventKey") if isinstance(auto_event, dict) else None,
+            "paidProviderInvoked": not cache_hit,
+            "auditStatus": (
+                reservation.get("auditStatus", "complete")
+                if not cache_hit
+                else "cache-hit-no-new-spend"
+            ),
+            "historicalEvidenceWarning": history_audit_warning,
         },
     }
 
@@ -2840,6 +3851,11 @@ async def chad_analyze(
     request: ChadAnalyzeRequest,
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    if not PAID_AI_ENABLED:
+        raise HTTPException(
+            status_code=423,
+            detail="Paid Chad/OpenAI calls are disabled for Phase 2.",
+        )
     blockers = chad_reactivation_gate.blockers(
         key_configured=bool(OPENAI_API_KEY),
         relay_token_configured=bool(RELAY_TOKEN),
@@ -2991,7 +4007,32 @@ async def terminal_client_snapshot(
             "repairMode": True,
             "message": "Repair mode is active; refreshes do not create database snapshots.",
         }
-    return terminal_addon.accept_client_snapshot(payload)
+    # Legacy Android uploads are preserved for compatibility, but Phase 1 no
+    # longer lets a device clock or device-computed aggregate become canonical
+    # market history. The server stores it as a deduplicated candidate and
+    # validates it asynchronously against a server evidence snapshot.
+    idempotency_key = str(payload.get("idempotencyKey") or "").strip()
+    if not idempotency_key:
+        idempotency_key = f"legacy-android-snapshot:{stable_hash(payload)}"
+    result = await asyncio.to_thread(
+        persist_helper_candidate,
+        {
+            "idempotencyKey": idempotency_key,
+            "jobId": payload.get("jobId"),
+            "evidenceSnapshotId": payload.get("evidenceSnapshotId"),
+            "producerId": payload.get("producerId") or "tagalysis-android-legacy",
+            "modelVersion": payload.get("modelVersion") or "legacy-client-snapshot-v1",
+            "origin": "android",
+            "createdAt": payload.get("recordedAt"),
+            "payload": payload,
+        },
+    )
+    return {
+        "accepted": True,
+        "authoritative": False,
+        "legacyCompatibility": True,
+        **result,
+    }
 
 
 @app.get("/v1/tag/heatmap")

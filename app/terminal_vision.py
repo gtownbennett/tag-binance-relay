@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import csv
+import hashlib
 import io
 import json
 import zipfile
@@ -15,6 +17,12 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .terminal_config import SYMBOL
 from .terminal_database import BinanceSnapshot, VisionRow, json_dumps, session_scope
+from .historical_memory import (
+    begin_backfill_range,
+    finish_backfill_range,
+    import_binance_vision_candles,
+    persist_historical_observations,
+)
 
 BASE = "https://data.binance.vision/data/futures/um"
 CANDLE_DATASETS = {
@@ -243,23 +251,24 @@ def _upsert_rows(rows: list[dict[str, Any]]) -> int:
         return 0
     with session_scope() as session:
         dialect = session.bind.dialect.name if session.bind is not None else ""
-        for values in rows:
+        for offset in range(0, len(rows), 500):
+            batch = rows[offset : offset + 500]
             if dialect == "postgresql":
-                statement = pg_insert(VisionRow).values(**values)
+                statement = pg_insert(VisionRow).values(batch)
                 statement = statement.on_conflict_do_update(
                     index_elements=[VisionRow.dataset, VisionRow.event_time_ms, VisionRow.interval],
-                    set_=values,
+                    set_={key: getattr(statement.excluded, key) for key in batch[0]},
                 )
                 session.execute(statement)
             elif dialect == "sqlite":
-                statement = sqlite_insert(VisionRow).values(**values)
+                statement = sqlite_insert(VisionRow).values(batch)
                 statement = statement.on_conflict_do_update(
                     index_elements=[VisionRow.dataset, VisionRow.event_time_ms, VisionRow.interval],
-                    set_=values,
+                    set_={key: getattr(statement.excluded, key) for key in batch[0]},
                 )
                 session.execute(statement)
             else:
-                session.add(VisionRow(**values))
+                session.add_all(VisionRow(**values) for values in batch)
     return len(rows)
 
 
@@ -288,11 +297,23 @@ async def _download_csv(
     interval: str = "5m",
     period: str = "daily",
 ) -> tuple[str, list[list[str]]]:
+    url, rows, _ = await _download_archive_csv(dataset, key, interval, period)
+    return url, rows
+
+
+async def _download_archive_csv(
+    dataset: str,
+    key: str,
+    interval: str = "5m",
+    period: str = "daily",
+) -> tuple[str, list[list[str]], str]:
     url = archive_url(dataset, key, interval, period)
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
         response = await client.get(url)
         response.raise_for_status()
-    archive = zipfile.ZipFile(io.BytesIO(response.content))
+    archive_bytes = response.content
+    archive_hash = hashlib.sha256(archive_bytes).hexdigest()
+    archive = zipfile.ZipFile(io.BytesIO(archive_bytes))
     members = [name for name in archive.namelist() if name.lower().endswith(".csv")]
     if not members:
         raise RuntimeError(f"No CSV file found in {url}")
@@ -300,7 +321,7 @@ async def _download_csv(
     for member in members:
         text = io.TextIOWrapper(archive.open(member), encoding="utf-8")
         rows.extend(list(csv.reader(text)))
-    return url, rows
+    return url, rows, archive_hash
 
 
 def _parse_funding_rows(raw: list[list[str]]) -> list[dict[str, Any]]:
@@ -392,6 +413,267 @@ def _parse_funding_rows(raw: list[list[str]]) -> list[dict[str, Any]]:
     return parsed
 
 
+def _parse_metrics_rows(raw: list[list[str]]) -> list[dict[str, Any]]:
+    """Parse Binance's official five-minute futures metrics archive.
+
+    The archive is source-specific and is never blended into spot evidence.
+    Unknown/missing columns remain null rather than being inferred.
+    """
+    if not raw:
+        return []
+    header = {_normalise_header(cell): index for index, cell in enumerate(raw[0])}
+    required = {"createtime", "sumopeninterest", "sumopeninterestvalue"}
+    if not required.issubset(header):
+        return []
+
+    def value(fields: list[str], name: str) -> str | None:
+        index = header.get(name)
+        return fields[index] if index is not None and index < len(fields) else None
+
+    parsed: list[dict[str, Any]] = []
+    for fields in raw[1:]:
+        raw_time = value(fields, "createtime")
+        event_time = _timestamp_ms(raw_time)
+        if event_time is None and raw_time:
+            try:
+                parsed_time = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+                if parsed_time.tzinfo is None:
+                    parsed_time = parsed_time.replace(tzinfo=timezone.utc)
+                event_time = int(parsed_time.astimezone(timezone.utc).timestamp() * 1_000)
+            except (TypeError, ValueError, OSError):
+                event_time = None
+        if event_time is None:
+            continue
+        values = {
+            "openInterestTokens": _float(value(fields, "sumopeninterest")),
+            "openInterestUsd": _float(value(fields, "sumopeninterestvalue")),
+            "topAccountRatio": _float(value(fields, "counttoptraderlongshortratio")),
+            "topPositionRatio": _float(value(fields, "sumtoptraderlongshortratio")),
+            "globalLongShortRatio": _float(value(fields, "countlongshortratio")),
+            "takerRatio": _float(value(fields, "sumtakerlongshortvolratio")),
+        }
+        parsed.append(
+            {
+                "dataset": "metrics",
+                "event_time_ms": event_time,
+                "interval": "5m",
+                "open_price": None,
+                "high_price": None,
+                "low_price": None,
+                "close_price": None,
+                "volume": None,
+                "buy_notional_usd": None,
+                "sell_notional_usd": None,
+                "value": values["openInterestUsd"],
+                "payload_json": json_dumps({"raw": fields, "values": values}),
+                "historical_values": values,
+            }
+        )
+    return parsed
+
+
+async def backfill_metrics_day(day: str) -> dict[str, Any]:
+    """Backfill one completed day of official OI/position/taker metrics."""
+    parsed_day = date.fromisoformat(day)
+    if parsed_day >= datetime.now(timezone.utc).date():
+        raise ValueError("Binance daily archives are intended for completed UTC days")
+    start_at = datetime.combine(parsed_day, datetime.min.time(), tzinfo=timezone.utc)
+    end_at = start_at + timedelta(days=1)
+    range_state = begin_backfill_range(
+        {
+            "source": "Binance Vision",
+            "dataset": "metrics",
+            "symbol": SYMBOL,
+            "resolution": "5m",
+            "rangeStart": start_at.isoformat(),
+            "rangeEnd": end_at.isoformat(),
+        }
+    )
+    if range_state["alreadyComplete"]:
+        return {"day": day, "rows": 0, "checkpoint": range_state}
+    try:
+        url, raw, archive_hash = await _download_archive_csv("metrics", day, period="daily")
+        parsed = _parse_metrics_rows(raw)
+        if raw and not parsed:
+            raise ValueError("Binance metrics archive schema was not recognized")
+        legacy_rows = _upsert_rows(
+            [{key: value for key, value in row.items() if key != "historical_values"} for row in parsed]
+        )
+        retrieved_at = datetime.now(timezone.utc)
+        warehouse = persist_historical_observations(
+            {
+                "source": "Binance Vision",
+                "sourceType": "official_exchange_archive",
+                "exchange": "Binance Futures",
+                "symbol": SYMBOL,
+                "category": "futures",
+                "dataset": "metrics",
+                "resolution": "5m",
+                "observedAt": datetime.fromtimestamp(row["event_time_ms"] / 1000, tz=timezone.utc).isoformat(),
+                "retrievedAt": retrieved_at.isoformat(),
+                "reliabilityStatus": "primary_archive",
+                "validationStatus": "valid",
+                "values": row["historical_values"],
+                "provenance": {
+                    "archive": url,
+                    "archiveSha256": archive_hash,
+                    "immutableArchive": True,
+                },
+            }
+            for row in parsed
+        )
+        checkpoint = finish_backfill_range(
+            range_state["rangeId"],
+            status="complete",
+            rows_seen=len(parsed),
+            rows_stored=warehouse["rowsStored"],
+            archive_reference=url,
+            archive_hash=archive_hash,
+        )
+        return {
+            "day": day,
+            "url": url,
+            "rows": legacy_rows,
+            "warehouse": warehouse,
+            "checkpoint": checkpoint,
+        }
+    except Exception as exc:
+        status = (
+            "unavailable"
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404
+            else "failed"
+        )
+        finish_backfill_range(
+            range_state["rangeId"],
+            status=status,
+            rows_seen=0,
+            rows_stored=0,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return {"day": day, "error": f"{type(exc).__name__}: {exc}", "checkpointStatus": status}
+
+
+async def backfill_metrics_range(
+    start_day: str,
+    end_day: str,
+    *,
+    concurrency: int = 4,
+) -> dict[str, Any]:
+    """Bounded, restart-safe metrics backfill for an inclusive date range."""
+    start = date.fromisoformat(start_day)
+    end = date.fromisoformat(end_day)
+    if end < start:
+        raise ValueError("end_day must be on or after start_day")
+    if end >= datetime.now(timezone.utc).date():
+        raise ValueError("metrics range must contain completed UTC days only")
+    semaphore = asyncio.Semaphore(max(1, min(int(concurrency), 6)))
+
+    async def one(day_value: date) -> dict[str, Any]:
+        async with semaphore:
+            return await backfill_metrics_day(day_value.isoformat())
+
+    days = [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
+    results = await asyncio.gather(*(one(day_value) for day_value in days))
+    return {
+        "startDay": start_day,
+        "endDay": end_day,
+        "days": len(results),
+        "complete": sum("error" not in row for row in results),
+        "unavailable": sum(row.get("checkpointStatus") == "unavailable" for row in results),
+        "failed": sum("error" in row and row.get("checkpointStatus") != "unavailable" for row in results),
+        "rows": sum(int(row.get("rows") or 0) for row in results),
+        "errors": [row for row in results if "error" in row][:50],
+    }
+
+
+async def backfill_candle_month(month: str, interval: str = "5m") -> dict[str, Any]:
+    """Backfill completed monthly price archives with durable checkpoints."""
+    parsed_month = datetime.strptime(month, "%Y-%m").date().replace(day=1)
+    current_month = datetime.now(timezone.utc).date().replace(day=1)
+    if parsed_month >= current_month:
+        raise ValueError("Monthly archives are backfilled only for completed UTC months")
+    next_month = (parsed_month.replace(day=28) + timedelta(days=4)).replace(day=1)
+    start_at = datetime.combine(parsed_month, datetime.min.time(), tzinfo=timezone.utc)
+    end_at = datetime.combine(next_month, datetime.min.time(), tzinfo=timezone.utc)
+    result: dict[str, Any] = {"month": month, "interval": interval, "datasets": {}, "errors": {}}
+    for dataset in sorted(CANDLE_DATASETS):
+        range_state = begin_backfill_range(
+            {
+                "source": "Binance Vision",
+                "dataset": dataset,
+                "symbol": SYMBOL,
+                "resolution": interval,
+                "rangeStart": start_at.isoformat(),
+                "rangeEnd": end_at.isoformat(),
+            }
+        )
+        if range_state["alreadyComplete"]:
+            result["datasets"][dataset] = {"rows": 0, "checkpoint": range_state}
+            continue
+        try:
+            url, raw, archive_hash = await _download_archive_csv(dataset, month, interval, "monthly")
+            legacy = []
+            for fields in raw:
+                if len(fields) < 6:
+                    continue
+                event_time = _timestamp_ms(fields[0])
+                if event_time is None:
+                    continue
+                legacy.append(
+                    {
+                        "dataset": dataset,
+                        "event_time_ms": event_time,
+                        "interval": interval,
+                        "open_price": _float(fields[1]),
+                        "high_price": _float(fields[2]),
+                        "low_price": _float(fields[3]),
+                        "close_price": _float(fields[4]),
+                        "volume": _float(fields[5]),
+                        "buy_notional_usd": None,
+                        "sell_notional_usd": None,
+                        "value": None,
+                        "payload_json": json_dumps(fields),
+                    }
+                )
+            legacy_rows = _upsert_rows(legacy)
+            warehouse = import_binance_vision_candles(
+                raw,
+                dataset=dataset,
+                resolution=interval,
+                archive_reference=url,
+                archive_hash=archive_hash,
+            )
+            checkpoint = finish_backfill_range(
+                range_state["rangeId"],
+                status="complete",
+                rows_seen=len(legacy),
+                rows_stored=warehouse["rowsStored"],
+                archive_reference=url,
+                archive_hash=archive_hash,
+            )
+            result["datasets"][dataset] = {
+                "url": url,
+                "rows": legacy_rows,
+                "warehouse": warehouse,
+                "checkpoint": checkpoint,
+            }
+        except Exception as exc:
+            status = (
+                "unavailable"
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404
+                else "failed"
+            )
+            result["errors"][dataset] = f"{type(exc).__name__}: {exc}"
+            finish_backfill_range(
+                range_state["rangeId"],
+                status=status,
+                rows_seen=0,
+                rows_stored=0,
+                error=result["errors"][dataset],
+            )
+    return result
+
+
 async def backfill_month(month: str) -> dict[str, Any]:
     """Backfill the completed monthly Binance funding-rate archive."""
     parsed_month = datetime.strptime(month, "%Y-%m").date().replace(day=1)
@@ -410,13 +692,60 @@ async def backfill_month(month: str) -> dict[str, Any]:
     }
 
     try:
-        url, raw = await _download_csv("fundingRate", month, period="monthly")
+        range_state = begin_backfill_range(
+            {
+                "source": "Binance Vision",
+                "dataset": "fundingRate",
+                "symbol": SYMBOL,
+                "resolution": "funding",
+                "rangeStart": datetime.combine(parsed_month, datetime.min.time(), tzinfo=timezone.utc).isoformat(),
+                "rangeEnd": datetime.combine(next_month, datetime.min.time(), tzinfo=timezone.utc).isoformat(),
+            }
+        )
+        if range_state["alreadyComplete"]:
+            result.update({"rowsParsed": 0, "rowsStored": 0, "checkpoint": range_state})
+            return result
+        url, raw, archive_hash = await _download_archive_csv("fundingRate", month, period="monthly")
         rows = _parse_funding_rows(raw)
+        retrieved_at = datetime.now(timezone.utc)
+        warehouse = persist_historical_observations(
+            {
+                "source": "Binance Vision",
+                "sourceType": "official_exchange_archive",
+                "exchange": "Binance Futures",
+                "symbol": SYMBOL,
+                "category": "futures",
+                "dataset": "fundingRate",
+                "resolution": row["interval"],
+                "observedAt": datetime.fromtimestamp((_timestamp_ms(row["event_time_ms"]) or 0) / 1000, tz=timezone.utc).isoformat(),
+                "retrievedAt": retrieved_at.isoformat(),
+                "reliabilityStatus": "primary_archive",
+                "validationStatus": "valid",
+                "values": {"fundingRate": row["value"]},
+                "provenance": {
+                    "archive": url,
+                    "archiveSha256": archive_hash,
+                    "immutableArchive": True,
+                },
+            }
+            for row in rows
+            if _timestamp_ms(row["event_time_ms"]) is not None
+        )
+        checkpoint = finish_backfill_range(
+            range_state["rangeId"],
+            status="complete",
+            rows_seen=len(rows),
+            rows_stored=warehouse["rowsStored"],
+            archive_reference=url,
+            archive_hash=archive_hash,
+        )
         result.update(
             {
                 "url": url,
                 "rowsParsed": len(rows),
                 "rowsStored": _upsert_rows(rows),
+                "warehouse": warehouse,
+                "checkpoint": checkpoint,
                 "storedMonthCount": _stored_count(
                     "fundingRate",
                     start_ms,
@@ -443,8 +772,23 @@ async def backfill_day(day: str, interval: str = "5m") -> dict[str, Any]:
     }
 
     for dataset in sorted(CANDLE_DATASETS):
+        start_at = datetime.combine(parsed_day, datetime.min.time(), tzinfo=timezone.utc)
+        end_at = start_at + timedelta(days=1)
+        range_state = begin_backfill_range(
+            {
+                "source": "Binance Vision",
+                "dataset": dataset,
+                "symbol": SYMBOL,
+                "resolution": interval,
+                "rangeStart": start_at.isoformat(),
+                "rangeEnd": end_at.isoformat(),
+            }
+        )
+        if range_state["alreadyComplete"]:
+            results["datasets"][dataset] = {"rows": 0, "checkpoint": range_state}
+            continue
         try:
-            url, raw = await _download_csv(dataset, day, interval, "daily")
+            url, raw, archive_hash = await _download_archive_csv(dataset, day, interval, "daily")
             rows: list[dict[str, Any]] = []
             for fields in raw:
                 if len(fields) < 6:
@@ -468,14 +812,57 @@ async def backfill_day(day: str, interval: str = "5m") -> dict[str, Any]:
                         "payload_json": json_dumps(fields),
                     }
                 )
-            results["datasets"][dataset] = {"url": url, "rows": _upsert_rows(rows)}
+            legacy_rows = _upsert_rows(rows)
+            warehouse = import_binance_vision_candles(
+                raw,
+                dataset=dataset,
+                resolution=interval,
+                archive_reference=url,
+                archive_hash=archive_hash,
+            )
+            checkpoint = finish_backfill_range(
+                range_state["rangeId"],
+                status="complete",
+                rows_seen=len(rows),
+                rows_stored=warehouse["rowsStored"],
+                archive_reference=url,
+                archive_hash=archive_hash,
+            )
+            results["datasets"][dataset] = {
+                "url": url,
+                "rows": legacy_rows,
+                "warehouse": warehouse,
+                "checkpoint": checkpoint,
+            }
         except Exception as exc:
             results["errors"][dataset] = f"{type(exc).__name__}: {exc}"
+            finish_backfill_range(
+                range_state["rangeId"],
+                status="unavailable" if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404 else "failed",
+                rows_seen=0,
+                rows_stored=0,
+                error=results["errors"][dataset],
+            )
 
     # Aggregate aggTrades into 5-minute taker-flow buckets instead of storing
     # millions of individual historical trades.
+    agg_start = datetime.combine(parsed_day, datetime.min.time(), tzinfo=timezone.utc)
+    agg_end = agg_start + timedelta(days=1)
+    agg_range = begin_backfill_range(
+        {
+            "source": "Binance Vision",
+            "dataset": "aggTrades5m",
+            "symbol": SYMBOL,
+            "resolution": "5m",
+            "rangeStart": agg_start.isoformat(),
+            "rangeEnd": agg_end.isoformat(),
+        }
+    )
+    if agg_range["alreadyComplete"]:
+        results["datasets"]["aggTrades5m"] = {"rows": 0, "checkpoint": agg_range}
+        return results
     try:
-        url, raw = await _download_csv("aggTrades", day, interval, "daily")
+        url, raw, archive_hash = await _download_archive_csv("aggTrades", day, interval, "daily")
         buckets: dict[int, dict[str, float]] = defaultdict(
             lambda: {"buy": 0.0, "sell": 0.0, "qty": 0.0, "count": 0.0}
         )
@@ -514,9 +901,63 @@ async def backfill_day(day: str, interval: str = "5m") -> dict[str, Any]:
             }
             for bucket_ms, values in buckets.items()
         ]
-        results["datasets"]["aggTrades5m"] = {"url": url, "rows": _upsert_rows(rows)}
+        legacy_rows = _upsert_rows(rows)
+        retrieved_at = datetime.now(timezone.utc)
+        warehouse = persist_historical_observations(
+            {
+                "source": "Binance Vision",
+                "sourceType": "official_exchange_archive",
+                "exchange": "Binance Futures",
+                "symbol": SYMBOL,
+                "category": "futures",
+                "dataset": "aggTrades5m",
+                "resolution": "5m",
+                "observedAt": datetime.fromtimestamp(row["event_time_ms"] / 1000, tz=timezone.utc).isoformat(),
+                "retrievedAt": retrieved_at.isoformat(),
+                "reliabilityStatus": "primary_archive",
+                "validationStatus": "valid",
+                "values": {
+                    "baseVolume": row["volume"],
+                    "takerBuyQuote": row["buy_notional_usd"],
+                    "takerSellQuote": row["sell_notional_usd"],
+                    "tradeCount": row["value"],
+                    "takerRatio": (
+                        row["buy_notional_usd"] / row["sell_notional_usd"]
+                        if row["sell_notional_usd"] > 0 else None
+                    ),
+                },
+                "provenance": {
+                    "archive": url,
+                    "archiveSha256": archive_hash,
+                    "immutableArchive": True,
+                    "aggregation": "deterministic 5-minute taker buckets",
+                },
+            }
+            for row in rows
+        )
+        checkpoint = finish_backfill_range(
+            agg_range["rangeId"],
+            status="complete",
+            rows_seen=len(rows),
+            rows_stored=warehouse["rowsStored"],
+            archive_reference=url,
+            archive_hash=archive_hash,
+        )
+        results["datasets"]["aggTrades5m"] = {
+            "url": url,
+            "rows": legacy_rows,
+            "warehouse": warehouse,
+            "checkpoint": checkpoint,
+        }
     except Exception as exc:
         results["errors"]["aggTrades5m"] = f"{type(exc).__name__}: {exc}"
+        finish_backfill_range(
+            agg_range["rangeId"],
+            status="unavailable" if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404 else "failed",
+            rows_seen=0,
+            rows_stored=0,
+            error=results["errors"]["aggTrades5m"],
+        )
 
     return results
 
@@ -531,12 +972,15 @@ async def backfill_recent(days: int = 2, interval: str = "5m") -> dict[str, Any]
     days = min(max(days, 1), 31)
     today = datetime.now(timezone.utc).date()
     output = []
+    metrics = []
     for offset in range(days, 0, -1):
         completed_day = (today - timedelta(days=offset)).isoformat()
         output.append(await backfill_day(completed_day, interval))
+        metrics.append(await backfill_metrics_day(completed_day))
 
     funding_month = _previous_completed_month(today)
     return {
         "days": output,
+        "metrics": metrics,
         "funding": await backfill_month(funding_month),
     }
