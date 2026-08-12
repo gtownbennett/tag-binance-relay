@@ -655,6 +655,28 @@ def schedule_current_evidence_job(*, interval_seconds: int = 300) -> dict[str, A
 def claim_due_job(*, worker_id: str, lock_seconds: int = 120) -> dict[str, Any] | None:
     now = utc_now()
     with session_scope() as session:
+        # Do not let one expired, exhausted job starve every later job in the
+        # queue.  This is especially important for the deliberately long
+        # historical-maintenance lease: an interrupted worker must become a
+        # visible terminal failure and the scheduler must keep moving.
+        exhausted_query = select(ServerJobRow).where(
+            (ServerJobRow.status.in_(("pending", "retry")))
+            & (ServerJobRow.attempts >= ServerJobRow.max_attempts)
+            | (
+                (ServerJobRow.status == "running")
+                & (ServerJobRow.locked_until.is_not(None))
+                & (ServerJobRow.locked_until <= now)
+                & (ServerJobRow.attempts >= ServerJobRow.max_attempts)
+            )
+        )
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            exhausted_query = exhausted_query.with_for_update(skip_locked=True)
+        for exhausted in session.scalars(exhausted_query):
+            exhausted.status = "failed"
+            exhausted.locked_by = None
+            exhausted.locked_until = None
+            exhausted.updated_at = now
+            exhausted.last_error = exhausted.last_error or "Maximum attempts exhausted before claim."
         query = (
             select(ServerJobRow)
             .where(
@@ -664,7 +686,8 @@ def claim_due_job(*, worker_id: str, lock_seconds: int = 120) -> dict[str, Any] 
                     (ServerJobRow.status == "running")
                     & (ServerJobRow.locked_until.is_not(None))
                     & (ServerJobRow.locked_until <= now),
-                )
+                ),
+                ServerJobRow.attempts < ServerJobRow.max_attempts,
             )
             .order_by(ServerJobRow.available_at.asc(), ServerJobRow.created_at.asc())
             .limit(1)

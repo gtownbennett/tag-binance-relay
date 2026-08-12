@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -246,6 +246,33 @@ def test_historical_maintenance_gets_one_bounded_long_lease() -> None:
         row = session.get(ServerJobRow, job["jobId"])
         assert row is not None and row.locked_until is not None
         assert (row.locked_until - row.updated_at).total_seconds() >= 1_200
+
+
+def test_exhausted_expired_job_cannot_starve_later_due_work() -> None:
+    stranded = enqueue_job(
+        job_type="maintain_historical_memory",
+        idempotency_key="history:expired-exhausted",
+        max_attempts=1,
+    )
+    claimed = claim_due_job(worker_id="first-worker", lock_seconds=60)
+    assert claimed is not None and claimed["jobId"] == stranded["jobId"]
+    with session_scope() as session:
+        row = session.get(ServerJobRow, stranded["jobId"])
+        assert row is not None
+        row.locked_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    later = enqueue_job(
+        job_type="collect_canonical_evidence",
+        idempotency_key="collect:after-expired-history",
+    )
+
+    next_claim = claim_due_job(worker_id="second-worker", lock_seconds=60)
+    assert next_claim is not None and next_claim["jobId"] == later["jobId"]
+    with session_scope() as session:
+        row = session.get(ServerJobRow, stranded["jobId"])
+        assert row is not None
+        assert row.status == "failed"
+        assert row.locked_until is None
+        assert row.last_error == "Maximum attempts exhausted before claim."
 
 
 def test_helper_output_remains_non_authoritative_and_tracks_server_receipt() -> None:
