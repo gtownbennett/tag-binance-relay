@@ -117,3 +117,90 @@ def verified_tag_supply_payload(
         "verificationStatus": "verified",
         "verifiedAt": retrieved.isoformat(),
     }
+
+
+def verified_tag_supply_payload_from_cmc_and_dex(
+    *,
+    coinmarketcap: Mapping[str, Any],
+    dexscreener: Mapping[str, Any],
+    bsc_total_supply_hex: str,
+    retrieved_at: datetime | str,
+    unavailable_sources: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Verify supply when CoinGecko is explicitly unavailable, never by a hidden substitute.
+
+    DexScreener's market-cap field is provider-labelled rather than treated as an
+    on-chain supply fact.  Dividing it by that same response's current price is
+    therefore only accepted as an independent *cross-check* of CMC's stated
+    circulating supply, alongside the BSC totalSupply truth.
+    """
+
+    retrieved = _time(retrieved_at, "retrievedAt")
+    cmc_statistics = coinmarketcap.get("statistics") if isinstance(coinmarketcap.get("statistics"), Mapping) else {}
+    cmc_timestamp = _time(coinmarketcap.get("latestUpdateTime"), "CoinMarketCap latestUpdateTime")
+    if retrieved - cmc_timestamp > SUPPLY_SOURCE_MAX_AGE:
+        raise SupplyTruthError("circulating-supply source is stale")
+
+    on_chain_total = _total_from_rpc(bsc_total_supply_hex)
+    cmc_total = _number(cmc_statistics.get("totalSupply"), "CoinMarketCap totalSupply")
+    if abs(cmc_total - on_chain_total) > 0.5:
+        raise SupplyTruthError("provider total supply does not match BSC totalSupply")
+    if abs(on_chain_total - TAG_TOTAL_SUPPLY) > 0.5:
+        raise SupplyTruthError("unexpected TAG on-chain total supply")
+
+    pairs = dexscreener.get("pairs") if isinstance(dexscreener.get("pairs"), list) else []
+    pair = next(
+        (
+            item for item in pairs
+            if isinstance(item, Mapping)
+            and str(item.get("chainId") or "").lower() == "bsc"
+            and str(item.get("pairAddress") or "").lower() == "0xf0750c373ebbb3baeef7e03d8300caad1983d67c"
+            and str((item.get("baseToken") or {}).get("address") or "").lower() == TAG_CONTRACT
+        ),
+        None,
+    )
+    if not isinstance(pair, Mapping):
+        raise SupplyTruthError("canonical TAG DexScreener pair is unavailable")
+    dex_price = _number(pair.get("priceUsd"), "DexScreener priceUsd")
+    dex_market_cap = _number(pair.get("marketCap"), "DexScreener marketCap")
+    dex_implied_circulating = dex_market_cap / dex_price
+    cmc_circulating = _number(cmc_statistics.get("circulatingSupply"), "CoinMarketCap circulatingSupply")
+    if cmc_circulating > on_chain_total or dex_implied_circulating > on_chain_total:
+        raise SupplyTruthError("circulating supply cannot exceed total supply")
+    divergence = abs(cmc_circulating - dex_implied_circulating) / max(cmc_circulating, dex_implied_circulating)
+    if divergence > MAX_CIRCULATING_SOURCE_DIVERGENCE:
+        raise SupplyTruthError("circulating-supply sources materially conflict")
+
+    source_reference = json.dumps(
+        {
+            "method": "CoinMarketCap circulating estimate cross-checked against DexScreener provider-labelled marketCap/price and BSC totalSupply",
+            "contractAddress": TAG_CONTRACT,
+            "coinMarketCapCirculating": cmc_circulating,
+            "dexScreenerMarketCapUsd": dex_market_cap,
+            "dexScreenerPriceUsd": dex_price,
+            "dexScreenerImpliedCirculating": dex_implied_circulating,
+            "circulatingDivergencePct": round(divergence * 100, 6),
+            "bscTotalSupply": on_chain_total,
+            "coinMarketCapUpdatedAt": cmc_timestamp.isoformat(),
+            "retrievedAt": retrieved.isoformat(),
+            "unavailableSources": list(unavailable_sources),
+            "sources": [
+                "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger",
+                "https://api.dexscreener.com/latest/dex/pairs/bsc/0xf0750c373EbBB3BaEEF7e03D8300cAaD1983d67c",
+                "https://bsc-dataseed.binance.org/ eth_call totalSupply",
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "assetSymbol": "TAG",
+        "network": "BNB Smart Chain",
+        "contractAddress": TAG_CONTRACT,
+        "circulatingSupplyTokens": cmc_circulating,
+        "fullyDilutedSupplyTokens": on_chain_total,
+        "sourceName": "CoinMarketCap supply truth cross-checked by DexScreener market-cap/price and BSC totalSupply (CoinGecko unavailable)",
+        "sourceReference": source_reference,
+        "verificationStatus": "verified",
+        "verifiedAt": retrieved.isoformat(),
+    }

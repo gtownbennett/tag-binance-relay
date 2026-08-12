@@ -77,7 +77,11 @@ from app.canonical_forecast import (
     persist_canonical_forecast,
     persist_portfolio_position_snapshot,
 )
-from app.supply_truth import SupplyTruthError, verified_tag_supply_payload
+from app.supply_truth import (
+    SupplyTruthError,
+    verified_tag_supply_payload,
+    verified_tag_supply_payload_from_cmc_and_dex,
+)
 from app.phase3_learning import (
     Phase3ValidationError,
     active_alerts as phase3_active_alerts,
@@ -2193,7 +2197,7 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
         raise RuntimeError("HTTP client is unavailable")
 
     async def collect() -> dict[str, Any]:
-        coin_gecko_response, coin_market_cap_response, bsc_response = await asyncio.gather(
+        coin_gecko_response, coin_market_cap_response, bsc_response, dex_response = await asyncio.gather(
             http_client.get(
                 "https://api.coingecko.com/api/v3/coins/tagger",
                 params={
@@ -2218,16 +2222,31 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
                     ],
                 },
             ),
+            http_client.get(
+                f"{DEXSCREENER_BASE}/latest/dex/pairs/{DEX_CHAIN_ID}/{DEX_PAIR_ADDRESS}"
+            ),
         )
-        for response in (coin_gecko_response, coin_market_cap_response, bsc_response):
+        for response in (coin_market_cap_response, bsc_response, dex_response):
             response.raise_for_status()
         cmc_document = coin_market_cap_response.json()
-        payload = verified_tag_supply_payload(
-            coingecko=coin_gecko_response.json(),
-            coinmarketcap=cmc_document.get("data") if isinstance(cmc_document, dict) else {},
-            bsc_total_supply_hex=(bsc_response.json() or {}).get("result"),
-            retrieved_at=terminal_utc_now(),
-        )
+        cmc_payload = cmc_document.get("data") if isinstance(cmc_document, dict) else {}
+        bsc_total = (bsc_response.json() or {}).get("result")
+        retrieved_at = terminal_utc_now()
+        if coin_gecko_response.is_success:
+            payload = verified_tag_supply_payload(
+                coingecko=coin_gecko_response.json(),
+                coinmarketcap=cmc_payload,
+                bsc_total_supply_hex=bsc_total,
+                retrieved_at=retrieved_at,
+            )
+        else:
+            payload = verified_tag_supply_payload_from_cmc_and_dex(
+                coinmarketcap=cmc_payload,
+                dexscreener=dex_response.json(),
+                bsc_total_supply_hex=bsc_total,
+                retrieved_at=retrieved_at,
+                unavailable_sources=(f"CoinGecko HTTP {coin_gecko_response.status_code}",),
+            )
         stored = await asyncio.to_thread(persist_asset_truth_snapshot, payload)
         return {
             **stored,
