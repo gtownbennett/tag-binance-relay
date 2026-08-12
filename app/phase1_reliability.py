@@ -328,8 +328,30 @@ def build_canonical_evidence_packet(
         )
     )
 
-    items.extend(
-        (
+    cex_spot = market.get("cexSpot") if isinstance(market.get("cexSpot"), list) else []
+    configured_cex = 0
+    for row in cex_spot:
+        if not isinstance(row, dict) or not row.get("exchange"):
+            continue
+        configured_cex += 1
+        exchange = str(row["exchange"])
+        available_cex = bool(row.get("available")) and _finite(row.get("priceUsd")) is not None
+        items.append(_evidence_item(
+            source_id=f"cex-spot:{exchange.lower()}-tag-usdt",
+            source_name=f"{exchange} TAG/USDT spot",
+            source_type="cex_spot",
+            category="cex_spot",
+            symbol_identity="TAG/USDT spot",
+            payload={**row, "available": available_cex},
+            required_fields=("priceUsd", "volumeUsd24h"),
+            collector="official_public_spot_ticker",
+            transport="official public exchange API",
+            directness="direct",
+            server_now=now,
+            failure_reason=None if available_cex else str(row.get("failureReason") or "CEX spot collector unavailable"),
+        ))
+    if not configured_cex:
+        items.append(
             _unavailable_item(
                 source_id="cex-spot:verified-tag-usdt",
                 source_name="Verified CEX spot",
@@ -340,6 +362,9 @@ def build_canonical_evidence_packet(
                 failure_reason="No verified TAG CEX spot collector is configured; DEX spot remains separately labeled.",
                 server_now=now,
             ),
+        )
+    items.extend(
+        (
             _unavailable_item(
                 source_id="on-chain:bscscan",
                 source_name="BscScan",
