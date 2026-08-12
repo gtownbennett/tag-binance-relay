@@ -2508,11 +2508,11 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
         if not HISTORICAL_RESEARCH_ENABLED:
             return {"enabled": False, "reason": "historical_research_disabled", "automaticPaidAiCalls": 0}
         horizon = str((job.get("payload") or {}).get("horizon") or "")
-        return await asyncio.to_thread(run_bounded_production_research, horizons=(horizon,))
+        return await asyncio.to_thread(run_bounded_production_research, max_observations=20_000, horizons=(horizon,))
     if job_type == "run_bounded_predictive_tournament":
         if not HISTORICAL_RESEARCH_ENABLED:
             return {"enabled": False, "reason": "historical_research_disabled", "automaticPaidAiCalls": 0}
-        return await asyncio.to_thread(persist_bounded_predictive_study)
+        return await asyncio.to_thread(persist_bounded_predictive_study, max_rows=25_000)
     if job_type == "evaluate_event_driven_chad":
         return await evaluate_event_driven_chad()
     raise ValueError(f"Unsupported server job type: {job_type}")
@@ -2572,11 +2572,11 @@ async def phase1_job_loop() -> None:
                         await asyncio.to_thread(
                             enqueue_job,
                             job_type="run_bounded_forecast_research",
-                            # v4 supersedes the prior single-attempt v3 key.
+                            # v5 supersedes the prior single-attempt v3/v4 keys.
                             # Re-running is safe: research persistence is
                             # content-hash idempotent and the long lease now
                             # survives normal Render wake/deploy windows.
-                            idempotency_key=f"phase9-bounded-research-v4:{research_watermark}:{research_horizon}",
+                            idempotency_key=f"phase9-bounded-research-v5:{research_watermark}:{research_horizon}",
                             origin="server-scheduler",
                             payload={"historyWatermark": research_watermark, "horizon": research_horizon, "priority": "lowest"},
                             # Research is idempotent at the persisted run and
@@ -2612,6 +2612,9 @@ async def phase1_job_loop() -> None:
                     if job is None:
                         break
                     try:
+                        phase1_state["activeJob"] = {
+                            "jobId": job["jobId"], "jobType": job["jobType"], "startedAt": utc_iso(),
+                        }
                         result = await _run_claimed_phase1_job(job)
                         await asyncio.to_thread(complete_job, job["jobId"], result)
                         phase1_state["lastCompletedJob"] = {
@@ -2625,6 +2628,8 @@ async def phase1_job_loop() -> None:
                     except Exception as exc:
                         await asyncio.to_thread(fail_job, job["jobId"], exc)
                         phase1_state["lastError"] = f"{type(exc).__name__}: {str(exc)[:500]}"
+                    finally:
+                        phase1_state["activeJob"] = None
                     processed += 1
             except asyncio.CancelledError:
                 raise

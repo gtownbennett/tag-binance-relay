@@ -82,6 +82,9 @@ def setup_module() -> None:
 def test_phase1_server_loop_has_the_phase1_enqueue_job() -> None:
     """The live scheduler must enqueue its Phase 6 work without a NameError."""
     assert main.enqueue_job is enqueue_job
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    assert '"activeJob"' in source
+    assert "phase9-bounded-research-v5" in source
 
 
 def setup_function() -> None:
