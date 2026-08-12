@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import defer
 
 from app.terminal_database import (
     CanonicalEvidenceItemRow,
@@ -469,6 +470,14 @@ def _series_rows(
         return list(
             session.scalars(
                 select(HistoricalMarketRow)
+                .options(
+                    # Event reconstruction consumes timestamped numeric fields
+                    # and row keys, never the raw provenance/value blobs.
+                    # Deferring them avoids hydrating hundreds of MB when a
+                    # named episode spans many 5-minute observations.
+                    defer(HistoricalMarketRow.provenance_json),
+                    defer(HistoricalMarketRow.values_json),
+                )
                 .where(
                     HistoricalMarketRow.source == source,
                     HistoricalMarketRow.dataset == dataset,
