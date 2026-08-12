@@ -260,6 +260,132 @@ def persist_asset_truth_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {"stored": True, "deduplicated": False, "snapshotId": snapshot_id}
 
 
+def _current_dex_price(packet: Mapping[str, Any]) -> tuple[float, str] | None:
+    """Return an explicitly labelled current DEX price; never blend venues."""
+
+    items = packet.get("items") if isinstance(packet.get("items"), list) else []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("category") != "dex_spot" or item.get("validationStatus") in {"invalid", "unavailable"}:
+            continue
+        payload = item.get("payload") if isinstance(item.get("payload"), Mapping) else {}
+        try:
+            price = _finite_positive(payload.get("priceUsd"), "current DEX price")
+        except ForecastValidationError:
+            continue
+        return price, str(item.get("sourceId") or "dex_spot")
+    return None
+
+
+def _latest_verified_supply_snapshot() -> dict[str, Any] | None:
+    with session_scope() as session:
+        row = session.scalar(
+            select(AssetTruthSnapshotRow)
+            .where(
+                AssetTruthSnapshotRow.asset_symbol == "TAG",
+                AssetTruthSnapshotRow.verification_status == "verified",
+            )
+            .order_by(AssetTruthSnapshotRow.verified_at.desc(), AssetTruthSnapshotRow.created_at.desc())
+            .limit(1)
+        )
+        if row is None:
+            return None
+        return {
+            "snapshotId": row.snapshot_id,
+            "circulatingSupplyTokens": row.circulating_supply,
+            "fullyDilutedSupplyTokens": row.fully_diluted_supply,
+            "verificationStatus": row.verification_status,
+        }
+
+
+def issue_due_tagalysis_forecasts(*, now: datetime | str | None = None) -> dict[str, Any]:
+    """Issue due deterministic TAGalysis records from frozen server evidence only."""
+
+    from .phase1_reliability import latest_evidence_packet
+
+    issued = _parse_time(now or utc_now(), "issuedAt")
+    packet = latest_evidence_packet()
+    if packet is None:
+        return {"issued": 0, "skipped": len(HORIZON_SPECS), "reason": "no canonical evidence"}
+    supply = _latest_verified_supply_snapshot()
+    if supply is None:
+        return {
+            "issued": 0,
+            "skipped": len(HORIZON_SPECS),
+            "reason": "no verified persisted TAG circulating-supply snapshot",
+            "evidenceSnapshotId": packet.get("snapshotId"),
+        }
+    price_source = _current_dex_price(packet)
+    if price_source is None:
+        return {
+            "issued": 0,
+            "skipped": len(HORIZON_SPECS),
+            "reason": "no current validated DEX spot price; futures marks were not substituted",
+            "evidenceSnapshotId": packet.get("snapshotId"),
+        }
+
+    current_price, price_source_id = price_source
+    items = packet.get("items") if isinstance(packet.get("items"), list) else []
+    usable = [
+        item for item in items
+        if isinstance(item, Mapping) and item.get("validationStatus") not in {"invalid", "unavailable"}
+    ]
+    missing = sorted(
+        str(item.get("sourceId") or item.get("category") or "unknown")
+        for item in items
+        if isinstance(item, Mapping) and item.get("validationStatus") in {"invalid", "unavailable"}
+    )
+    freshness_values = [str(item.get("freshness") or "unavailable") for item in usable]
+    freshness_status = (
+        "stale" if any(value in {"stale", "unavailable"} for value in freshness_values)
+        else "warning" if any(value in {"warning", "degraded"} for value in freshness_values)
+        else "current"
+    )
+    source_availability = {
+        "availableCount": len(usable),
+        "totalCount": max(1, len(items)),
+        "missingSources": missing,
+    }
+    freshness = {"status": freshness_status, "oldestAgeSeconds": None, "staleSources": []}
+    base_features = {"evidenceReferences": [price_source_id]}
+    created: list[str] = []
+    skipped: list[str] = []
+    for horizon, spec in HORIZON_SPECS.items():
+        latest = latest_canonical_forecast(producer="tagalysis", horizon=horizon)
+        if latest is not None:
+            latest_issued = _parse_time(latest["issuedAt"], "issuedAt")
+            if issued < latest_issued + timedelta(minutes=spec.minutes):
+                skipped.append(horizon)
+                continue
+        record = build_tagalysis_forecast(
+            horizon=horizon,
+            evidence_snapshot_id=str(packet["snapshotId"]),
+            supply_snapshot=supply,
+            portfolio_snapshot=None,
+            current_price=current_price,
+            data_as_of=packet.get("dataAsOf") or packet.get("serverCreatedAt") or issued,
+            features=base_features,
+            source_availability=source_availability,
+            freshness=freshness,
+            issued_at=issued,
+        )
+        result = persist_canonical_forecast(record)
+        if result["stored"]:
+            created.append(horizon)
+        else:
+            skipped.append(horizon)
+    return {
+        "issued": len(created),
+        "horizons": created,
+        "skipped": skipped,
+        "evidenceSnapshotId": packet.get("snapshotId"),
+        "supplySnapshotId": supply["snapshotId"],
+        "priceSourceId": price_source_id,
+        "automaticPaidAiCalls": 0,
+    }
+
+
 def persist_portfolio_position_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
     quantity = _finite_nonnegative(payload.get("quantityTokens"), "quantityTokens")
     cost_basis = payload.get("costBasisUsd")

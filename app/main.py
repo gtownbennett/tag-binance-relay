@@ -71,11 +71,13 @@ from app.phase1_reliability import (
 from app.canonical_forecast import (
     ForecastValidationError,
     format_canonical_forecast,
+    issue_due_tagalysis_forecasts,
     latest_canonical_forecast,
     persist_asset_truth_snapshot,
     persist_canonical_forecast,
     persist_portfolio_position_snapshot,
 )
+from app.supply_truth import SupplyTruthError, verified_tag_supply_payload
 from app.phase3_learning import (
     Phase3ValidationError,
     active_alerts as phase3_active_alerts,
@@ -2184,6 +2186,62 @@ async def collect_canonical_evidence_once() -> dict[str, Any]:
     return {**result, "coalesced": coalesced}
 
 
+async def collect_verified_tag_supply_once() -> dict[str, Any]:
+    """Persist current TAG supply only after independent public-source checks."""
+
+    if http_client is None:
+        raise RuntimeError("HTTP client is unavailable")
+
+    async def collect() -> dict[str, Any]:
+        coin_gecko_response, coin_market_cap_response, bsc_response = await asyncio.gather(
+            http_client.get(
+                "https://api.coingecko.com/api/v3/coins/tagger",
+                params={
+                    "localization": "false",
+                    "tickers": "false",
+                    "market_data": "true",
+                    "community_data": "false",
+                    "developer_data": "false",
+                    "sparkline": "false",
+                },
+            ),
+            http_client.get("https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger"),
+            http_client.post(
+                "https://bsc-dataseed.binance.org/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_call",
+                    "params": [
+                        {"to": "0x208bf3e7da9639f1eaefa2de78c23396b0682025", "data": "0x18160ddd"},
+                        "latest",
+                    ],
+                },
+            ),
+        )
+        for response in (coin_gecko_response, coin_market_cap_response, bsc_response):
+            response.raise_for_status()
+        cmc_document = coin_market_cap_response.json()
+        payload = verified_tag_supply_payload(
+            coingecko=coin_gecko_response.json(),
+            coinmarketcap=cmc_document.get("data") if isinstance(cmc_document, dict) else {},
+            bsc_total_supply_hex=(bsc_response.json() or {}).get("result"),
+            retrieved_at=terminal_utc_now(),
+        )
+        stored = await asyncio.to_thread(persist_asset_truth_snapshot, payload)
+        return {
+            **stored,
+            "source": "cross-checked-public-supply-truth",
+            "automaticPaidAiCalls": 0,
+        }
+
+    try:
+        return await bounded_retry(collect, attempts=2)
+    except SupplyTruthError as exc:
+        # A failed source is visible and leaves existing verified truth intact.
+        return {"stored": False, "verified": False, "reason": str(exc), "automaticPaidAiCalls": 0}
+
+
 async def evaluate_event_driven_chad() -> dict[str, Any]:
     """Evaluate deterministic major-event gates; never call Chad for ordinary noise."""
 
@@ -2394,6 +2452,11 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
     job_type = str(job.get("jobType") or "")
     if job_type == "collect_canonical_evidence":
         return await collect_canonical_evidence_once()
+    if job_type == "collect_verified_tag_supply":
+        return await collect_verified_tag_supply_once()
+    if job_type == "issue_due_tagalysis_forecasts":
+        # Deterministic server-side TAGalysis issuance has no Chad/OpenAI path.
+        return await asyncio.to_thread(issue_due_tagalysis_forecasts)
     if job_type == "validate_helper_candidate":
         candidate_id = str((job.get("payload") or {}).get("candidateId") or "")
         if not candidate_id:
@@ -2432,6 +2495,24 @@ async def phase1_job_loop() -> None:
                 await asyncio.to_thread(
                     schedule_current_evidence_job,
                     interval_seconds=COLLECT_SECONDS,
+                )
+                supply_bucket = int(time.time()) // 3_600 * 3_600
+                await asyncio.to_thread(
+                    enqueue_job,
+                    job_type="collect_verified_tag_supply",
+                    idempotency_key=f"collect-verified-tag-supply:{supply_bucket}",
+                    origin="server-scheduler",
+                    payload={"bucket": supply_bucket},
+                    max_attempts=2,
+                )
+                forecast_bucket = int(time.time()) // max(300, COLLECT_SECONDS) * max(300, COLLECT_SECONDS)
+                await asyncio.to_thread(
+                    enqueue_job,
+                    job_type="issue_due_tagalysis_forecasts",
+                    idempotency_key=f"issue-tagalysis-forecasts:{forecast_bucket}",
+                    origin="server-scheduler",
+                    payload={"bucket": forecast_bucket},
+                    max_attempts=2,
                 )
                 await asyncio.to_thread(
                     enqueue_phase3_jobs,
