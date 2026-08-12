@@ -29,6 +29,7 @@ from app.historical_memory import (
     TAG_CONTRACT,
     HistoricalMemoryError,
     _historical_signal_features_at,
+    _bounded_detection_plan,
     begin_backfill_range,
     build_coverage_report,
     chad_history_evidence_package,
@@ -698,6 +699,30 @@ def test_compact_production_summary_uses_persisted_metadata_not_raw_history() ->
     assert summary["replayRuns"][0]["noLookahead"] is True
     assert summary["sideEffects"] == "none"
     assert "rows" not in summary
+
+
+def test_maintenance_detector_plan_is_source_bounded_and_incremental() -> None:
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    persist_historical_observations(_series(start, [0.001, 0.00101, 0.00102, 0.00103, 0.00104]))
+    persist_event_version(
+        _event(
+            "detector-fixture",
+            start,
+            start + timedelta(minutes=10),
+            feature=0.2,
+        )
+    )
+    caught_up = _bounded_detection_plan()
+    assert caught_up["ready"] is False
+    assert caught_up["reason"] == "no new source coverage beyond the detector overlap"
+
+    persist_historical_observations(
+        [_observation(start + timedelta(hours=3), 0.0012)]
+    )
+    incremental = _bounded_detection_plan()
+    assert incremental["ready"] is True
+    assert incremental["sourceDataThrough"].startswith("2026-08-01T03:00:00")
+    assert incremental["start"].startswith("2026-07-31T18:10:00")
 
 
 def _auto_payload(event_key: str = "panic-1", evidence: str = "a" * 64) -> dict:

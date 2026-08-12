@@ -2021,19 +2021,75 @@ def run_walk_forward_analog_validation(
     }
 
 
+def _bounded_detection_plan() -> dict[str, Any]:
+    """Choose an incremental, source-bounded detector window.
+
+    Historical maintenance must never scan an arbitrary wall-clock month when
+    the archive itself has not advanced.  A small overlap permits revisions at
+    the edge while the latest detected event acts as a lightweight durable
+    checkpoint without inventing a second mutable event store.
+    """
+    with session_scope() as session:
+        source_through = session.scalar(
+            select(func.max(HistoricalMarketRow.observed_at)).where(
+                HistoricalMarketRow.source == "Binance Vision",
+                HistoricalMarketRow.dataset == "klines",
+                HistoricalMarketRow.resolution == "5m",
+            )
+        )
+        detected_through = session.scalar(
+            select(func.max(HistoricalEventVersionRow.end_at)).where(
+                HistoricalEventVersionRow.event_key.not_in([row[0] for row in KNOWN_EPISODES])
+            )
+        )
+    if source_through is None:
+        return {"ready": False, "reason": "no Binance Vision 5m source rows are available"}
+    source_through = _aware(source_through)
+    checkpoint = _aware(detected_through) if detected_through is not None else None
+    # Detector events can end shortly before the last candle.  Reprocessing
+    # less than one hour is needless churn, while a wider new gap gets a
+    # bounded 48h lookback with a six-hour overlap for edge continuity.
+    if checkpoint is not None and source_through <= checkpoint + timedelta(hours=1):
+        return {
+            "ready": False,
+            "reason": "no new source coverage beyond the detector overlap",
+            "sourceDataThrough": source_through.isoformat(),
+            "detectionCheckpointEnd": checkpoint.isoformat(),
+        }
+    start = max(
+        source_through - timedelta(days=2),
+        checkpoint - timedelta(hours=6) if checkpoint is not None else source_through - timedelta(days=2),
+    )
+    return {
+        "ready": True,
+        "sourceDataThrough": source_through.isoformat(),
+        "detectionCheckpointEnd": checkpoint.isoformat() if checkpoint is not None else None,
+        "start": start.isoformat(),
+        "end": (source_through + timedelta(minutes=5)).isoformat(),
+    }
+
+
 def historical_maintenance(*, include_recent_detection: bool = True) -> dict[str, Any]:
-    now = utc_now()
+    plan = _bounded_detection_plan()
     automatic = (
         detect_and_persist_events(
             source="Binance Vision",
             dataset="klines",
             resolution="5m",
-            start=now - timedelta(days=30),
-            end=now + timedelta(minutes=5),
-            as_of=now,
+            start=_time(plan["start"], "detector start"),
+            end=_time(plan["end"], "detector end"),
+            as_of=_time(plan["sourceDataThrough"], "detector sourceDataThrough"),
         )
-        if include_recent_detection
-        else {"detected": 0, "stored": 0, "deduplicated": 0, "eventVersionIds": [], "skipped": "import activation"}
+        if include_recent_detection and plan["ready"]
+        else {
+            "detected": 0,
+            "stored": 0,
+            "deduplicated": 0,
+            "eventVersionIds": [],
+            "skipped": "import activation" if not include_recent_detection else plan["reason"],
+            "sourceDataThrough": plan.get("sourceDataThrough"),
+            "detectionCheckpointEnd": plan.get("detectionCheckpointEnd"),
+        }
     )
     named = [reconstruct_named_episode(definition[0]) for definition in KNOWN_EPISODES]
     coverage = build_coverage_report(persist=True)
