@@ -71,7 +71,6 @@ from app.phase1_reliability import (
 from app.canonical_forecast import (
     ForecastValidationError,
     format_canonical_forecast,
-    issue_due_tagalysis_forecasts,
     latest_canonical_forecast,
     persist_asset_truth_snapshot,
     persist_canonical_forecast,
@@ -2395,9 +2394,6 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
     job_type = str(job.get("jobType") or "")
     if job_type == "collect_canonical_evidence":
         return await collect_canonical_evidence_once()
-    if job_type == "issue_due_tagalysis_forecasts":
-        # Deterministic server-side TAGalysis issuance has no Chad/OpenAI path.
-        return await asyncio.to_thread(issue_due_tagalysis_forecasts)
     if job_type == "validate_helper_candidate":
         candidate_id = str((job.get("payload") or {}).get("candidateId") or "")
         if not candidate_id:
@@ -2436,15 +2432,6 @@ async def phase1_job_loop() -> None:
                 await asyncio.to_thread(
                     schedule_current_evidence_job,
                     interval_seconds=COLLECT_SECONDS,
-                )
-                forecast_bucket = int(time.time()) // max(300, COLLECT_SECONDS) * max(300, COLLECT_SECONDS)
-                await asyncio.to_thread(
-                    enqueue_job,
-                    job_type="issue_due_tagalysis_forecasts",
-                    idempotency_key=f"issue-tagalysis-forecasts:{forecast_bucket}",
-                    origin="server-scheduler",
-                    payload={"bucket": forecast_bucket},
-                    max_attempts=2,
                 )
                 await asyncio.to_thread(
                     enqueue_phase3_jobs,

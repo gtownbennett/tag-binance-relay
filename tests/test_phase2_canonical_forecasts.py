@@ -17,7 +17,6 @@ from app.canonical_forecast import (
     canonicalize_forecast,
     forecast_freshness,
     format_canonical_forecast,
-    issue_due_tagalysis_forecasts,
     latest_canonical_forecast,
     persist_asset_truth_snapshot,
     persist_canonical_forecast,
@@ -188,25 +187,6 @@ def test_schema_is_immutable_deduplicated_and_preserves_revisions() -> None:
         ).all()
     assert [row.forecast_id for row in rows] == [first["forecastId"], revision["forecastId"]]
     assert rows[1].revision_parent_id == first["forecastId"]
-
-
-def test_server_scheduler_issues_only_deterministic_tagalysis_records_after_verified_supply() -> None:
-    packet = build_canonical_evidence_packet(_market_fixture(), server_now=NOW)
-    persist_evidence_packet(packet)
-
-    blocked = issue_due_tagalysis_forecasts(now=NOW + timedelta(minutes=1))
-    assert blocked["issued"] == 0
-    assert "verified persisted TAG circulating-supply" in blocked["reason"]
-
-    persist_asset_truth_snapshot(_supply_payload())
-    issued = issue_due_tagalysis_forecasts(now=NOW + timedelta(minutes=1))
-    assert set(issued["horizons"]) == set(HORIZON_SPECS)
-    assert issued["automaticPaidAiCalls"] == 0
-    with session_scope() as session:
-        rows = session.scalars(select(CanonicalForecastRow)).all()
-    assert len(rows) == len(HORIZON_SPECS)
-    assert {row.producer for row in rows} == {"tagalysis"}
-    assert {row.evidence_snapshot_id for row in rows} == {packet["snapshotId"]}
 
 
 def test_all_six_producers_are_separate_and_deterministic_builder_cannot_impersonate_chad() -> None:
