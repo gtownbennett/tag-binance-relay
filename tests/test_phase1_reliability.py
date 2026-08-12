@@ -235,6 +235,19 @@ def test_jobs_are_idempotent_locked_and_completed_exactly_once() -> None:
         assert row.attempts == 1
 
 
+def test_historical_maintenance_gets_one_bounded_long_lease() -> None:
+    job = enqueue_job(
+        job_type="maintain_historical_memory",
+        idempotency_key="history:bounded-lease",
+    )
+    claimed = claim_due_job(worker_id="history-worker", lock_seconds=60)
+    assert claimed is not None and claimed["jobId"] == job["jobId"]
+    with session_scope() as session:
+        row = session.get(ServerJobRow, job["jobId"])
+        assert row is not None and row.locked_until is not None
+        assert (row.locked_until - row.updated_at).total_seconds() >= 1_200
+
+
 def test_helper_output_remains_non_authoritative_and_tracks_server_receipt() -> None:
     packet = build_canonical_evidence_packet(_market_fixture())
     persist_evidence_packet(packet)

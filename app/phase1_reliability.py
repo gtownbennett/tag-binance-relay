@@ -681,7 +681,14 @@ def claim_due_job(*, worker_id: str, lock_seconds: int = 120) -> dict[str, Any] 
             return None
         row.status = "running"
         row.locked_by = worker_id
-        row.locked_until = now + timedelta(seconds=max(30, int(lock_seconds)))
+        # A production historical pass reads a 1.5 GB immutable warehouse and
+        # deliberately uses one worker.  Its lease must outlast that bounded
+        # maintenance transaction, otherwise a second worker can duplicate
+        # costly work after five minutes.  This changes no retry count.
+        effective_lock_seconds = max(30, int(lock_seconds))
+        if row.job_type == "maintain_historical_memory":
+            effective_lock_seconds = max(effective_lock_seconds, 1_200)
+        row.locked_until = now + timedelta(seconds=effective_lock_seconds)
         row.attempts += 1
         row.updated_at = now
         session.flush()
