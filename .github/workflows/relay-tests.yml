@@ -31,10 +31,10 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt "pytest>=8,<9"
 
       - name: Compile Python
         run: python -m compileall -q app
 
       - name: Run unit tests
-        run: python -m unittest discover -s tests -v
+        run: python -m pytest -q
