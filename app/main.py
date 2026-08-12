@@ -59,6 +59,7 @@ from app.phase1_reliability import (
     cache_put as phase1_cache_put,
     claim_due_job,
     complete_job,
+    enqueue_job,
     fail_job,
     latest_evidence_packet,
     persist_evidence_packet,

@@ -78,6 +78,11 @@ def setup_module() -> None:
     init_db()
 
 
+def test_phase1_server_loop_has_the_phase1_enqueue_job() -> None:
+    """The live scheduler must enqueue its Phase 6 work without a NameError."""
+    assert main.enqueue_job is enqueue_job
+
+
 def setup_function() -> None:
     with session_scope() as session:
         for model in (
