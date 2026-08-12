@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -147,6 +148,42 @@ def test_packet_hash_deduplicates_and_server_store_is_authoritative() -> None:
     assert latest is not None
     assert latest["storage"]["authoritative"] is True
     assert latest["storage"]["backend"] == "server-postgresql"
+
+
+def test_evidence_snapshot_is_flushed_before_fk_children_are_added() -> None:
+    """Protect the immediate FK order required by production PostgreSQL."""
+
+    packet = build_canonical_evidence_packet(_market_fixture())
+
+    class FkOrderingSession:
+        def __init__(self) -> None:
+            self.parent_added = False
+            self.parent_flushed = False
+
+        def scalar(self, _statement: object) -> None:
+            return None
+
+        def add(self, row: object) -> None:
+            if isinstance(row, CanonicalEvidenceSnapshotRow):
+                self.parent_added = True
+            elif isinstance(row, CanonicalEvidenceItemRow):
+                assert self.parent_added and self.parent_flushed
+
+        def flush(self) -> None:
+            assert self.parent_added
+            self.parent_flushed = True
+
+    fake_session = FkOrderingSession()
+
+    @contextmanager
+    def fk_ordering_scope():
+        yield fake_session
+
+    with patch("app.phase1_reliability.session_scope", fk_ordering_scope):
+        result = persist_evidence_packet(packet)
+
+    assert result["stored"] is True
+    assert fake_session.parent_flushed is True
 
 
 def test_failed_wake_keeps_last_usable_server_packet() -> None:

@@ -459,6 +459,12 @@ def persist_evidence_packet(packet: dict[str, Any]) -> dict[str, Any]:
                 payload_json=json_dumps(packet),
             )
         )
+        # The child model intentionally has no ORM relationship so its
+        # provenance remains fully immutable.  Flush the parent explicitly:
+        # PostgreSQL enforces the foreign key immediately and otherwise may
+        # receive evidence items before their snapshot in the same unit of
+        # work.
+        session.flush()
         for item in items:
             if not isinstance(item, dict):
                 continue
