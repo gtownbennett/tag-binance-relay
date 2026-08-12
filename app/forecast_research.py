@@ -127,6 +127,45 @@ def online_regime(features: Mapping[str, float]) -> dict[str, Any]:
     return {"label": name, "onlineConfidence": confidence, "reasons": reasons, "noLookahead": True}
 
 
+def confirmed_online_regime_sequence(
+    observations: Sequence[Mapping[str, Any]], *, confirmations: int = 2,
+) -> list[dict[str, Any]]:
+    """Emit regime transitions only after consecutive forecast-time evidence.
+
+    `effectiveFrom` retains the first confirming observation for audit, while
+    `detectedAt` is the later confirmation time.  Consumers must use
+    `detectedAt`, never backfill the confirmed state into earlier forecasts.
+    """
+    if confirmations < 1:
+        raise ResearchValidationError("regime confirmations must be positive")
+    pending_label: str | None = None
+    pending_started: datetime | None = None
+    pending_count = 0
+    active_label: str | None = None
+    emitted: list[dict[str, Any]] = []
+    for row in sorted(observations, key=lambda value: _time(value.get("observedAt"), "observedAt")):
+        observed_at = _time(row.get("observedAt"), "observedAt")
+        regime = online_regime(row.get("features") if isinstance(row.get("features"), Mapping) else {})
+        label = regime["label"]
+        if label == active_label:
+            pending_label, pending_started, pending_count = None, None, 0
+            continue
+        if label == pending_label:
+            pending_count += 1
+        else:
+            pending_label, pending_started, pending_count = label, observed_at, 1
+        if pending_count >= confirmations:
+            emitted.append({
+                "onlineLabel": label, "previousOnlineLabel": active_label,
+                "effectiveFrom": pending_started.isoformat() if pending_started else observed_at.isoformat(),
+                "detectedAt": observed_at.isoformat(), "onlineConfidence": regime["onlineConfidence"],
+                "reasons": regime["reasons"], "noLookahead": True,
+            })
+            active_label = label
+            pending_label, pending_started, pending_count = None, None, 0
+    return emitted
+
+
 def purged_embargoed_cases(
     cutoffs: Iterable[datetime | str], *, horizon: timedelta, embargo: timedelta | None = None
 ) -> dict[str, Any]:

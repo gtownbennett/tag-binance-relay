@@ -5,6 +5,7 @@ import pytest
 from app.forecast_research import (
     ResearchValidationError,
     deterministic_replay,
+    confirmed_online_regime_sequence,
     generic_ai_benchmark_status,
     online_regime,
     outcome_distribution,
@@ -44,6 +45,19 @@ def test_online_regime_is_explainable_and_forecast_time_safe() -> None:
     regime = online_regime({"oiChange": 0.6, "spotConfirmation": 0.5, "realizedVolatility": 0.3})
     assert regime["label"] == "SPOT_CONFIRMED_LEVERAGE"
     assert regime["noLookahead"] is True
+
+
+def test_online_regime_requires_confirmation_without_backdating_detection() -> None:
+    rows = [
+        {"observedAt": NOW.isoformat(), "features": {"oiChange": 0.0}},
+        {"observedAt": (NOW + timedelta(hours=1)).isoformat(), "features": {"oiChange": 0.6}},
+        {"observedAt": (NOW + timedelta(hours=2)).isoformat(), "features": {"oiChange": 0.6}},
+    ]
+    transitions = confirmed_online_regime_sequence(rows, confirmations=2)
+    assert transitions[-1]["onlineLabel"] == "LEVERAGE_ONLY_EXPANSION"
+    assert transitions[-1]["effectiveFrom"] == rows[1]["observedAt"]
+    assert transitions[-1]["detectedAt"] == rows[2]["observedAt"]
+    assert transitions[-1]["noLookahead"] is True
 
 
 def test_purged_embargoed_cases_reports_effective_sample_count() -> None:
