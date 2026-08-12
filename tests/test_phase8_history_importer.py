@@ -19,6 +19,12 @@ sys.modules[SPEC.name] = IMPORTER
 SPEC.loader.exec_module(IMPORTER)
 
 
+requires_validated_warehouse = pytest.mark.skipif(
+    not IMPORTER.WAREHOUSE.is_file(),
+    reason="Validated Phase 6 warehouse is a protected external artifact, not a Git-tracked CI fixture.",
+)
+
+
 def test_importer_requires_direct_tls_least_privilege_uri(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(
         "TAGALYSIS_HISTORY_IMPORT_URL",
@@ -55,6 +61,7 @@ def test_importer_only_targets_phase6_history_tables() -> None:
         assert batch_statement.count("%s") == len(IMPORTER.TABLES[table][1]) * 2
 
 
+@requires_validated_warehouse
 def test_validated_warehouse_is_the_expected_single_source() -> None:
     with IMPORTER.warehouse_connection() as warehouse:
         assert IMPORTER.warehouse_count(warehouse, "historical_market_rows") == 560_922
@@ -64,6 +71,7 @@ def test_validated_warehouse_is_the_expected_single_source() -> None:
     }
 
 
+@requires_validated_warehouse
 def test_resume_cursor_reads_only_rows_after_the_last_committed_key() -> None:
     with IMPORTER.warehouse_connection() as warehouse:
         last_key = warehouse.execute(
@@ -78,6 +86,7 @@ def test_resume_cursor_reads_only_rows_after_the_last_committed_key() -> None:
     assert next_row["source_row_key"] > first_key
 
 
+@requires_validated_warehouse
 def test_sample_rows_never_advance_the_full_import_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeCursor:
         def __enter__(self) -> "FakeCursor":
@@ -114,6 +123,7 @@ def test_sample_rows_never_advance_the_full_import_checkpoint(monkeypatch: pytes
     assert checkpoints == []
 
 
+@requires_validated_warehouse
 def test_full_batch_checkpoint_uses_the_batch_final_key(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeCursor:
         def __enter__(self) -> "FakeCursor":
