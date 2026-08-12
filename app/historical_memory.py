@@ -1932,15 +1932,19 @@ def run_walk_forward_analog_validation(
     }
 
 
-def historical_maintenance() -> dict[str, Any]:
+def historical_maintenance(*, include_recent_detection: bool = True) -> dict[str, Any]:
     now = utc_now()
-    automatic = detect_and_persist_events(
-        source="Binance Vision",
-        dataset="klines",
-        resolution="5m",
-        start=now - timedelta(days=30),
-        end=now + timedelta(minutes=5),
-        as_of=now,
+    automatic = (
+        detect_and_persist_events(
+            source="Binance Vision",
+            dataset="klines",
+            resolution="5m",
+            start=now - timedelta(days=30),
+            end=now + timedelta(minutes=5),
+            as_of=now,
+        )
+        if include_recent_detection
+        else {"detected": 0, "stored": 0, "deduplicated": 0, "eventVersionIds": [], "skipped": "import activation"}
     )
     named = [reconstruct_named_episode(definition[0]) for definition in KNOWN_EPISODES]
     coverage = build_coverage_report(persist=True)

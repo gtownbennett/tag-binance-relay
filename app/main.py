@@ -2495,7 +2495,10 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
         }
         if BACKFILL_ENABLED and not REPAIR_MODE:
             archive_catch_up["result"] = await terminal_backfill_recent(2, "5m")
-        maintenance = await asyncio.to_thread(historical_maintenance)
+        maintenance = await asyncio.to_thread(
+            historical_maintenance,
+            include_recent_detection=not bool((job.get("payload") or {}).get("importActivation")),
+        )
         return {**maintenance, "archiveCatchUp": archive_catch_up}
     if job_type == "evaluate_event_driven_chad":
         return await evaluate_event_driven_chad()
