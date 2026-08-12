@@ -178,6 +178,79 @@ def _normalized_probabilities(values: list[float]) -> list[float]:
     return result
 
 
+def deterministic_horizon_projection(
+    *,
+    horizon: str,
+    current_price: float,
+    features: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Evaluate the deterministic TAGalysis horizon formula without storage.
+
+    This is deliberately the same scoring path used by canonical issuance.  It
+    lets a research replay exercise the real deterministic model against a
+    frozen historical feature vector without creating fake LIVE forecasts,
+    evidence snapshots, or grades.
+    """
+    canonical_horizon = "3m" if horizon.strip().lower() == "90d" else horizon.strip().lower()
+    spec = HORIZON_SPECS.get(canonical_horizon)
+    if spec is None:
+        raise ForecastValidationError(f"unsupported horizon: {horizon}")
+    price = _finite_positive(current_price, "currentPriceUsd")
+    values: dict[str, float] = {}
+    for name in spec.required_features:
+        raw = features.get(name)
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            values[name] = max(-1.0, min(1.0, parsed))
+    missing_fields = sorted(set(spec.required_features) - set(values))
+    completeness = len(values) / len(spec.required_features) * 100.0
+    weighted = sum(values.get(name, 0.0) * weight for name, weight in spec.weights)
+    weight_total = sum(abs(weight) for name, weight in spec.weights if name in values)
+    score = weighted / weight_total if weight_total else 0.0
+    volatility = features.get(spec.volatility_key)
+    explicit_volatility_fallback = False
+    try:
+        volatility_pct = float(volatility)
+        if not math.isfinite(volatility_pct) or volatility_pct <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        volatility_pct = spec.fallback_volatility_pct
+        explicit_volatility_fallback = True
+        missing_fields.append(spec.volatility_key)
+    dispersion_pct = min(spec.drift_cap_pct * 1.5, volatility_pct)
+    p50_return_pct = math.tanh(score) * spec.drift_cap_pct * (completeness / 100.0) * 0.72
+    p50 = price * (1.0 + p50_return_pct / 100.0)
+    sideways_weight = max(0.12, 0.54 - abs(score) * 0.34)
+    up_weight = max(0.05, 0.23 + score * 0.30)
+    down_weight = max(0.05, 0.23 - score * 0.30)
+    up, sideways, down = _normalized_probabilities([up_weight, sideways_weight, down_weight])
+    point_return_pct = p50_return_pct + (up - down) * dispersion_pct * 0.10
+    point = price * (1.0 + point_return_pct / 100.0)
+    downside_skew = 1.0 + max(0.0, down - up) * 0.45
+    upside_skew = 1.0 + max(0.0, up - down) * 0.45
+    q10 = max(p50 * (1.0 - dispersion_pct / 100.0 * downside_skew), price * 0.05)
+    q90 = p50 * (1.0 + dispersion_pct / 100.0 * upside_skew)
+    return {
+        "horizon": canonical_horizon,
+        "score": score,
+        "values": values,
+        "missingFields": sorted(set(missing_fields)),
+        "completenessPct": completeness,
+        "volatilityPct": volatility_pct,
+        "volatilityFallbackExplicit": explicit_volatility_fallback,
+        "pointForecastUsd": point,
+        "p50Usd": p50,
+        "q10Usd": q10,
+        "q90Usd": q90,
+        "probabilityUp": up,
+        "probabilitySideways": sideways,
+        "probabilityDown": down,
+    }
+
+
 def direction_from_probabilities(
     probabilities: Mapping[str, Any],
     *,
@@ -586,30 +659,17 @@ def build_tagalysis_forecast(
         if portfolio_snapshot.get("costBasisUsd") is not None:
             cost_basis = _finite_nonnegative(portfolio_snapshot.get("costBasisUsd"), "portfolioCostBasisUsd")
 
-    values: dict[str, float] = {}
-    for name in spec.required_features:
-        raw = features.get(name)
-        try:
-            parsed = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(parsed):
-            values[name] = max(-1.0, min(1.0, parsed))
-    missing_fields = sorted(set(spec.required_features) - set(values))
-    completeness = len(values) / len(spec.required_features) * 100.0
-    weighted = sum(values.get(name, 0.0) * weight for name, weight in spec.weights)
-    weight_total = sum(abs(weight) for name, weight in spec.weights if name in values)
-    score = weighted / weight_total if weight_total else 0.0
-    volatility = features.get(spec.volatility_key)
-    explicit_volatility_fallback = False
-    try:
-        volatility_pct = float(volatility)
-        if not math.isfinite(volatility_pct) or volatility_pct <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        volatility_pct = spec.fallback_volatility_pct
-        explicit_volatility_fallback = True
-        missing_fields.append(spec.volatility_key)
+    projection = deterministic_horizon_projection(
+        horizon=canonical_horizon,
+        current_price=price,
+        features=features,
+    )
+    values = projection["values"]
+    missing_fields = projection["missingFields"]
+    completeness = projection["completenessPct"]
+    score = projection["score"]
+    volatility_pct = projection["volatilityPct"]
+    explicit_volatility_fallback = projection["volatilityFallbackExplicit"]
     history_context = (
         normalize_forecast_history_context(
             historical_context,
@@ -654,12 +714,9 @@ def build_tagalysis_forecast(
         ),
     )
     dispersion_pct = min(spec.drift_cap_pct * 1.5, volatility_pct)
-    p50_return_pct = math.tanh(score) * spec.drift_cap_pct * (completeness / 100.0) * 0.72
-    preliminary_p50 = price * (1.0 + p50_return_pct / 100.0)
-    sideways_weight = max(0.12, 0.54 - abs(score) * 0.34)
-    up_weight = max(0.05, 0.23 + score * 0.30)
-    down_weight = max(0.05, 0.23 - score * 0.30)
-    up, sideways, down = _normalized_probabilities([up_weight, sideways_weight, down_weight])
+    up = projection["probabilityUp"]
+    sideways = projection["probabilitySideways"]
+    down = projection["probabilityDown"]
     scenarios: list[dict[str, Any]]
     if canonical_horizon in {"1y", "5y"}:
         scenarios = _long_term_scenarios(
@@ -680,15 +737,14 @@ def build_tagalysis_forecast(
         q75 = max(scenarios[2]["priceRegionUsd"]["low"], p50)
         q90 = scenarios[3]["priceRegionUsd"]["high"]
     else:
-        p50 = preliminary_p50
-        point_return_pct = p50_return_pct + (up - down) * dispersion_pct * 0.10
-        point = price * (1.0 + point_return_pct / 100.0)
+        p50 = projection["p50Usd"]
+        point = projection["pointForecastUsd"]
         downside_skew = 1.0 + max(0.0, down - up) * 0.45
         upside_skew = 1.0 + max(0.0, up - down) * 0.45
-        q10 = max(p50 * (1.0 - dispersion_pct / 100.0 * downside_skew), price * 0.05)
+        q10 = projection["q10Usd"]
         q25 = max(p50 * (1.0 - dispersion_pct / 100.0 * 0.48 * downside_skew), q10)
         q75 = p50 * (1.0 + dispersion_pct / 100.0 * 0.48 * upside_skew)
-        q90 = p50 * (1.0 + dispersion_pct / 100.0 * upside_skew)
+        q90 = projection["q90Usd"]
         scenarios = [
             _scenario(
                 scenario_id="bear", label="Bear case", probability=down, price=q10,

@@ -235,7 +235,7 @@ def test_jobs_are_idempotent_locked_and_completed_exactly_once() -> None:
         assert row.attempts == 1
 
 
-def test_historical_maintenance_gets_one_bounded_long_lease() -> None:
+def test_historical_maintenance_and_research_get_one_bounded_long_lease() -> None:
     job = enqueue_job(
         job_type="maintain_historical_memory",
         idempotency_key="history:bounded-lease",
@@ -244,6 +244,28 @@ def test_historical_maintenance_gets_one_bounded_long_lease() -> None:
     assert claimed is not None and claimed["jobId"] == job["jobId"]
     with session_scope() as session:
         row = session.get(ServerJobRow, job["jobId"])
+        assert row is not None and row.locked_until is not None
+        assert (row.locked_until - row.updated_at).total_seconds() >= 1_200
+    research = enqueue_job(
+        job_type="run_bounded_forecast_research",
+        idempotency_key="research:bounded-lease",
+        max_attempts=2,
+    )
+    claimed_research = claim_due_job(worker_id="research-worker", lock_seconds=60)
+    assert claimed_research is not None and claimed_research["jobId"] == research["jobId"]
+    with session_scope() as session:
+        row = session.get(ServerJobRow, research["jobId"])
+        assert row is not None and row.locked_until is not None
+        assert (row.locked_until - row.updated_at).total_seconds() >= 1_200
+    tournament = enqueue_job(
+        job_type="run_bounded_predictive_tournament",
+        idempotency_key="tournament:bounded-lease",
+        max_attempts=2,
+    )
+    claimed_tournament = claim_due_job(worker_id="tournament-worker", lock_seconds=60)
+    assert claimed_tournament is not None and claimed_tournament["jobId"] == tournament["jobId"]
+    with session_scope() as session:
+        row = session.get(ServerJobRow, tournament["jobId"])
         assert row is not None and row.locked_until is not None
         assert (row.locked_until - row.updated_at).total_seconds() >= 1_200
 

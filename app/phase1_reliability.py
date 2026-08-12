@@ -704,12 +704,14 @@ def claim_due_job(*, worker_id: str, lock_seconds: int = 120) -> dict[str, Any] 
             return None
         row.status = "running"
         row.locked_by = worker_id
-        # A production historical pass reads a 1.5 GB immutable warehouse and
-        # deliberately uses one worker.  Its lease must outlast that bounded
-        # maintenance transaction, otherwise a second worker can duplicate
-        # costly work after five minutes.  This changes no retry count.
+        # Low-priority history and research both scan the immutable warehouse
+        # on one worker.  Their leases must outlast a bounded pass, otherwise a
+        # Render restart can leave a job visible as an exhausted orphan even
+        # though its idempotent persistence would make a single retry safe.
+        # This does not create a retry storm: the caller still chooses the
+        # bounded max_attempts value.
         effective_lock_seconds = max(30, int(lock_seconds))
-        if row.job_type == "maintain_historical_memory":
+        if row.job_type in {"maintain_historical_memory", "run_bounded_forecast_research", "run_bounded_predictive_tournament"}:
             effective_lock_seconds = max(effective_lock_seconds, 1_200)
         row.locked_until = now + timedelta(seconds=effective_lock_seconds)
         row.attempts += 1

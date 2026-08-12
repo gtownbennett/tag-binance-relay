@@ -112,6 +112,7 @@ from app.historical_memory import (
     historical_production_summary,
 )
 from app.forecast_research import production_research_watermark, run_bounded_production_research
+from app.predictive_tournament import persist_bounded_predictive_study
 from app.event_driven_chad import (
     chad_usage_report,
     finish_chad_call,
@@ -2508,6 +2509,10 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
             return {"enabled": False, "reason": "historical_research_disabled", "automaticPaidAiCalls": 0}
         horizon = str((job.get("payload") or {}).get("horizon") or "")
         return await asyncio.to_thread(run_bounded_production_research, horizons=(horizon,))
+    if job_type == "run_bounded_predictive_tournament":
+        if not HISTORICAL_RESEARCH_ENABLED:
+            return {"enabled": False, "reason": "historical_research_disabled", "automaticPaidAiCalls": 0}
+        return await asyncio.to_thread(persist_bounded_predictive_study)
     if job_type == "evaluate_event_driven_chad":
         return await evaluate_event_driven_chad()
     raise ValueError(f"Unsupported server job type: {job_type}")
@@ -2567,11 +2572,27 @@ async def phase1_job_loop() -> None:
                         await asyncio.to_thread(
                             enqueue_job,
                             job_type="run_bounded_forecast_research",
-                            idempotency_key=f"phase9-bounded-research-v3:{research_watermark}:{research_horizon}",
+                            # v4 supersedes the prior single-attempt v3 key.
+                            # Re-running is safe: research persistence is
+                            # content-hash idempotent and the long lease now
+                            # survives normal Render wake/deploy windows.
+                            idempotency_key=f"phase9-bounded-research-v4:{research_watermark}:{research_horizon}",
                             origin="server-scheduler",
                             payload={"historyWatermark": research_watermark, "horizon": research_horizon, "priority": "lowest"},
-                            max_attempts=1,
+                            # Research is idempotent at the persisted run and
+                            # feature-profile hashes.  Permit one delayed
+                            # recovery after a Render restart, never an
+                            # unbounded retry loop.
+                            max_attempts=2,
                         )
+                    await asyncio.to_thread(
+                        enqueue_job,
+                        job_type="run_bounded_predictive_tournament",
+                        idempotency_key=f"phase10-canonical-tournament-v1:{research_watermark}",
+                        origin="server-scheduler",
+                        payload={"historyWatermark": research_watermark, "priority": "lowest"},
+                        max_attempts=2,
+                    )
                 chad_event_bucket = int(time.time()) // max(300, COLLECT_SECONDS) * max(300, COLLECT_SECONDS)
                 await asyncio.to_thread(
                     enqueue_job,
@@ -2815,7 +2836,22 @@ async def health() -> dict[str, Any]:
             "configured": LEDGER_ENABLED,
             "checkedByHealthRoute": False,
         },
-        "automaticGrader": dict(grader_state) if LEDGER_ENABLED else None,
+        # Retained for clients that previously consumed this field.  It is
+        # exclusively the legacy Chad-ledger grader and is intentionally
+        # disabled with paid Chad.  It must not be mistaken for the
+        # deterministic canonical TAGalysis exact-deadline grader below.
+        "automaticGrader": (
+            {**dict(grader_state), "scope": "legacy_chad_ledger_only", "canonicalForecastGrading": "separate_server_job"}
+            if LEDGER_ENABLED else None
+        ),
+        "canonicalForecastGrader": {
+            "enabled": bool(DETERMINISTIC_GRADING_ENABLED and SERVER_JOBS_ENABLED),
+            "scheduler": "grade_due_canonical_forecasts",
+            "exactDeadlineOnly": True,
+            "paidAiIndependent": True,
+            "workerRunning": bool(phase1_state.get("running")),
+            "state": "server_job_loop" if phase1_state.get("running") else "awaiting_server_job_loop",
+        },
         "terminalAddonVersion": TERMINAL_ADDON_VERSION,
         "terminalCollectorRunning": bool(
             phase1_state.get("running")
