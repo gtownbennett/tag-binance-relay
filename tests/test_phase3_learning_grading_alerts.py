@@ -608,3 +608,30 @@ def test_phase4_control_center_read_does_not_seed_or_hardcode_user_levels() -> N
     assert snapshot["marketCapLevels"] == []
     with session_scope() as session:
         assert session.scalar(select(func.count()).select_from(UserMarketCapLevelVersionRow)) == 0
+
+
+def test_phase4_control_center_market_truth_uses_verified_supply_not_provider_fdv() -> None:
+    packet = build_canonical_evidence_packet(_market_fixture(), server_now=NOW)
+    persist_evidence_packet(packet)
+    supply = {
+        "assetSymbol": "TAG",
+        "network": "BNB Smart Chain",
+        "contractAddress": "0x208bf3e7da9639f1eaefa2de78c23396b0682025",
+        "circulatingSupplyTokens": 108_000_000_000.0,
+        "fullyDilutedSupplyTokens": 405_380_800_000.0,
+        "sourceName": "verified supply fixture",
+        "sourceReference": "fixture:supply:control-center",
+        "verificationStatus": "verified",
+        "verifiedAt": NOW.isoformat(),
+    }
+    persisted = persist_asset_truth_snapshot(supply)
+
+    truth = canonical_control_center_snapshot(now=NOW)["marketTruth"]
+
+    assert truth["available"] is True
+    assert truth["priceUsd"] == pytest.approx(0.001)
+    assert truth["circulatingSupplyTokens"] == supply["circulatingSupplyTokens"]
+    assert truth["circulatingMarketCapUsd"] == pytest.approx(108_000_000.0)
+    assert truth["fdvUsd"] == pytest.approx(405_380_800.0)
+    assert truth["circulatingMarketCapUsd"] != truth["fdvUsd"]
+    assert truth["supplySnapshotId"] == persisted["snapshotId"]

@@ -8,8 +8,15 @@ from typing import Any
 from sqlalchemy import select
 
 from app.canonical_forecast import format_canonical_forecast, forecast_freshness
+from app.phase1_reliability import latest_evidence_packet
 from app.phase3_learning import HORIZON_MINIMUM_SAMPLES, active_alerts, current_user_levels
-from app.terminal_database import CanonicalForecastGradeRow, CanonicalForecastRow, session_scope, utc_now
+from app.terminal_database import (
+    AssetTruthSnapshotRow,
+    CanonicalForecastGradeRow,
+    CanonicalForecastRow,
+    session_scope,
+    utc_now,
+)
 
 
 CONTROL_CENTER_PRODUCERS = ("tagalysis", "chad", "final_call")
@@ -79,6 +86,82 @@ def _grade_reports(rows: list[CanonicalForecastGradeRow]) -> list[dict[str, Any]
             }
         )
     return reports
+
+
+def _canonical_market_truth() -> dict[str, Any]:
+    """Return the newest persisted server truth, or an explicit absence.
+
+    This deliberately derives circulating market cap from the immutable verified
+    supply snapshot and an explicitly labelled DEX spot quote.  It must never
+    present a provider's FDV field as circulating market cap.
+    """
+    packet = latest_evidence_packet()
+    if packet is None:
+        return {
+            "available": False,
+            "status": "UNAVAILABLE",
+            "reason": "No persisted canonical evidence packet is available.",
+        }
+    items = packet.get("items") if isinstance(packet.get("items"), list) else []
+    dex_item = next(
+        (
+            item
+            for item in items
+            if isinstance(item, dict)
+            and item.get("category") == "dex_spot"
+            and item.get("validationStatus") not in {"invalid", "unavailable"}
+            and isinstance(item.get("payload"), dict)
+        ),
+        None,
+    )
+    price = None
+    if dex_item is not None:
+        candidate = dex_item["payload"].get("priceUsd")
+        if isinstance(candidate, (int, float)) and candidate > 0:
+            price = float(candidate)
+    if price is None:
+        return {
+            "available": False,
+            "status": "UNAVAILABLE",
+            "reason": "The newest canonical evidence has no validated DEX spot price.",
+            "evidenceSnapshotId": packet.get("snapshotId"),
+            "dataAsOf": packet.get("dataAsOf"),
+        }
+    with session_scope() as session:
+        supply = session.scalar(
+            select(AssetTruthSnapshotRow)
+            .where(
+                AssetTruthSnapshotRow.asset_symbol == "TAG",
+                AssetTruthSnapshotRow.verification_status == "verified",
+            )
+            .order_by(AssetTruthSnapshotRow.verified_at.desc(), AssetTruthSnapshotRow.created_at.desc())
+            .limit(1)
+        )
+    if supply is None:
+        return {
+            "available": False,
+            "status": "UNAVAILABLE",
+            "reason": "No verified persisted TAG supply snapshot is available.",
+            "evidenceSnapshotId": packet.get("snapshotId"),
+            "dataAsOf": packet.get("dataAsOf"),
+        }
+    circulating = float(supply.circulating_supply)
+    fully_diluted = float(supply.fully_diluted_supply or 0) or None
+    return {
+        "available": True,
+        "status": "VERIFIED",
+        "priceUsd": price,
+        "circulatingSupplyTokens": circulating,
+        "fullyDilutedSupplyTokens": fully_diluted,
+        "circulatingMarketCapUsd": price * circulating,
+        "fdvUsd": price * fully_diluted if fully_diluted is not None else None,
+        "dataAsOf": packet.get("dataAsOf"),
+        "evidenceSnapshotId": packet.get("snapshotId"),
+        "supplySnapshotId": supply.snapshot_id,
+        "priceSourceId": dex_item.get("sourceId"),
+        "priceSourceName": dex_item.get("source"),
+        "supplySourceName": supply.source_name,
+    }
 
 
 def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[str, Any]:
@@ -178,4 +261,5 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
         "gradeReports": _grade_reports(grade_rows),
         "alerts": active_alerts(limit=50),
         "marketCapLevels": current_user_levels(seed_defaults=False),
+        "marketTruth": _canonical_market_truth(),
     }
