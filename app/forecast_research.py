@@ -15,7 +15,7 @@ from bisect import bisect_left
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 
 from app.terminal_database import (
     FeatureReliabilityProfileRow,
@@ -343,31 +343,40 @@ def persist_regime_version(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {"regimeVersionId": regime_id, "deduplicated": False}
 
 
-def run_bounded_production_research(*, max_observations: int = 120_000, persist: bool = True) -> dict[str, Any]:
+def run_bounded_production_research(
+    *, max_observations: int = 40_000, persist: bool = True, horizons: Sequence[str] | None = None,
+) -> dict[str, Any]:
     """Run a low-priority, deterministic replay from persisted production history.
 
     This does not acquire data, alter a forecast, select a champion, or call a
     provider.  It deliberately uses only stored rows and appends compact,
     reproducible research records once per historical coverage watermark.
     """
+    wanted = tuple(horizons or tuple(REPLAY_HORIZONS))
+    invalid = set(wanted).difference(REPLAY_HORIZONS)
+    if invalid:
+        raise ResearchValidationError(f"unsupported requested horizons: {sorted(invalid)}")
+    short_horizons = {"1h", "4h", "24h"}
+    needs_futures = bool(set(wanted).intersection(short_horizons))
+    needs_daily = bool(set(wanted).difference(short_horizons))
     with session_scope() as session:
         futures = list(session.execute(
             select(HistoricalMarketRow.observed_at, HistoricalMarketRow.close_price)
             .where(HistoricalMarketRow.source == "Binance Vision", HistoricalMarketRow.dataset == "klines",
                    HistoricalMarketRow.validation_status == "valid", HistoricalMarketRow.close_price.is_not(None))
-            .order_by(HistoricalMarketRow.observed_at.asc()).limit(max_observations)
-        ))
+            .order_by(desc(HistoricalMarketRow.observed_at)).limit(max_observations)
+        )) if needs_futures else []
         daily = list(session.execute(
             select(HistoricalMarketRow.observed_at, HistoricalMarketRow.close_price)
             .where(HistoricalMarketRow.source == "CoinMarketCap Data API", HistoricalMarketRow.dataset == "aggregateDaily",
                    HistoricalMarketRow.validation_status == "valid", HistoricalMarketRow.close_price.is_not(None))
-            .order_by(HistoricalMarketRow.observed_at.asc()).limit(max_observations)
-        ))
+            .order_by(desc(HistoricalMarketRow.observed_at)).limit(max_observations)
+        )) if needs_daily else []
 
     def observations(rows: Sequence[tuple[datetime, float]]) -> list[dict[str, Any]]:
         return [{"observedAt": _time(at, "observedAt").isoformat(), "price": float(price)} for at, price in rows]
 
-    futures_points, daily_points = observations(futures), observations(daily)
+    futures_points, daily_points = observations(list(reversed(futures))), observations(list(reversed(daily)))
     horizons = {
         "1h": (futures_points, timedelta(days=1)), "4h": (futures_points, timedelta(days=2)),
         "24h": (futures_points, timedelta(days=7)), "7d": (daily_points, timedelta(days=30)),
@@ -375,7 +384,8 @@ def run_bounded_production_research(*, max_observations: int = 120_000, persist:
         "180d": (daily_points, timedelta(days=180)), "1y": (daily_points, timedelta(days=365)),
     }
     stored: dict[str, Any] = {}
-    for horizon, (points, lookback) in horizons.items():
+    for horizon in wanted:
+        points, lookback = horizons[horizon]
         result = deterministic_replay(points, horizon=horizon, lookback=lookback)
         if not points:
             stored[horizon] = {"status": "STILL_LEARNING", "reason": "no persisted source coverage"}

@@ -2506,7 +2506,8 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
     if job_type == "run_bounded_forecast_research":
         if not HISTORICAL_RESEARCH_ENABLED:
             return {"enabled": False, "reason": "historical_research_disabled", "automaticPaidAiCalls": 0}
-        return await asyncio.to_thread(run_bounded_production_research)
+        horizon = str((job.get("payload") or {}).get("horizon") or "")
+        return await asyncio.to_thread(run_bounded_production_research, horizons=(horizon,))
     if job_type == "evaluate_event_driven_chad":
         return await evaluate_event_driven_chad()
     raise ValueError(f"Unsupported server job type: {job_type}")
@@ -2562,14 +2563,15 @@ async def phase1_job_loop() -> None:
                 # repeated full replay, and scheduled after live work.
                 research_watermark = await asyncio.to_thread(production_research_watermark)
                 if research_watermark is not None:
-                    await asyncio.to_thread(
-                        enqueue_job,
-                        job_type="run_bounded_forecast_research",
-                        idempotency_key=f"phase9-bounded-research-v2:{research_watermark}",
-                        origin="server-scheduler",
-                        payload={"historyWatermark": research_watermark, "priority": "lowest"},
-                        max_attempts=1,
-                    )
+                    for research_horizon in ("1h", "4h", "24h", "7d", "30d", "90d", "180d", "1y"):
+                        await asyncio.to_thread(
+                            enqueue_job,
+                            job_type="run_bounded_forecast_research",
+                            idempotency_key=f"phase9-bounded-research-v3:{research_watermark}:{research_horizon}",
+                            origin="server-scheduler",
+                            payload={"historyWatermark": research_watermark, "horizon": research_horizon, "priority": "lowest"},
+                            max_attempts=1,
+                        )
                 chad_event_bucket = int(time.time()) // max(300, COLLECT_SECONDS) * max(300, COLLECT_SECONDS)
                 await asyncio.to_thread(
                     enqueue_job,
