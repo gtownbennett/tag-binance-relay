@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from app.prospective_learning import assess_evidence_packet, paired_threshold_result, register_prospective_tournament
+from app.prospective_learning import assess_evidence_packet, evaluate_prospective_thresholds, paired_threshold_result, register_prospective_tournament
 from app.terminal_database import ForecastResearchRunRow, init_db, session_scope
 
 
@@ -44,3 +44,28 @@ def test_threshold_evaluation_is_paired_preliminary_and_never_auto_promotes() ->
     assert result["status"] == "PRELIMINARY_PROSPECTIVE_EVIDENCE"
     assert result["championWins"] == 30
     assert result["automaticPromotion"] is False
+
+
+def test_threshold_evaluation_uses_only_the_prequalified_clean_pairs(monkeypatch) -> None:
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    issued = datetime(2026, 8, 13, tzinfo=timezone.utc)
+    clean_tag = SimpleNamespace(horizon="1h", issued_at=issued, deadline=issued, point_error_pct=1.0)
+    clean_base = SimpleNamespace(horizon="1h", issued_at=issued, deadline=issued, point_error_pct=2.0)
+    population = {
+        "horizons": {"1h": {"eligible": 1}},
+    }
+    monkeypatch.setattr("app.prospective_learning.THRESHOLDS", (1,))
+    monkeypatch.setattr("app.prospective_learning.register_prospective_tournament", lambda: {"researchRunId": "reg"})
+    monkeypatch.setattr("app.prospective_learning.reconcile_missed_deadline_dispositions", lambda: {})
+    monkeypatch.setattr("app.prospective_learning.reconcile_matched_shadow_grades", lambda: {})
+    monkeypatch.setattr("app.prospective_learning.prospective_population", lambda: population)
+    monkeypatch.setattr("app.prospective_learning._matched_clean_pairs", lambda: [(clean_tag, clean_base)])
+    persisted = []
+    monkeypatch.setattr("app.prospective_learning.persist_research_run", lambda payload: persisted.append(payload) or payload)
+
+    result = evaluate_prospective_thresholds()
+
+    assert len(result["evaluations"]) == 1
+    assert persisted[0]["results"]["meanAbsoluteErrorDeltaPct"] == 1.0

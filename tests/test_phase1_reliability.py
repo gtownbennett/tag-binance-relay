@@ -262,6 +262,27 @@ def test_jobs_are_idempotent_locked_and_completed_exactly_once() -> None:
         assert row.attempts == 1
 
 
+def test_due_exact_deadline_capture_preempts_older_periodic_work() -> None:
+    now = datetime.now(timezone.utc)
+    periodic = enqueue_job(
+        job_type="collect_canonical_evidence",
+        idempotency_key="collect:older-periodic",
+        available_at=now - timedelta(minutes=5),
+    )
+    capture = enqueue_job(
+        job_type="capture_canonical_deadline_observation",
+        idempotency_key="capture:narrow-window",
+        available_at=now - timedelta(seconds=1),
+        payload={"forecastId": "forecast-priority-fixture"},
+        max_attempts=1,
+    )
+
+    claimed = claim_due_job(worker_id="deadline-worker", lock_seconds=60)
+
+    assert claimed is not None and claimed["jobId"] == capture["jobId"]
+    assert claimed["jobId"] != periodic["jobId"]
+
+
 def test_historical_maintenance_and_research_get_one_bounded_long_lease() -> None:
     job = enqueue_job(
         job_type="maintain_historical_memory",

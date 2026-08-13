@@ -14,7 +14,7 @@ services:
       - key: SERVER_JOBS_ENABLED
         value: "true"
       - key: SERVER_JOB_POLL_SECONDS
-        value: "30"
+        value: "5"
       - key: DETERMINISTIC_GRADING_ENABLED
         value: "true"
       - key: PAID_AI_ENABLED

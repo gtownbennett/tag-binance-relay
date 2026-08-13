@@ -41,6 +41,7 @@ from app.phase3_learning import (
     process_alert_signal,
     rollback_learning_version,
     register_forecast_invalidation_rule,
+    schedule_exact_deadline_capture,
     weighted_interval_score,
 )
 from app.phase4_control_center import (
@@ -635,6 +636,49 @@ def test_missing_matched_shadow_grade_is_reconciled_without_new_observation() ->
     assert evaluation["learningHealth"] == "PIPELINE_ACTIVE_IMPROVEMENT_NOT_DEMONSTRATED"
 
 
+def test_completed_late_capture_is_honestly_ungradable_without_an_outcome() -> None:
+    register_prospective_tournament()
+    with session_scope() as session:
+        registration = session.scalar(select(ForecastResearchRunRow).where(
+            ForecastResearchRunRow.run_kind == "prospective_tournament_registration"
+        ))
+        registration.created_at = NOW
+    forecast = _forecast(horizon="1h", issued_at=NOW + timedelta(minutes=1), point=0.0011)
+    persist_canonical_forecast(forecast)
+    schedule_exact_deadline_capture(
+        forecast_id=forecast["forecastId"], deadline=datetime.fromisoformat(forecast["deadline"])
+    )
+    with session_scope() as session:
+        job = session.scalar(select(ServerJobRow).where(
+            ServerJobRow.job_type == "capture_canonical_deadline_observation",
+            ServerJobRow.payload_json.contains(forecast["forecastId"]),
+        ))
+        job.status = "completed"
+        job.result_json = json.dumps({
+            "captured": False,
+            "graded": False,
+            "reason": "outside_exact_capture_window",
+            "captureLagSeconds": 48.5,
+        })
+
+    evaluation = evaluate_prospective_thresholds()
+
+    assert evaluation["missedDeadlineReconciliation"] == {
+        "classified": 1,
+        "forecastIds": [forecast["forecastId"]],
+        "outcomesCreated": 0,
+        "gradesCreated": 0,
+    }
+    with session_scope() as session:
+        disposition = session.scalar(select(ForecastEvaluationDispositionRow).where(
+            ForecastEvaluationDispositionRow.forecast_id == forecast["forecastId"]
+        ))
+        assert disposition is not None and disposition.category == "ungradable"
+        assert session.scalar(select(CanonicalForecastGradeRow).where(
+            CanonicalForecastGradeRow.forecast_id == forecast["forecastId"]
+        )) is None
+
+
 def test_pre_registration_grade_never_enters_clean_tournament_population() -> None:
     tag = _forecast(horizon="1h", issued_at=NOW + timedelta(minutes=1), point=0.00108)
     baseline = _forecast(
@@ -732,7 +776,43 @@ def test_alert_contract_rejects_missing_configuration_and_stale_current_value() 
     )
     stale = active_alerts(now=NOW + timedelta(minutes=31))[0]
     assert stale["actionabilityStatus"] == "STALE_CURRENT_VALUE"
+    assert stale["distancePct"] is None
+    assert stale["distanceDirection"] == "UNAVAILABLE"
+    assert stale["ownerDecision"] == "No action — current value is stale."
     assert stale["expiresAt"] == (NOW + timedelta(minutes=30)).isoformat()
+
+
+@pytest.mark.parametrize(
+    ("current", "expected_direction", "expected_distance"),
+    (
+        (125_000_000, "INSIDE", 0.0),
+        (124_999_999, "BELOW", (125_000_000 / 124_999_999 - 1.0) * 100.0),
+        (128_000_001, "ABOVE", (128_000_001 / 128_000_000 - 1.0) * 100.0),
+        (118_000_000, "BELOW", (125_000_000 / 118_000_000 - 1.0) * 100.0),
+    ),
+)
+def test_alert_distance_boundaries_use_structured_range(
+    current: float, expected_direction: str, expected_distance: float,
+) -> None:
+    evidence_id = _evidence()
+    level = next(row for row in current_user_levels() if row["levelKey"] == "trim-125-128")
+    process_alert_signal({
+        "caseKey": f"boundary:{current}",
+        "alertType": "USER MARKET-CAP LEVEL",
+        "evidenceSnapshotId": evidence_id,
+        "idempotencyKey": f"boundary:{current}",
+        "detectedAt": NOW.isoformat(),
+        "signalScore": 60,
+        "marketCapUsd": current,
+        "levelVersionId": level["levelVersionId"],
+    })
+
+    alert = active_alerts(now=NOW)[0]
+
+    assert alert["distanceDirection"] == expected_direction
+    assert alert["distancePct"] == pytest.approx(expected_distance)
+    assert alert["target"]["lowUsd"] == 125_000_000
+    assert alert["target"]["highUsd"] == 128_000_000
 
 
 def test_forecast_dispositions_are_terminal_and_wrong_valid_stays_valid() -> None:
@@ -754,6 +834,27 @@ def test_forecast_dispositions_are_terminal_and_wrong_valid_stays_valid() -> Non
     )
     assert duplicate["category"] == "valid_completed"
     assert duplicate["deduplicated"] is True
+
+
+def test_graded_live_forecast_cannot_be_reclassified_if_disposition_is_missing() -> None:
+    forecast = _forecast(horizon="1h", point=0.0012)
+    persist_canonical_forecast(forecast)
+    grade_canonical_forecast(
+        forecast["forecastId"],
+        _outcome(datetime.fromisoformat(forecast["deadline"]), price=0.0008, suffix="lost-disposition"),
+    )
+    # Simulate legacy/drifted state in which the grade survived but its
+    # terminal disposition did not.  Reconciliation must never relabel it.
+    with session_scope() as session:
+        disposition = session.scalar(select(ForecastEvaluationDispositionRow).where(
+            ForecastEvaluationDispositionRow.forecast_id == forecast["forecastId"]
+        ))
+        session.delete(disposition)
+    with pytest.raises(Phase3ValidationError, match="graded live forecast cannot be relabeled"):
+        classify_forecast_evaluation(
+            forecast["forecastId"],
+            {"category": "ungradable", "reason": "missing capture claimed after grading"},
+        )
 
 
 def test_prospective_invalidation_cannot_be_backdated_or_applied_after_deadline(monkeypatch: pytest.MonkeyPatch) -> None:

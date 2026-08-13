@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import or_, select
+from sqlalchemy import case, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from .terminal_database import (
@@ -714,7 +714,18 @@ def claim_due_job(*, worker_id: str, lock_seconds: int = 120) -> dict[str, Any] 
                 ),
                 ServerJobRow.attempts < ServerJobRow.max_attempts,
             )
-            .order_by(ServerJobRow.available_at.asc(), ServerJobRow.created_at.asc())
+            # Exact-deadline captures have a deliberately narrow validity
+            # window.  Periodic maintenance may already be overdue when a
+            # capture becomes available, so FIFO alone can make an otherwise
+            # healthy worker miss the immutable observation deadline.
+            .order_by(
+                case(
+                    (ServerJobRow.job_type == "capture_canonical_deadline_observation", 0),
+                    else_=1,
+                ).asc(),
+                ServerJobRow.available_at.asc(),
+                ServerJobRow.created_at.asc(),
+            )
             .limit(1)
         )
         if session.bind is not None and session.bind.dialect.name == "postgresql":

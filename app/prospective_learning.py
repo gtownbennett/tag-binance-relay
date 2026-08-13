@@ -342,6 +342,61 @@ def reconcile_matched_shadow_grades() -> dict[str, Any]:
     return {"repaired": len(repaired), "forecastIds": repaired, "excluded": excluded, "newMarketObservations": 0}
 
 
+def reconcile_missed_deadline_dispositions() -> dict[str, Any]:
+    """Classify completed, provenance-backed capture misses as ungradable.
+
+    This never manufactures an outcome.  It only closes a reliability record
+    after the immutable capture job itself proves that the exact-deadline
+    observation was unavailable or arrived outside the registered window.
+    """
+    from .phase3_learning import classify_forecast_evaluation
+
+    allowed_reasons = {
+        "outside_exact_capture_window",
+        "spot_source_unavailable",
+        "spot_price_unavailable",
+    }
+    candidates: list[tuple[str, str, float | None]] = []
+    with session_scope() as session:
+        jobs = session.scalars(select(ServerJobRow).where(
+            ServerJobRow.job_type == "capture_canonical_deadline_observation",
+            ServerJobRow.status == "completed",
+        )).all()
+        for job in jobs:
+            payload = json.loads(job.payload_json or "{}")
+            result = json.loads(job.result_json or "{}")
+            forecast_id = str(payload.get("forecastId") or "")
+            reason = str(result.get("reason") or "")
+            if not forecast_id or reason not in allowed_reasons:
+                continue
+            forecast = session.get(CanonicalForecastRow, forecast_id)
+            deadline = None if forecast is None else (
+                forecast.deadline if forecast.deadline.tzinfo else forecast.deadline.replace(tzinfo=timezone.utc)
+            )
+            if forecast is None or forecast.producer != "tagalysis" or deadline > utc_now():
+                continue
+            if session.scalar(select(CanonicalForecastGradeRow).where(
+                CanonicalForecastGradeRow.forecast_id == forecast_id,
+                CanonicalForecastGradeRow.evaluation_kind == "live",
+            )) is not None:
+                continue
+            if session.scalar(select(ForecastEvaluationDispositionRow).where(
+                ForecastEvaluationDispositionRow.forecast_id == forecast_id,
+            )) is not None:
+                continue
+            candidates.append((forecast_id, reason, _finite(result.get("captureLagSeconds"))))
+    classified: list[str] = []
+    for forecast_id, reason, lag in candidates:
+        lag_text = f" Capture lag was {lag:.3f} seconds." if lag is not None else ""
+        disposition = classify_forecast_evaluation(forecast_id, {
+            "category": "ungradable",
+            "reason": f"Exact-deadline observation was not valid: {reason}.{lag_text}",
+        })
+        if not disposition["deduplicated"]:
+            classified.append(forecast_id)
+    return {"classified": len(classified), "forecastIds": classified, "outcomesCreated": 0, "gradesCreated": 0}
+
+
 def _matched_clean_pairs() -> list[tuple[CanonicalForecastGradeRow, CanonicalForecastGradeRow]]:
     clean = _clean_grades()
     with session_scope() as session:
@@ -426,23 +481,19 @@ def paired_threshold_result(
 def evaluate_prospective_thresholds() -> dict[str, Any]:
     """Run a conservative, idempotent paired evaluation only at reached thresholds."""
     registration = register_prospective_tournament()
+    missed_deadline_reconciliation = reconcile_missed_deadline_dispositions()
     reconciliation = reconcile_matched_shadow_grades()
     population = prospective_population()
     persisted: list[dict[str, Any]] = []
-    # Build matching data with direct, portable queries instead of JSON SQL.
-    with session_scope() as session:
-        tags = session.scalars(select(CanonicalForecastGradeRow).where(
-            CanonicalForecastGradeRow.producer == "tagalysis", CanonicalForecastGradeRow.evaluation_kind == "live"))
-        baselines = session.scalars(select(CanonicalForecastGradeRow).where(
-            CanonicalForecastGradeRow.producer == "baseline", CanonicalForecastGradeRow.evaluation_kind == "live"))
-        tags = list(tags)
-        baselines = list(baselines)
-    baseline_by_key = {(row.horizon, row.deadline, row.outcome_id): row for row in baselines}
+    # Threshold evaluation must consume the exact same clean population shown
+    # by eligibility.  Re-querying every independent live grade here could
+    # otherwise pull legacy or unassessed pairs into the first N cases.
+    clean_matched = _matched_clean_pairs()
     for horizon, state in population["horizons"].items():
         matched = [
-            (tag, baseline_by_key[(tag.horizon, tag.deadline, tag.outcome_id)])
-            for tag in tags
-            if (tag.horizon, tag.deadline, tag.outcome_id) in baseline_by_key and tag.independent_sample
+            (tag, baseline)
+            for tag, baseline in clean_matched
+            if tag.horizon == horizon
         ]
         for threshold in THRESHOLDS:
             if state["eligible"] < threshold or len(matched) < threshold:
@@ -455,6 +506,7 @@ def evaluate_prospective_thresholds() -> dict[str, Any]:
                 "rawCaseCount": len(selected), "effectiveSampleCount": len(selected), "noLookahead": True, "results": result}))
     return {
         "registration": registration,
+        "missedDeadlineReconciliation": missed_deadline_reconciliation,
         "reconciliation": reconciliation,
         "population": population,
         "evaluations": persisted,

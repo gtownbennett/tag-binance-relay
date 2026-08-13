@@ -214,8 +214,14 @@ def classify_forecast_evaluation(forecast_id: str, payload: Mapping[str, Any]) -
             grade = session.get(CanonicalForecastGradeRow, grade_id) if grade_id else None
             if grade is None or grade.forecast_id != forecast_id or grade.evaluation_kind != "live":
                 raise Phase3ValidationError("valid completion requires its canonical live grade")
-        elif grade_id is not None:
-            raise Phase3ValidationError("only valid completed forecasts may reference an ordinary grade")
+        else:
+            if grade_id is not None:
+                raise Phase3ValidationError("only valid completed forecasts may reference an ordinary grade")
+            if session.scalar(select(CanonicalForecastGradeRow).where(
+                CanonicalForecastGradeRow.forecast_id == forecast_id,
+                CanonicalForecastGradeRow.evaluation_kind == "live",
+            )) is not None:
+                raise Phase3ValidationError("a graded live forecast cannot be relabeled")
         if category == "prospectively_invalidated":
             rule = session.get(ForecastInvalidationRuleRow, rule_id) if rule_id else None
             evidence = session.get(CanonicalEvidenceSnapshotRow, evidence_id) if evidence_id else None
@@ -350,8 +356,7 @@ def persist_verified_outcome(payload: Mapping[str, Any]) -> dict[str, Any]:
             CanonicalEvidenceSnapshotRow, normalized["evidenceSnapshotId"]
         ) is None:
             raise Phase3ValidationError("outcome evidence snapshot does not exist")
-        session.add(
-            VerifiedOutcomeRow(
+        outcome_row = VerifiedOutcomeRow(
                 outcome_id=outcome_id,
                 outcome_hash=outcome_hash,
                 asset_symbol=normalized["assetSymbol"],
@@ -364,7 +369,30 @@ def persist_verified_outcome(payload: Mapping[str, Any]) -> dict[str, Any]:
                 verification_status="verified",
                 payload_json=json_dumps(normalized),
             )
-        )
+        # The exact-capture worker and the bounded catch-up grader can observe
+        # the same immutable deadline concurrently.  Protect the natural-key
+        # insert with a savepoint so the loser of that race returns the
+        # already-persisted outcome instead of failing the server job.
+        try:
+            with session.begin_nested():
+                session.add(outcome_row)
+                session.flush()
+        except IntegrityError:
+            natural_existing = session.scalar(
+                select(VerifiedOutcomeRow).where(
+                    VerifiedOutcomeRow.asset_symbol == normalized["assetSymbol"],
+                    VerifiedOutcomeRow.observed_at == _parse_time(normalized["observedAt"], "observedAt"),
+                    VerifiedOutcomeRow.source_name == normalized["sourceName"],
+                )
+            )
+            if natural_existing is None:
+                raise
+            return {
+                "outcomeId": natural_existing.outcome_id,
+                "outcomeHash": natural_existing.outcome_hash,
+                "deduplicated": True,
+                "dedupeBasis": "asset_observed_at_source_race",
+            }
     return {"outcomeId": outcome_id, "outcomeHash": outcome_hash, "deduplicated": False}
 
 
@@ -1464,18 +1492,6 @@ def active_alerts(*, limit: int = 50, now: datetime | None = None) -> list[dict[
             current_value = latest.market_cap_usd if latest is not None else None
             target_low = float(level.low_usd) if level is not None and level.enabled else None
             target_high = float(level.high_usd) if level is not None and level.enabled else None
-            if current_value is None or target_low is None or target_high is None:
-                distance_pct = None
-                distance_direction = "UNAVAILABLE"
-            elif target_low <= current_value <= target_high:
-                distance_pct = 0.0
-                distance_direction = "INSIDE"
-            elif current_value < target_low:
-                distance_pct = (target_low / current_value - 1.0) * 100.0 if current_value > 0 else None
-                distance_direction = "BELOW"
-            else:
-                distance_pct = (current_value / target_high - 1.0) * 100.0
-                distance_direction = "ABOVE"
             configured = bool(level is not None and level.enabled)
             current_present = current_value is not None and current_value > 0
             current_observed_at = _aware(latest.detected_at) if latest is not None else None
@@ -1484,6 +1500,18 @@ def active_alerts(*, limit: int = 50, now: datetime | None = None) -> list[dict[
                 and observed_now <= current_observed_at + current_value_max_age
             )
             actionable = configured and current_fresh
+            if not actionable:
+                distance_pct = None
+                distance_direction = "UNAVAILABLE"
+            elif target_low <= current_value <= target_high:
+                distance_pct = 0.0
+                distance_direction = "INSIDE"
+            elif current_value < target_low:
+                distance_pct = (target_low / current_value - 1.0) * 100.0
+                distance_direction = "BELOW"
+            else:
+                distance_pct = (current_value / target_high - 1.0) * 100.0
+                distance_direction = "ABOVE"
             results.append(
                 {
                     "alertId": case.alert_id,
@@ -1528,7 +1556,11 @@ def active_alerts(*, limit: int = 50, now: datetime | None = None) -> list[dict[
                         "Review the saved owner plan; no automatic order is permitted."
                         if actionable and latest is not None and latest.stage in {"CONFIRMED", "URGENT ACTION"}
                         else "Watch; no automatic order is permitted."
-                        if actionable else "No action — configuration incomplete."
+                        if actionable else (
+                            "No action — configured target is missing or disabled."
+                            if not configured else "No action — current value is unavailable."
+                            if not current_present else "No action — current value is stale."
+                        )
                     ),
                     "effectiveAt": _aware(level.created_at).isoformat() if level is not None else None,
                     "expiresAt": (
