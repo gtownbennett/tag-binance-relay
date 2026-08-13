@@ -1057,6 +1057,62 @@ class CanonicalForecastGradeRow(Base):
     payload_json: Mapped[str] = mapped_column(Text)
 
 
+class ForecastInvalidationRuleRow(Base):
+    """Immutable, predeclared rule that may invalidate a future forecast."""
+
+    __tablename__ = "forecast_invalidation_rules"
+    __table_args__ = (
+        UniqueConstraint("rule_version", name="uq_forecast_invalidation_rule_version"),
+        CheckConstraint("effective_at >= registered_at", name="ck_invalidation_rule_time_order"),
+    )
+
+    rule_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    rule_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    rule_version: Mapped[str] = mapped_column(String(80), index=True)
+    registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    trigger_type: Mapped[str] = mapped_column(String(80))
+    threshold_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class ForecastEvaluationDispositionRow(Base):
+    """One immutable terminal evaluation category per canonical forecast."""
+
+    __tablename__ = "forecast_evaluation_dispositions"
+    __table_args__ = (
+        UniqueConstraint("forecast_id", name="uq_forecast_terminal_disposition"),
+        CheckConstraint(
+            "category IN ('valid_completed','prospectively_invalidated','ungradable','legacy_pre_repair','practice')",
+            name="ck_forecast_disposition_category",
+        ),
+        CheckConstraint(
+            "category <> 'prospectively_invalidated' OR (rule_id IS NOT NULL AND trigger_evidence_snapshot_id IS NOT NULL AND triggered_at IS NOT NULL)",
+            name="ck_forecast_invalidation_provenance",
+        ),
+        CheckConstraint(
+            "category <> 'valid_completed' OR grade_id IS NOT NULL",
+            name="ck_forecast_valid_grade",
+        ),
+    )
+
+    disposition_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    disposition_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    forecast_id: Mapped[str] = mapped_column(String(64), ForeignKey("canonical_forecasts.forecast_id"), index=True)
+    category: Mapped[str] = mapped_column(String(40), index=True)
+    grade_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("canonical_forecast_grades.grade_id"), index=True)
+    rule_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("forecast_invalidation_rules.rule_id"), index=True)
+    trigger_evidence_snapshot_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("canonical_evidence_snapshots.snapshot_id"), index=True
+    )
+    triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    warning_early_enough: Mapped[bool | None] = mapped_column(Boolean)
+    invalidation_confirmed: Mapped[bool | None] = mapped_column(Boolean)
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
 class MarketRegimeRow(Base):
     __tablename__ = "market_regimes"
     __table_args__ = (UniqueConstraint("evidence_snapshot_id", "detector_version", name="uq_market_regime_snapshot_version"),)

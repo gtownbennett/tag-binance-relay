@@ -25,6 +25,7 @@ from app.phase3_learning import (
     active_alerts,
     capture_exact_due_outcomes,
     capture_direct_deadline_outcome,
+    classify_forecast_evaluation,
     current_learning_version,
     current_user_levels,
     enqueue_phase3_jobs,
@@ -39,12 +40,19 @@ from app.phase3_learning import (
     persist_verified_outcome,
     process_alert_signal,
     rollback_learning_version,
+    register_forecast_invalidation_rule,
     weighted_interval_score,
 )
 from app.phase4_control_center import (
     CHAD_PENDING_MESSAGE,
     GRADE_PENDING_MESSAGE,
     canonical_control_center_snapshot,
+)
+from app.prospective_learning import (
+    evaluate_prospective_thresholds,
+    record_forecast_evidence,
+    reconcile_matched_shadow_grades,
+    register_prospective_tournament,
 )
 from app.terminal_database import (
     AlertCaseRow,
@@ -55,6 +63,9 @@ from app.terminal_database import (
     CanonicalEvidenceSnapshotRow,
     CanonicalForecastGradeRow,
     CanonicalForecastRow,
+    ForecastEvaluationDispositionRow,
+    ForecastInvalidationRuleRow,
+    ForecastResearchRunRow,
     HistoricalAnalogRow,
     LearningVersionRow,
     MarketRegimeRow,
@@ -86,7 +97,10 @@ def setup_function() -> None:
             PatternSequenceRow,
             MarketRegimeRow,
             LearningVersionRow,
+            ForecastResearchRunRow,
+            ForecastEvaluationDispositionRow,
             CanonicalForecastGradeRow,
+            ForecastInvalidationRuleRow,
             VerifiedOutcomeRow,
             UserMarketCapLevelVersionRow,
             CanonicalForecastRow,
@@ -549,6 +563,251 @@ def test_direct_deadline_capture_is_fresh_bounded_and_not_a_nearest_snapshot() -
         grade = session.scalar(select(CanonicalForecastGradeRow).where(CanonicalForecastGradeRow.forecast_id == forecast["forecastId"]))
     assert grade is not None
     assert "direct_server_capture_at_exact_deadline" in grade.payload_json
+
+
+def test_exact_deadline_outcome_natural_key_is_shared_by_matched_shadow() -> None:
+    deadline = NOW + timedelta(hours=1)
+    first = persist_verified_outcome(
+        {
+            "assetSymbol": "TAG",
+            "observedAt": deadline.isoformat(),
+            "priceUsd": 0.0011,
+            "sourceName": "fixture DEX",
+            "sourceReference": "deadline-capture:champion",
+            "verificationStatus": "verified",
+            "capturePolicy": "direct_server_capture_at_exact_deadline",
+        }
+    )
+    shadow = persist_verified_outcome(
+        {
+            "assetSymbol": "TAG",
+            "observedAt": deadline.isoformat(),
+            "priceUsd": 0.0011,
+            "sourceName": "fixture DEX",
+            "sourceReference": "deadline-capture:shadow",
+            "verificationStatus": "verified",
+            "capturePolicy": "direct_server_capture_at_exact_deadline",
+        }
+    )
+    assert shadow["deduplicated"] is True
+    assert shadow["dedupeBasis"] == "asset_observed_at_source"
+    assert shadow["outcomeId"] == first["outcomeId"]
+
+
+def test_missing_matched_shadow_grade_is_reconciled_without_new_observation() -> None:
+    register_prospective_tournament()
+    with session_scope() as session:
+        registration = session.scalar(select(ForecastResearchRunRow).where(
+            ForecastResearchRunRow.run_kind == "prospective_tournament_registration"
+        ))
+        registration.created_at = NOW - timedelta(minutes=1)
+    tag = _forecast(horizon="1h", issued_at=NOW + timedelta(minutes=1), point=0.00108)
+    baseline = _forecast(
+        horizon="1h",
+        producer="baseline",
+        issued_at=NOW + timedelta(minutes=1),
+        point=0.00101,
+    )
+    persist_canonical_forecast(tag)
+    persist_canonical_forecast(baseline)
+    record_forecast_evidence(tag["forecastId"])
+    record_forecast_evidence(baseline["forecastId"])
+    outcome = persist_verified_outcome(
+        {
+            "assetSymbol": "TAG",
+            "observedAt": tag["deadline"],
+            "priceUsd": 0.00104,
+            "sourceName": "fixture DEX",
+            "sourceReference": "deadline-capture:tag",
+            "verificationStatus": "verified",
+            "capturePolicy": "direct_server_capture_at_exact_deadline",
+            "capturedAt": tag["deadline"],
+            "captureLagSeconds": 0,
+        }
+    )
+    grade_canonical_forecast(tag["forecastId"], outcome["outcomeId"])
+    repaired = reconcile_matched_shadow_grades()
+    assert repaired["repaired"] == 1
+    assert repaired["newMarketObservations"] == 0
+    evaluation = evaluate_prospective_thresholds()
+    assert evaluation["reconciliation"]["repaired"] == 0
+    assert evaluation["population"]["census"]["cleanMatchedPairs"] == 1
+    assert evaluation["learningHealth"] == "PIPELINE_ACTIVE_IMPROVEMENT_NOT_DEMONSTRATED"
+
+
+def test_pre_registration_grade_never_enters_clean_tournament_population() -> None:
+    tag = _forecast(horizon="1h", issued_at=NOW + timedelta(minutes=1), point=0.00108)
+    baseline = _forecast(
+        horizon="1h", producer="baseline", issued_at=NOW + timedelta(minutes=1), point=0.00101
+    )
+    persist_canonical_forecast(tag)
+    persist_canonical_forecast(baseline)
+    register_prospective_tournament()
+    record_forecast_evidence(tag["forecastId"])
+    record_forecast_evidence(baseline["forecastId"])
+    outcome = persist_verified_outcome(
+        {
+            "assetSymbol": "TAG",
+            "observedAt": tag["deadline"],
+            "priceUsd": 0.00104,
+            "sourceName": "fixture DEX",
+            "sourceReference": "deadline-capture:pre-registration",
+            "verificationStatus": "verified",
+            "capturePolicy": "direct_server_capture_at_exact_deadline",
+            "capturedAt": tag["deadline"],
+            "captureLagSeconds": 0,
+        }
+    )
+    grade_canonical_forecast(tag["forecastId"], outcome["outcomeId"])
+    reconcile_matched_shadow_grades()
+    population = evaluate_prospective_thresholds()["population"]
+    assert population["census"]["cleanExactDeadlineGrades"] == 0
+    assert population["census"]["cleanMatchedPairs"] == 0
+    assert population["forecastGradeCensus"]["totals"]["legacyPreRepair"] == 0
+    # It is still a valid immutable grade; only tournament eligibility is excluded.
+    assert population["forecastGradeCensus"]["totals"]["validCompleted"] == 1
+
+
+def test_active_alert_contract_uses_structured_persisted_level() -> None:
+    evidence_id = _evidence()
+    level = next(row for row in current_user_levels() if row["levelKey"] == "trim-125-128")
+    process_alert_signal(
+        {
+            "caseKey": "market-cap-level:trim-125-128",
+            "alertType": "USER MARKET-CAP LEVEL",
+            "evidenceSnapshotId": evidence_id,
+            "idempotencyKey": "structured-alert-fixture",
+            "detectedAt": NOW.isoformat(),
+            "signalScore": 60,
+            "priceUsd": 0.0012,
+            "marketCapUsd": 126_000_000,
+            "levelVersionId": level["levelVersionId"],
+        }
+    )
+    alert = active_alerts(now=NOW)[0]
+    assert alert["target"] == {
+        "type": "CIRCULATING_MARKET_CAP_RANGE_USD",
+        "lowUsd": 125_000_000,
+        "highUsd": 128_000_000,
+    }
+    assert alert["currentValue"]["valueUsd"] == 126_000_000
+    assert alert["distancePct"] == 0
+    assert alert["distanceDirection"] == "INSIDE"
+    assert alert["actionabilityStatus"] == "ACTIONABLE"
+    assert alert["activationCondition"] and alert["clearingCondition"]
+
+
+def test_alert_contract_rejects_missing_configuration_and_stale_current_value() -> None:
+    evidence_id = _evidence()
+    process_alert_signal(
+        {
+            "caseKey": "unconfigured-alert",
+            "alertType": "USER MARKET-CAP LEVEL",
+            "evidenceSnapshotId": evidence_id,
+            "idempotencyKey": "unconfigured-alert-fixture",
+            "detectedAt": NOW.isoformat(),
+            "signalScore": 60,
+            "marketCapUsd": 120_000_000,
+        }
+    )
+    unconfigured = active_alerts(now=NOW)[0]
+    assert unconfigured["target"] is None
+    assert unconfigured["actionabilityStatus"] == "MISSING_CONFIGURATION"
+    assert unconfigured["ownerDecision"].startswith("No action")
+
+    setup_function()
+    evidence_id = _evidence()
+    level = next(row for row in current_user_levels() if row["levelKey"] == "retest-135")
+    process_alert_signal(
+        {
+            "caseKey": "market-cap-level:retest-135",
+            "alertType": "USER MARKET-CAP LEVEL",
+            "evidenceSnapshotId": evidence_id,
+            "idempotencyKey": "stale-alert-fixture",
+            "detectedAt": NOW.isoformat(),
+            "signalScore": 60,
+            "marketCapUsd": 134_000_000,
+            "levelVersionId": level["levelVersionId"],
+        }
+    )
+    stale = active_alerts(now=NOW + timedelta(minutes=31))[0]
+    assert stale["actionabilityStatus"] == "STALE_CURRENT_VALUE"
+    assert stale["expiresAt"] == (NOW + timedelta(minutes=30)).isoformat()
+
+
+def test_forecast_dispositions_are_terminal_and_wrong_valid_stays_valid() -> None:
+    forecast = _forecast(horizon="1h", point=0.0012)
+    persist_canonical_forecast(forecast)
+    grade = grade_canonical_forecast(
+        forecast["forecastId"],
+        _outcome(datetime.fromisoformat(forecast["deadline"]), price=0.0008, suffix="wrong-valid"),
+    )
+    assert grade["metrics"]["directionCorrect"] is False
+    with session_scope() as session:
+        disposition = session.scalar(select(ForecastEvaluationDispositionRow).where(
+            ForecastEvaluationDispositionRow.forecast_id == forecast["forecastId"]
+        ))
+    assert disposition is not None and disposition.category == "valid_completed"
+    duplicate = classify_forecast_evaluation(
+        forecast["forecastId"],
+        {"category": "prospectively_invalidated", "reason": "loss relabel attempt"},
+    )
+    assert duplicate["category"] == "valid_completed"
+    assert duplicate["deduplicated"] is True
+
+
+def test_prospective_invalidation_cannot_be_backdated_or_applied_after_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    forecast = _forecast(horizon="1h", issued_at=NOW + timedelta(hours=1))
+    persist_canonical_forecast(forecast)
+    registration_time = NOW + timedelta(minutes=30)
+    monkeypatch.setattr("app.phase3_learning.utc_now", lambda: registration_time)
+    rule = register_forecast_invalidation_rule(
+        {
+            "ruleVersion": "support-failure-v1",
+            "triggerType": "CIRCULATING_MARKET_CAP_BELOW",
+            "thresholds": {"marketCapUsd": 100_000_000},
+            "effectiveAt": registration_time.isoformat(),
+        }
+    )
+    with pytest.raises(Phase3ValidationError, match="post-outcome"):
+        classify_forecast_evaluation(
+            forecast["forecastId"],
+            {
+                "category": "prospectively_invalidated",
+                "ruleId": rule["ruleId"],
+                "triggerEvidenceSnapshotId": forecast["evidenceSnapshotId"],
+                "triggeredAt": (datetime.fromisoformat(forecast["deadline"]) + timedelta(seconds=1)).isoformat(),
+                "reason": "too late",
+            },
+        )
+    valid = classify_forecast_evaluation(
+        forecast["forecastId"],
+        {
+            "category": "prospectively_invalidated",
+            "ruleId": rule["ruleId"],
+            "triggerEvidenceSnapshotId": forecast["evidenceSnapshotId"],
+            "triggeredAt": (registration_time + timedelta(minutes=1)).isoformat(),
+            "warningEarlyEnough": True,
+            "invalidationConfirmed": False,
+            "reason": "predeclared support failure",
+        },
+    )
+    assert valid["category"] == "prospectively_invalidated"
+    with pytest.raises(Phase3ValidationError, match="excludes ordinary grading"):
+        grade_canonical_forecast(
+            forecast["forecastId"],
+            _outcome(datetime.fromisoformat(forecast["deadline"]), suffix="invalid-excluded"),
+        )
+
+
+def test_phase13_governance_migration_is_additive_and_guarded() -> None:
+    sql = Path("migrations/20260812_phase13_forecast_governance.sql").read_text(encoding="utf-8").lower()
+    assert "create table if not exists forecast_invalidation_rules" in sql
+    assert "create table if not exists forecast_evaluation_dispositions" in sql
+    assert "post-outcome forecast invalidation is forbidden" in sql
+    assert "a graded loss cannot be relabeled invalid" in sql
+    assert "category <> 'valid_completed'" in sql
+    assert "drop table" not in sql and "truncate" not in sql
 
 
 def test_phase3_migration_is_additive_immutable_and_covers_all_domains() -> None:

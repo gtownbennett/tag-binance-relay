@@ -13,9 +13,12 @@ from app.terminal_database import (
     AlertCaseRow,
     AlertOutcomeRow,
     AlertStageEventRow,
+    AssetTruthSnapshotRow,
     CanonicalEvidenceSnapshotRow,
     CanonicalForecastGradeRow,
     CanonicalForecastRow,
+    ForecastEvaluationDispositionRow,
+    ForecastInvalidationRuleRow,
     HistoricalAnalogRow,
     LearningVersionRow,
     MarketRegimeRow,
@@ -108,6 +111,15 @@ class Phase3ValidationError(ValueError):
     pass
 
 
+FORECAST_DISPOSITION_CATEGORIES = {
+    "valid_completed",
+    "prospectively_invalidated",
+    "ungradable",
+    "legacy_pre_repair",
+    "practice",
+}
+
+
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
@@ -136,6 +148,152 @@ def _finite(value: Any, field: str, *, positive: bool = False) -> float:
 
 def _row_payload(row: CanonicalForecastRow) -> dict[str, Any]:
     return json.loads(row.payload_json)
+
+
+def register_forecast_invalidation_rule(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Register an immutable rule before it can classify a forecast."""
+    version = str(payload.get("ruleVersion") or "").strip()
+    trigger_type = str(payload.get("triggerType") or "").strip()
+    thresholds = payload.get("thresholds") if isinstance(payload.get("thresholds"), dict) else {}
+    if not version or not trigger_type or not thresholds:
+        raise Phase3ValidationError("rule version, trigger type and thresholds are required")
+    registered_at = utc_now()
+    effective_at = _parse_time(payload.get("effectiveAt") or registered_at, "effectiveAt")
+    if effective_at < registered_at:
+        raise Phase3ValidationError("an invalidation rule cannot be backdated")
+    normalized = {
+        "ruleVersion": version,
+        "triggerType": trigger_type,
+        "thresholds": thresholds,
+        "registeredAt": registered_at.isoformat(),
+        "effectiveAt": effective_at.isoformat(),
+    }
+    rule_hash = stable_hash(normalized)
+    rule_id = f"invalidation_rule_{rule_hash[:24]}"
+    with session_scope() as session:
+        existing = session.scalar(select(ForecastInvalidationRuleRow).where(
+            ForecastInvalidationRuleRow.rule_version == version
+        ))
+        if existing is not None:
+            return {"ruleId": existing.rule_id, "deduplicated": True}
+        session.add(ForecastInvalidationRuleRow(
+            rule_id=rule_id,
+            rule_hash=rule_hash,
+            rule_version=version,
+            registered_at=registered_at,
+            effective_at=effective_at,
+            trigger_type=trigger_type,
+            threshold_json=json_dumps(thresholds),
+            payload_json=json_dumps(normalized),
+        ))
+    return {"ruleId": rule_id, "ruleVersion": version, "deduplicated": False}
+
+
+def classify_forecast_evaluation(forecast_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Persist one terminal category; wrong valid forecasts remain valid."""
+    category = str(payload.get("category") or "").strip().lower()
+    if category not in FORECAST_DISPOSITION_CATEGORIES:
+        raise Phase3ValidationError("forecast evaluation category is not canonical")
+    reason = str(payload.get("reason") or "").strip()
+    if not reason:
+        raise Phase3ValidationError("forecast evaluation disposition requires a reason")
+    grade_id = str(payload.get("gradeId") or "").strip() or None
+    rule_id = str(payload.get("ruleId") or "").strip() or None
+    evidence_id = str(payload.get("triggerEvidenceSnapshotId") or "").strip() or None
+    triggered_at = _parse_time(payload["triggeredAt"], "triggeredAt") if payload.get("triggeredAt") else None
+    with session_scope() as session:
+        forecast = session.get(CanonicalForecastRow, forecast_id)
+        if forecast is None:
+            raise Phase3ValidationError("forecast evaluation requires an existing forecast")
+        existing = session.scalar(select(ForecastEvaluationDispositionRow).where(
+            ForecastEvaluationDispositionRow.forecast_id == forecast_id
+        ))
+        if existing is not None:
+            return {"dispositionId": existing.disposition_id, "category": existing.category, "deduplicated": True}
+        if category == "valid_completed":
+            grade = session.get(CanonicalForecastGradeRow, grade_id) if grade_id else None
+            if grade is None or grade.forecast_id != forecast_id or grade.evaluation_kind != "live":
+                raise Phase3ValidationError("valid completion requires its canonical live grade")
+        elif grade_id is not None:
+            raise Phase3ValidationError("only valid completed forecasts may reference an ordinary grade")
+        if category == "prospectively_invalidated":
+            rule = session.get(ForecastInvalidationRuleRow, rule_id) if rule_id else None
+            evidence = session.get(CanonicalEvidenceSnapshotRow, evidence_id) if evidence_id else None
+            if rule is None or evidence is None or triggered_at is None:
+                raise Phase3ValidationError("prospective invalidation requires its predeclared rule, trigger time and evidence")
+            if _aware(rule.registered_at) > triggered_at or _aware(rule.effective_at) > triggered_at:
+                raise Phase3ValidationError("invalidation rule was not registered and effective before its trigger")
+            if triggered_at > _aware(forecast.deadline):
+                raise Phase3ValidationError("post-outcome forecast invalidation is forbidden")
+            if evidence.data_as_of is None or _aware(evidence.data_as_of) > triggered_at:
+                raise Phase3ValidationError("invalidation evidence was not available at the trigger")
+            if session.scalar(select(CanonicalForecastGradeRow).where(
+                CanonicalForecastGradeRow.forecast_id == forecast_id
+            )) is not None:
+                raise Phase3ValidationError("a graded loss cannot be relabeled invalid")
+        normalized = {
+            "forecastId": forecast_id,
+            "category": category,
+            "gradeId": grade_id,
+            "ruleId": rule_id,
+            "triggerEvidenceSnapshotId": evidence_id,
+            "triggeredAt": triggered_at.isoformat() if triggered_at else None,
+            "warningEarlyEnough": payload.get("warningEarlyEnough"),
+            "invalidationConfirmed": payload.get("invalidationConfirmed"),
+            "reason": reason,
+        }
+        disposition_hash = stable_hash(normalized)
+        disposition_id = f"forecast_disposition_{disposition_hash[:20]}"
+        session.add(ForecastEvaluationDispositionRow(
+            disposition_id=disposition_id,
+            disposition_hash=disposition_hash,
+            forecast_id=forecast_id,
+            category=category,
+            grade_id=grade_id,
+            rule_id=rule_id,
+            trigger_evidence_snapshot_id=evidence_id,
+            triggered_at=triggered_at,
+            warning_early_enough=payload.get("warningEarlyEnough"),
+            invalidation_confirmed=payload.get("invalidationConfirmed"),
+            reason=reason,
+            created_at=utc_now(),
+            payload_json=json_dumps(normalized),
+        ))
+    return {"dispositionId": disposition_id, "category": category, "deduplicated": False}
+
+
+def _ensure_valid_disposition(session: Any, forecast: CanonicalForecastRow, grade: CanonicalForecastGradeRow) -> None:
+    if grade.evaluation_kind != "live":
+        return
+    existing = session.scalar(select(ForecastEvaluationDispositionRow).where(
+        ForecastEvaluationDispositionRow.forecast_id == forecast.forecast_id
+    ))
+    if existing is not None:
+        if existing.category != "valid_completed" or existing.grade_id != grade.grade_id:
+            raise Phase3ValidationError("forecast terminal disposition excludes ordinary grading")
+        return
+    normalized = {
+        "forecastId": forecast.forecast_id,
+        "category": "valid_completed",
+        "gradeId": grade.grade_id,
+        "reason": "Verified exact-deadline live outcome graded under the canonical contract.",
+    }
+    disposition_hash = stable_hash(normalized)
+    session.add(ForecastEvaluationDispositionRow(
+        disposition_id=f"forecast_disposition_{disposition_hash[:20]}",
+        disposition_hash=disposition_hash,
+        forecast_id=forecast.forecast_id,
+        category="valid_completed",
+        grade_id=grade.grade_id,
+        rule_id=None,
+        trigger_evidence_snapshot_id=None,
+        triggered_at=None,
+        warning_early_enough=None,
+        invalidation_confirmed=None,
+        reason=normalized["reason"],
+        created_at=utc_now(),
+        payload_json=json_dumps(normalized),
+    ))
 
 
 def persist_verified_outcome(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -169,6 +327,25 @@ def persist_verified_outcome(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
         if existing is not None:
             return {"outcomeId": existing.outcome_id, "deduplicated": True}
+        # A matched shadow and its canonical forecast intentionally share one
+        # exact-deadline realization.  Source references identify the consumer
+        # forecast, so they can differ even though the immutable market
+        # observation is the same.  Reuse the database natural key before an
+        # INSERT reaches its uniqueness constraint.
+        natural_existing = session.scalar(
+            select(VerifiedOutcomeRow).where(
+                VerifiedOutcomeRow.asset_symbol == normalized["assetSymbol"],
+                VerifiedOutcomeRow.observed_at == _parse_time(normalized["observedAt"], "observedAt"),
+                VerifiedOutcomeRow.source_name == normalized["sourceName"],
+            )
+        )
+        if natural_existing is not None:
+            return {
+                "outcomeId": natural_existing.outcome_id,
+                "outcomeHash": natural_existing.outcome_hash,
+                "deduplicated": True,
+                "dedupeBasis": "asset_observed_at_source",
+            }
         if normalized["evidenceSnapshotId"] and session.get(
             CanonicalEvidenceSnapshotRow, normalized["evidenceSnapshotId"]
         ) is None:
@@ -393,6 +570,11 @@ def grade_canonical_forecast(
             raise Phase3ValidationError("forecast and verified outcome must exist")
         if _aware(forecast.deadline) != _aware(outcome.observed_at):
             raise Phase3ValidationError("verified outcome must be observed at the exact forecast deadline")
+        disposition = session.scalar(select(ForecastEvaluationDispositionRow).where(
+            ForecastEvaluationDispositionRow.forecast_id == forecast_id
+        ))
+        if disposition is not None and disposition.category != "valid_completed":
+            raise Phase3ValidationError("forecast terminal disposition excludes ordinary grading")
         existing = session.scalar(
             select(CanonicalForecastGradeRow).where(
                 CanonicalForecastGradeRow.subject_type == "forecast",
@@ -402,6 +584,7 @@ def grade_canonical_forecast(
             )
         )
         if existing is not None:
+            _ensure_valid_disposition(session, forecast, existing)
             return {"gradeId": existing.grade_id, "deduplicated": True, "gradeLabel": existing.grade_label}
 
         record = _row_payload(forecast)
@@ -488,8 +671,7 @@ def grade_canonical_forecast(
             {"forecastId": forecast_id, "outcomeId": outcome_id, "kind": evaluation_kind, "version": GRADE_VERSION, "metrics": metrics}
         )
         grade_id = f"grade_{grade_hash[:32]}"
-        session.add(
-            CanonicalForecastGradeRow(
+        grade_row = CanonicalForecastGradeRow(
                 grade_id=grade_id,
                 grade_hash=grade_hash,
                 subject_type="forecast",
@@ -530,7 +712,9 @@ def grade_canonical_forecast(
                     }
                 ),
             )
-        )
+        session.add(grade_row)
+        session.flush()
+        _ensure_valid_disposition(session, forecast, grade_row)
     return {
         "gradeId": grade_id,
         "deduplicated": False,
@@ -1253,7 +1437,9 @@ def finalize_alert(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {"outcomeId": outcome_id, "resultClass": result_class, "leadTimeSeconds": lead_time, "deduplicated": False}
 
 
-def active_alerts(*, limit: int = 50) -> list[dict[str, Any]]:
+def active_alerts(*, limit: int = 50, now: datetime | None = None) -> list[dict[str, Any]]:
+    observed_now = _aware(now or utc_now())
+    current_value_max_age = timedelta(minutes=30)
     with session_scope() as session:
         archived_ids = select(AlertOutcomeRow.alert_id).where(AlertOutcomeRow.alert_id.is_not(None))
         cases = session.scalars(
@@ -1274,6 +1460,30 @@ def active_alerts(*, limit: int = 50) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for case in cases:
             latest = latest_by_case.get(case.alert_id)
+            level = session.get(UserMarketCapLevelVersionRow, case.level_version_id) if case.level_version_id else None
+            current_value = latest.market_cap_usd if latest is not None else None
+            target_low = float(level.low_usd) if level is not None and level.enabled else None
+            target_high = float(level.high_usd) if level is not None and level.enabled else None
+            if current_value is None or target_low is None or target_high is None:
+                distance_pct = None
+                distance_direction = "UNAVAILABLE"
+            elif target_low <= current_value <= target_high:
+                distance_pct = 0.0
+                distance_direction = "INSIDE"
+            elif current_value < target_low:
+                distance_pct = (target_low / current_value - 1.0) * 100.0 if current_value > 0 else None
+                distance_direction = "BELOW"
+            else:
+                distance_pct = (current_value / target_high - 1.0) * 100.0
+                distance_direction = "ABOVE"
+            configured = bool(level is not None and level.enabled)
+            current_present = current_value is not None and current_value > 0
+            current_observed_at = _aware(latest.detected_at) if latest is not None else None
+            current_fresh = bool(
+                current_present and current_observed_at is not None
+                and observed_now <= current_observed_at + current_value_max_age
+            )
+            actionable = configured and current_fresh
             results.append(
                 {
                     "alertId": case.alert_id,
@@ -1288,6 +1498,55 @@ def active_alerts(*, limit: int = 50) -> list[dict[str, Any]]:
                     "priceUsd": latest.price_usd if latest is not None else None,
                     "marketCapUsd": latest.market_cap_usd if latest is not None else None,
                     "notificationAllowed": latest.notification_allowed if latest is not None else False,
+                    "alertVersion": ALERT_VERSION,
+                    "target": {
+                        "type": "CIRCULATING_MARKET_CAP_RANGE_USD",
+                        "lowUsd": target_low,
+                        "highUsd": target_high,
+                    } if configured else None,
+                    # Retained for older Android clients; range-aware clients
+                    # must use the structured target above.
+                    "targetUsd": target_low,
+                    "currentValue": {
+                        "type": "CIRCULATING_MARKET_CAP_USD",
+                        "valueUsd": current_value,
+                    } if current_present else None,
+                    "distancePct": distance_pct,
+                    "distanceDirection": distance_direction,
+                    "activationCondition": (
+                        f"Activate when verified circulating market cap enters "
+                        f"${target_low:,.0f}–${target_high:,.0f}."
+                        if configured else ""
+                    ),
+                    "clearingCondition": (
+                        "Clear when verified circulating market cap moves more than 5% outside the configured range, "
+                        "the level is disabled, or the case is explicitly finalized."
+                        if configured else ""
+                    ),
+                    "urgency": latest.stage if latest is not None else "OBSERVING",
+                    "ownerDecision": (
+                        "Review the saved owner plan; no automatic order is permitted."
+                        if actionable and latest is not None and latest.stage in {"CONFIRMED", "URGENT ACTION"}
+                        else "Watch; no automatic order is permitted."
+                        if actionable else "No action — configuration incomplete."
+                    ),
+                    "effectiveAt": _aware(level.created_at).isoformat() if level is not None else None,
+                    "expiresAt": (
+                        (current_observed_at + current_value_max_age).isoformat()
+                        if current_observed_at is not None else None
+                    ),
+                    "actionabilityStatus": "ACTIONABLE" if actionable else (
+                        "MISSING_CONFIGURATION" if not configured
+                        else "CURRENT_VALUE_UNAVAILABLE" if not current_present
+                        else "STALE_CURRENT_VALUE"
+                    ),
+                    "levelVersionId": case.level_version_id,
+                    "levelName": level.label if level is not None else "",
+                    "provenance": {
+                        "evidenceSnapshotId": latest.evidence_snapshot_id if latest is not None else case.initial_evidence_snapshot_id,
+                        "evidenceHash": latest.evidence_hash if latest is not None else None,
+                        "levelVersionId": case.level_version_id,
+                    },
                 }
             )
     return results
@@ -1560,11 +1819,22 @@ def process_level_alerts_from_latest_evidence() -> dict[str, Any]:
         None,
     )
     spot = spot_item.get("payload") if isinstance(spot_item, dict) and isinstance(spot_item.get("payload"), dict) else {}
-    market_cap = spot.get("marketCapUsd")
     price = spot.get("priceUsd")
-    if market_cap is None:
-        return {"processed": 0, "reason": "verified market cap unavailable"}
-    market_cap_value = float(market_cap)
+    if price is None:
+        return {"processed": 0, "reason": "verified price unavailable"}
+    with session_scope() as session:
+        supply = session.scalar(
+            select(AssetTruthSnapshotRow)
+            .where(
+                AssetTruthSnapshotRow.asset_symbol == "TAG",
+                AssetTruthSnapshotRow.verification_status == "verified",
+            )
+            .order_by(AssetTruthSnapshotRow.verified_at.desc(), AssetTruthSnapshotRow.created_at.desc())
+            .limit(1)
+        )
+    if supply is None:
+        return {"processed": 0, "reason": "verified circulating supply unavailable"}
+    market_cap_value = float(price) * float(supply.circulating_supply)
     processed = 0
     for level in current_user_levels():
         if not level["enabled"]:
