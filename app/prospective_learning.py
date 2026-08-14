@@ -32,7 +32,7 @@ from .terminal_database import (
 PROSPECTIVE_TOURNAMENT_VERSION = "prospective-tournament-v1"
 THRESHOLDS = (30, 100, 250)
 HORIZONS = ("1h", "4h", "24h", "7d", "30d")
-ALL_HORIZONS = ("1h", "4h", "12h", "24h", "3d", "7d", "30d", "3m", "1y", "5y")
+ALL_HORIZONS = ("1h", "4h", "12h", "24h", "3d", "7d", "30d", "3m", "6m", "1y", "3y", "5y")
 
 
 def _finite(value: Any) -> float | None:

@@ -1201,6 +1201,18 @@ def _similarity(
 def _canonical_current_features(features: Mapping[str, Any]) -> dict[str, Any]:
     """Map horizon/live feature names into stable cross-era analog families."""
 
+    explicit = features.get("historicalAnalogFeatures")
+    if isinstance(explicit, Mapping):
+        # Current canonical projection fields are bounded model inputs, while
+        # historical event fields use raw fractional returns, ratios, and USD
+        # values. New evidence packets carry an explicit comparable namespace
+        # so the matcher never mixes those unit systems.
+        return {
+            str(key): value
+            for key, value in explicit.items()
+            if _number(value) is not None
+        }
+
     def first(*names: str) -> Any:
         for name in names:
             if _number(features.get(name)) is not None:

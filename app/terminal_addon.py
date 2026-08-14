@@ -40,6 +40,7 @@ from .terminal_intelligence import (
     liquidation_feed,
     prediction_ledger,
     server_oi_history,
+    server_realized_volatility_24h,
     share_report_text,
 )
 from .terminal_multi_exchange import multi_exchange_service
@@ -326,13 +327,51 @@ class TerminalAddon:
                     "deferred": True,
                 }
             )
+            volatility = (
+                server_realized_volatility_24h()
+                if include_server_history
+                else {
+                    "available": False,
+                    "realizedVolatility24hPct": None,
+                    "status": "Stored realized-volatility history is deferred.",
+                }
+            )
+            if volatility.get("available"):
+                spot_compat = {
+                    **spot_compat,
+                    "realizedVolatility24hPct": volatility.get("realizedVolatility24hPct"),
+                    "realizedVolatility24hPointCount": volatility.get("pointCount"),
+                    "realizedVolatility24hFirstObservedAt": volatility.get("firstObservedAt"),
+                    "realizedVolatility24hLastObservedAt": volatility.get("lastObservedAt"),
+                    "realizedVolatility24hMethod": volatility.get("method"),
+                }
+            enriched_exchanges = []
+            for row in futures.get("exchanges") or []:
+                if isinstance(row, dict) and row.get("exchange") == "Binance":
+                    enriched_exchanges.append({
+                        **row,
+                        "oiChange5mPct": history.get("change5mPct"),
+                        "oiChange15mPct": history.get("change15mPct"),
+                        "oiChange1hPct": history.get("change1hPct"),
+                        "oiChange4hPct": history.get("change4hPct"),
+                        "oiChange24hPct": history.get("change24hPct"),
+                        "oiHistoryCoverageKey": history.get("coverageKey"),
+                    })
+                else:
+                    enriched_exchanges.append(row)
             futures = {
                 **futures,
+                "exchanges": enriched_exchanges,
                 "oiChange5m": history.get("change5mPct"),
                 "oiChange15m": history.get("change15mPct"),
                 "oiChange1h": history.get("change1hPct"),
                 "oiChange4h": history.get("change4hPct"),
                 "oiChange24h": history.get("change24hPct"),
+                "oiChange5mPct": history.get("change5mPct"),
+                "oiChange15mPct": history.get("change15mPct"),
+                "oiChange1hPct": history.get("change1hPct"),
+                "oiChange4hPct": history.get("change4hPct"),
+                "oiChange24hPct": history.get("change24hPct"),
                 "historyStatus": history.get("status"),
             }
             result = {
@@ -341,6 +380,7 @@ class TerminalAddon:
                 "futures": futures,
                 "binance": binance,
                 "serverOiHistory": history,
+                "serverRealizedVolatility24h": volatility,
             }
             self.market_cache["time"] = time.monotonic()
             self.market_cache["value"] = result

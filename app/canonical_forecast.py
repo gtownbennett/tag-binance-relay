@@ -98,10 +98,20 @@ HORIZON_SPECS: dict[str, HorizonSpec] = {
         (("adoptionTrend3m", 0.27), ("liquidityTrend3m", 0.24), ("listingAccess3m", 0.17), ("supplyTrend3m", -0.14), ("cryptoRegime3m", 0.18)),
         "Three-month outlook is driven by adoption, exchange access, liquidity, supply, and macro regime.",
     ),
+    "6m": HorizonSpec(
+        "6m", 262_800, "3m-6m", "scenarioDispersion6mPct", 42.0, 100.0, 6.5,
+        (("adoptionTrend6m", 0.28), ("liquidityTrend6m", 0.24), ("listingAccess6m", 0.18), ("supplyTrend6m", -0.13), ("cryptoRegime6m", 0.17)),
+        "Six-month scenario outlook uses adoption, exchange access, liquidity durability, supply, and cycle regime.",
+    ),
     "1y": HorizonSpec(
         "1y", 525_600, "3m-1y", "scenarioDispersion1yPct", 55.0, 140.0, 8.0,
         (("adoptionTrend1y", 0.30), ("liquidityTrend1y", 0.24), ("listingAccess1y", 0.18), ("supplyTrend1y", -0.12), ("cryptoRegime1y", 0.16)),
         "One-year scenario outlook uses adoption, exchange access, liquidity durability, supply, and cycle regime.",
+    ),
+    "3y": HorizonSpec(
+        "3y", 1_576_800, "1y-3y", "scenarioDispersion3yPct", 72.0, 280.0, 10.0,
+        (("adoptionTrend3y", 0.31), ("liquidityTrend3y", 0.25), ("listingAccess3y", 0.17), ("supplyTrend3y", -0.12), ("cryptoRegime3y", 0.15)),
+        "Three-year scenario outlook requires durable adoption, liquidity, access, supply discipline, and cycle survival.",
     ),
     "5y": HorizonSpec(
         "5y", 2_628_000, "1y-5y", "scenarioDispersion5yPct", 85.0, 400.0, 12.0,
@@ -120,9 +130,14 @@ MINIMUM_INDEPENDENT_SAMPLES: dict[str, int | None] = {
     "7d": 20,
     "30d": 12,
     "3m": 12,
+    "6m": None,
     "1y": None,
+    "3y": None,
     "5y": None,
 }
+
+
+SCENARIO_ONLY_HORIZONS = frozenset({"6m", "1y", "3y", "5y"})
 
 
 def _stable_json(value: Any) -> str:
@@ -396,7 +411,15 @@ def canonical_features_from_evidence_packet(packet: Mapping[str, Any]) -> dict[s
     ]
     references = [str(item.get("sourceId")) for item in available if item.get("sourceId")]
     by_id = {str(item.get("sourceId")): item for item in available}
-    features: dict[str, Any] = {"evidenceReferences": sorted(references), "featureAvailability": {}}
+    features: dict[str, Any] = {
+        "evidenceReferences": sorted(references),
+        "featureAvailability": {},
+        # Analog matching uses historical event units, not the bounded model
+        # inputs below. Keeping the two namespaces separate prevents a scaled
+        # forecast signal from being compared with a raw fractional return.
+        "historicalAnalogFeatures": {},
+    }
+    analog = features["historicalAnalogFeatures"]
 
     def payload(source_id: str) -> Mapping[str, Any]:
         item = by_id.get(source_id)
@@ -410,6 +433,10 @@ def canonical_features_from_evidence_packet(packet: Mapping[str, Any]) -> dict[s
         if value is not None:
             features[name] = value
             features["featureAvailability"][name] = "observed_dex_spot"
+    raw_price_change_24h = _bounded_unit(changes.get("h24"), scale=100.0)
+    if raw_price_change_24h is not None:
+        analog["priceStructure"] = raw_price_change_24h
+        analog["returnPath"] = raw_price_change_24h
     for raw, name, scale in ((volumes.get("h24"), "spotVolume24h", 1_000_000.0), (dex.get("liquidityUsd"), "liquidityChange24h", 2_000_000.0)):
         value = _bounded_unit(raw, scale=scale)
         if value is not None:
@@ -417,11 +444,32 @@ def canonical_features_from_evidence_packet(packet: Mapping[str, Any]) -> dict[s
             features["featureAvailability"][name] = "observed_dex_spot"
 
     futures = payload("futures:binance")
-    for raw, name, scale in ((futures.get("oiChange1hPct"), "oiChange1h", 15.0), (futures.get("oiChange4hPct"), "oiChange4h", 30.0), (futures.get("fundingRate"), "fundingTrend4h", 0.30), (futures.get("orderBookImbalancePct"), "orderBookDepth4h", 100.0)):
+    for raw, name, scale in ((futures.get("oiChange1hPct"), "oiChange1h", 15.0), (futures.get("oiChange4hPct"), "oiChange4h", 30.0), (futures.get("oiChange24hPct"), "oiChange24h", 60.0), (futures.get("fundingRate"), "fundingTrend4h", 0.30), (futures.get("orderBookImbalancePct"), "orderBookDepth4h", 100.0)):
         value = _bounded_unit(raw, scale=scale)
         if value is not None:
             features[name] = value
             features["featureAvailability"][name] = "observed_futures"
+    raw_oi_change_24h = _bounded_unit(futures.get("oiChange24hPct"), scale=100.0)
+    if raw_oi_change_24h is not None:
+        analog["openInterestChange"] = raw_oi_change_24h
+    try:
+        raw_funding = float(futures.get("fundingRate"))
+    except (TypeError, ValueError):
+        raw_funding = math.nan
+    if math.isfinite(raw_funding):
+        # Multi-exchange snapshots expose funding in percentage points while
+        # imported historical rows retain the exchange fractional rate.
+        analog["funding"] = raw_funding / 100.0
+    for source_name, target_name in (
+        ("longShortRatio", "longShortPositioning"),
+        ("takerBuySellRatio", "takerImbalance"),
+    ):
+        try:
+            raw_value = float(futures.get(source_name))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(raw_value):
+            analog[target_name] = raw_value
     try:
         ratio = float(futures.get("takerBuySellRatio"))
         taker = (ratio - 1.0) / (ratio + 1.0) if math.isfinite(ratio) and ratio > 0 else None
@@ -430,6 +478,14 @@ def canonical_features_from_evidence_packet(packet: Mapping[str, Any]) -> dict[s
     if taker is not None:
         features["takerImbalance1h"] = max(-1.0, min(1.0, taker))
         features["featureAvailability"]["takerImbalance1h"] = "observed_futures"
+    realized_volatility = dex.get("realizedVolatility24hPct")
+    try:
+        realized_volatility_value = float(realized_volatility)
+    except (TypeError, ValueError):
+        realized_volatility_value = math.nan
+    if math.isfinite(realized_volatility_value) and realized_volatility_value > 0:
+        features["realizedVolatility24hPct"] = realized_volatility_value
+        features["featureAvailability"]["realizedVolatility24hPct"] = "observed_dex_spot_history"
     try:
         long_liq = float(futures.get("longLiquidation1hUsd"))
         short_liq = float(futures.get("shortLiquidation1hUsd"))
@@ -457,6 +513,17 @@ def canonical_features_from_evidence_packet(packet: Mapping[str, Any]) -> dict[s
             features["cexDexAgreement24h"] = 1.0 - abs(value)
             features["featureAvailability"]["cexDexAgreement12h"] = "observed_cross_venue_spot"
             features["featureAvailability"]["cexDexAgreement24h"] = "observed_cross_venue_spot"
+            analog["spotConfirmation"] = 1.0 - abs(value)
+    for raw, name in (
+        (dex.get("marketCapUsd") or dex.get("marketCap"), "marketCap"),
+        (dex.get("liquidityUsd"), "liquidity"),
+    ):
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed) and parsed > 0:
+            analog[name] = parsed
     return features
 
 
@@ -707,13 +774,19 @@ def _long_term_scenarios(
     supply: float,
     quantity: float | None,
 ) -> list[dict[str, Any]]:
-    is_five_year = spec.label == "5y"
+    scenario_moves = {
+        "6m": (-35.0, 90.0, 220.0),
+        "1y": (-45.0, 140.0, 400.0),
+        "3y": (-60.0, 300.0, 900.0),
+        "5y": (-70.0, 450.0, 1_500.0),
+    }
     extreme = max(0.03, min(0.10, 0.05 + max(score, 0.0) * 0.03))
     bear = max(0.12, min(0.42, 0.28 - score * 0.10))
     bull = max(0.12, min(0.38, 0.24 + score * 0.08))
     base = max(0.18, 1.0 - extreme - bear - bull)
     probabilities = _normalized_probabilities([bear, base, bull, extreme])
-    moves = (-70.0 if is_five_year else -45.0, score * spec.drift_cap_pct * 0.35, 450.0 if is_five_year else 140.0, 1_500.0 if is_five_year else 400.0)
+    bear_move, bull_move, extreme_move = scenario_moves[spec.label]
+    moves = (bear_move, score * spec.drift_cap_pct * 0.35, bull_move, extreme_move)
     prices = [max(current_price * (1.0 + move / 100.0), current_price * 0.05) for move in moves]
     shared_risks = ["Liquidity can deteriorate.", "Supply or token access can change.", "Crypto market regimes can reverse."]
     rows = (
@@ -837,12 +910,17 @@ def build_tagalysis_forecast(
             - sum(row["points"] for row in quality["confidencePenalties"]),
         ),
     )
+    if canonical_horizon in SCENARIO_ONLY_HORIZONS:
+        # Scenario horizons have no completed live calibration by design.
+        # Coverage may describe their inputs, but it must not become a
+        # fabricated predictive-confidence score.
+        confidence = 0.0
     dispersion_pct = min(spec.drift_cap_pct * 1.5, volatility_pct)
     up = projection["probabilityUp"]
     sideways = projection["probabilitySideways"]
     down = projection["probabilityDown"]
     scenarios: list[dict[str, Any]]
-    if canonical_horizon in {"1y", "5y"}:
+    if canonical_horizon in SCENARIO_ONLY_HORIZONS:
         scenarios = _long_term_scenarios(
             spec,
             current_price=price,
@@ -959,7 +1037,7 @@ def build_tagalysis_forecast(
             "intervalBasis": "horizon-specific dispersion quantiles",
         },
         "calibration": {
-            "status": "long-term-scenario-not-live-calibrated" if canonical_horizon in {"1y", "5y"} else "still-learning",
+            "status": "long-term-scenario-not-live-calibrated" if canonical_horizon in SCENARIO_ONLY_HORIZONS else "still-learning",
             "minimumIndependentSamples": MINIMUM_INDEPENDENT_SAMPLES[canonical_horizon],
             "completedIndependentSamples": 0,
         },
@@ -1029,8 +1107,8 @@ def canonicalize_forecast(value: Mapping[str, Any]) -> dict[str, Any]:
     scenario_probability = sum(_finite_nonnegative(row.get("probability"), "scenario.probability") for row in scenarios if isinstance(row, dict))
     if abs(scenario_probability - 1.0) > 0.001:
         raise ForecastValidationError("scenario probabilities must total 1")
-    if horizon in {"1y", "5y"} and [row.get("id") for row in scenarios] != ["bear", "base", "bull", "extreme"]:
-        raise ForecastValidationError("1Y/5Y require bear, base, bull, and extreme scenario records")
+    if horizon in SCENARIO_ONLY_HORIZONS and [row.get("id") for row in scenarios] != ["bear", "base", "bull", "extreme"]:
+        raise ForecastValidationError("scenario-only horizons require bear, base, bull, and extreme scenario records")
     for row in scenarios:
         if not isinstance(row, dict) or not row.get("conditions") or not row.get("invalidation") or not row.get("risks"):
             raise ForecastValidationError("every scenario requires conditions, invalidation, and risks")
@@ -1048,7 +1126,7 @@ def canonicalize_forecast(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(calibration, dict):
         raise ForecastValidationError("calibration status is required")
     minimum = calibration.get("minimumIndependentSamples")
-    if horizon in {"1y", "5y"} and minimum is not None:
+    if horizon in SCENARIO_ONLY_HORIZONS and minimum is not None:
         raise ForecastValidationError("long-term calibration availability must be nullable, never a maximum-integer sentinel")
     serialized = _stable_json(record)
     if "2147483647" in serialized:

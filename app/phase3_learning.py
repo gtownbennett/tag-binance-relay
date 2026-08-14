@@ -76,7 +76,9 @@ HORIZON_MINIMUM_SAMPLES = {
     "7d": 12,
     "30d": 10,
     "3m": 8,
+    "6m": 8,
     "1y": 8,
+    "3y": 5,
     "5y": 5,
 }
 HORIZON_BASE_TOLERANCE_PCT = {
@@ -88,7 +90,9 @@ HORIZON_BASE_TOLERANCE_PCT = {
     "7d": 5.0,
     "30d": 8.0,
     "3m": 12.0,
+    "6m": 16.0,
     "1y": 20.0,
+    "3y": 30.0,
     "5y": 35.0,
 }
 

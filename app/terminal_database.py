@@ -882,7 +882,7 @@ class CanonicalForecastRow(Base):
             name="ck_canonical_forecast_producer",
         ),
         CheckConstraint(
-            "horizon IN ('1h','4h','12h','24h','3d','7d','30d','3m','1y','5y')",
+            "horizon IN ('1h','4h','12h','24h','3d','7d','30d','3m','6m','1y','3y','5y')",
             name="ck_canonical_forecast_horizon",
         ),
         CheckConstraint(
@@ -1474,9 +1474,71 @@ def _migrate_postgres_timestamp_columns() -> None:
             connection.execute(text(statement))
 
 
+def _migrate_canonical_horizon_constraints() -> None:
+    """Extend existing production checks for scenario-only 6m and 3y rows."""
+
+    if engine.dialect.name != "postgresql":
+        return
+    definitions = {
+        "ck_canonical_forecast_horizon": (
+            "horizon IN ('1h','4h','12h','24h','3d','7d','30d','3m','6m','1y','3y','5y')"
+        ),
+        "ck_canonical_forecast_horizon_minutes": (
+            "(horizon = '1h' AND horizon_minutes = 60) OR "
+            "(horizon = '4h' AND horizon_minutes = 240) OR "
+            "(horizon = '12h' AND horizon_minutes = 720) OR "
+            "(horizon = '24h' AND horizon_minutes = 1440) OR "
+            "(horizon = '3d' AND horizon_minutes = 4320) OR "
+            "(horizon = '7d' AND horizon_minutes = 10080) OR "
+            "(horizon = '30d' AND horizon_minutes = 43200) OR "
+            "(horizon = '3m' AND horizon_minutes = 129600) OR "
+            "(horizon = '6m' AND horizon_minutes = 262800) OR "
+            "(horizon = '1y' AND horizon_minutes = 525600) OR "
+            "(horizon = '3y' AND horizon_minutes = 1576800) OR "
+            "(horizon = '5y' AND horizon_minutes = 2628000)"
+        ),
+    }
+    with engine.begin() as connection:
+        existing = {
+            row.conname: row.definition
+            for row in connection.execute(
+                text(
+                    "SELECT conname, pg_get_constraintdef(oid) AS definition "
+                    "FROM pg_constraint WHERE conrelid = 'canonical_forecasts'::regclass "
+                    "AND conname IN ('ck_canonical_forecast_horizon', "
+                    "'ck_canonical_forecast_horizon_minutes')"
+                )
+            )
+        }
+        for name, definition in definitions.items():
+            current = str(existing.get(name) or "")
+            if "'6m'" in current and "'3y'" in current:
+                continue
+            replacement = f"{name}_v2"
+            connection.execute(
+                text(
+                    f"ALTER TABLE canonical_forecasts ADD CONSTRAINT {replacement} "
+                    f"CHECK ({definition}) NOT VALID"
+                )
+            )
+            connection.execute(
+                text(f"ALTER TABLE canonical_forecasts VALIDATE CONSTRAINT {replacement}")
+            )
+            if current:
+                connection.execute(
+                    text(f"ALTER TABLE canonical_forecasts DROP CONSTRAINT {name}")
+                )
+            connection.execute(
+                text(
+                    f"ALTER TABLE canonical_forecasts RENAME CONSTRAINT {replacement} TO {name}"
+                )
+            )
+
+
 def init_db() -> None:
     Base.metadata.create_all(engine)
     _migrate_postgres_timestamp_columns()
+    _migrate_canonical_horizon_constraints()
     # Existing PostgreSQL tables predate these composite indexes. create_all()
     # does not add them to an already-created table, so create them explicitly
     # and idempotently.

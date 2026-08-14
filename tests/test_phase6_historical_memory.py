@@ -29,6 +29,7 @@ from app.historical_memory import (
     TAG_CONTRACT,
     HistoricalMemoryError,
     _historical_signal_features_at,
+    _canonical_current_features,
     _bounded_detection_plan,
     begin_backfill_range,
     build_coverage_report,
@@ -243,6 +244,26 @@ def _features() -> dict:
         "cexDexAgreement24h": 0.3,
         "liquidityChange24h": 0.2,
         "realizedVolatility24hPct": 5.0,
+    }
+
+
+def test_live_analog_namespace_preserves_historical_units() -> None:
+    normalized = _canonical_current_features({
+        "priceChange24h": 0.8,
+        "oiChange24h": 0.9,
+        "spotVolume24h": 0.7,
+        "historicalAnalogFeatures": {
+            "priceStructure": 0.04,
+            "returnPath": 0.04,
+            "openInterestChange": -0.12,
+            "takerImbalance": 1.15,
+        },
+    })
+    assert normalized == {
+        "priceStructure": 0.04,
+        "returnPath": 0.04,
+        "openInterestChange": -0.12,
+        "takerImbalance": 1.15,
     }
 
 

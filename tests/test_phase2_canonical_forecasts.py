@@ -55,7 +55,9 @@ def _market_fixture() -> dict:
                     "volumeUsd24h": 2_000_000.0,
                     "oiChange1hPct": 3.0,
                     "oiChange4hPct": 5.0,
+                    "oiChange24hPct": 8.0,
                     "takerBuySellRatio": 1.2,
+                    "longShortRatio": 1.05,
                     "updatedAt": observed,
                 }
                 for name, symbol in (
@@ -74,6 +76,8 @@ def _market_fixture() -> dict:
             "priceChangePct": {"h1": 0.5, "h24": 1.5},
             "transactions": {"h1": {"buys": 5, "sells": 4}},
             "liquidityUsd": 500_000.0,
+            "marketCapUsd": 108_000_000.0,
+            "realizedVolatility24hPct": 4.25,
             "pairAddress": "0xf0750c373ebbb3baeef7e03d8300caad1983d67c",
             "generatedAt": observed,
         },
@@ -220,6 +224,11 @@ def test_evidence_feature_adapter_preserves_spot_futures_and_missingness() -> No
     features = canonical_features_from_evidence_packet(packet)
     assert features["featureAvailability"]["priceChange1h"] == "observed_dex_spot"
     assert features["featureAvailability"]["oiChange1h"] == "observed_futures"
+    assert features["featureAvailability"]["oiChange24h"] == "observed_futures"
+    assert features["featureAvailability"]["realizedVolatility24hPct"] == "observed_dex_spot_history"
+    assert features["historicalAnalogFeatures"]["priceStructure"] == pytest.approx(0.015)
+    assert features["historicalAnalogFeatures"]["openInterestChange"] == pytest.approx(0.08)
+    assert features["historicalAnalogFeatures"]["takerImbalance"] == pytest.approx(1.2)
     assert "spotConfirmation4h" not in features
     assert "cexDexAgreement12h" not in features
 
@@ -258,10 +267,11 @@ def test_all_six_producers_are_separate_and_deterministic_builder_cannot_imperso
 
 
 def test_integer_sentinel_is_impossible_and_long_term_calibration_is_explicitly_unavailable() -> None:
-    for horizon in ("1y", "5y"):
+    for horizon in ("6m", "1y", "3y", "5y"):
         forecast = _forecast(horizon)
         assert forecast["calibration"]["minimumIndependentSamples"] is None
         assert forecast["calibration"]["status"] == "long-term-scenario-not-live-calibrated"
+        assert forecast["confidence"]["score"] == 0.0
         assert "2147483647" not in json.dumps(forecast)
     assert all(value is None or value < 2_147_483_647 for value in MINIMUM_INDEPENDENT_SAMPLES.values())
 
@@ -297,9 +307,9 @@ def test_direction_uses_probability_and_p50_and_supports_no_strong_edge() -> Non
 
 def test_every_horizon_has_distinct_logic_deadline_and_explanation() -> None:
     forecasts = {horizon: _forecast(horizon) for horizon in HORIZON_SPECS}
-    assert len({tuple(row["forecastMethod"]["featureNames"]) for row in forecasts.values()}) == 10
-    assert len({row["forecastMethod"]["featureWindow"] for row in forecasts.values()}) == 10
-    assert len({row["evidenceSummary"] for row in forecasts.values()}) == 10
+    assert len({tuple(row["forecastMethod"]["featureNames"]) for row in forecasts.values()}) == 12
+    assert len({row["forecastMethod"]["featureWindow"] for row in forecasts.values()}) == 12
+    assert len({row["evidenceSummary"] for row in forecasts.values()}) == 12
     for horizon, row in forecasts.items():
         expected = datetime.fromisoformat(row["issuedAt"]) + timedelta(minutes=HORIZON_SPECS[horizon].minutes)
         assert datetime.fromisoformat(row["deadline"]) == expected
