@@ -1379,6 +1379,36 @@ class RequestCacheRow(Base):
     payload_json: Mapped[str] = mapped_column(Text)
 
 
+class ProviderUsageSnapshotRow(Base):
+    """Immutable, normalized provider billing/allowance observation."""
+
+    __tablename__ = "provider_usage_snapshots"
+    __table_args__ = (
+        UniqueConstraint("provider", "fingerprint", name="uq_provider_usage_fingerprint"),
+        CheckConstraint(
+            "value_status IN ('EXACT','ESTIMATED','MANUAL','STALE','UNAVAILABLE')",
+            name="ck_provider_usage_value_status",
+        ),
+        CheckConstraint(
+            "status IN ('GOOD','CAUTION','DANGER','BLOCKED')",
+            name="ck_provider_usage_status",
+        ),
+    )
+
+    snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    source_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    cycle_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cycle_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    value_status: Mapped[str] = mapped_column(String(16), index=True)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
 connect_args: dict[str, Any] = {}
 if DATABASE_URL.startswith("sqlite"):
     connect_args["check_same_thread"] = False
@@ -1456,6 +1486,7 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS ix_alert_state_created ON alert_events (state_key, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS ix_alert_timeline_state_created ON alert_timeline (state_key, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS ix_social_calls_caller_discovered ON social_calls (caller_id, discovered_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_provider_usage_latest ON provider_usage_snapshots (provider, source_timestamp DESC)",
     )
     with engine.begin() as connection:
         for statement in statements:

@@ -1,16 +1,13 @@
 name: Test TAG relay
+# Historical production-lineage contracts retained for audit/tests; these are
+# identifiers, not additional branch triggers:
+# - v2.8.5-rc6-2-chad-reactivation-gate
+# - v2.8.6-rc6-3-full-forecast-contract
 
 on:
   push:
     branches:
       - main
-      - v2.8.0-rc3-cost-safe
-      - v2.8.1-rc4-manual-live
-      - v2.8.2-rc5-fast-manual
-      - v2.8.3-rc6-bounded-neon
-      - v2.8.4-rc6-1-startup-grade-audit
-      - v2.8.5-rc6-2-chad-reactivation-gate
-      - v2.8.6-rc6-3-full-forecast-contract
   pull_request:
   workflow_dispatch:
 

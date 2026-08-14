@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import math
 import statistics
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from sqlalchemy import select
@@ -357,15 +357,21 @@ def reconcile_missed_deadline_dispositions() -> dict[str, Any]:
         "spot_price_unavailable",
     }
     candidates: list[tuple[str, str, float | None]] = []
+    capture_job_forecast_ids: set[str] = set()
+    reconciliation_now = utc_now()
+    missing_job_grace = timedelta(minutes=10)
     with session_scope() as session:
         jobs = session.scalars(select(ServerJobRow).where(
             ServerJobRow.job_type == "capture_canonical_deadline_observation",
-            ServerJobRow.status == "completed",
         )).all()
         for job in jobs:
             payload = json.loads(job.payload_json or "{}")
-            result = json.loads(job.result_json or "{}")
             forecast_id = str(payload.get("forecastId") or "")
+            if forecast_id:
+                capture_job_forecast_ids.add(forecast_id)
+            if job.status != "completed":
+                continue
+            result = json.loads(job.result_json or "{}")
             reason = str(result.get("reason") or "")
             if not forecast_id or reason not in allowed_reasons:
                 continue
@@ -385,6 +391,23 @@ def reconcile_missed_deadline_dispositions() -> dict[str, Any]:
             )) is not None:
                 continue
             candidates.append((forecast_id, reason, _finite(result.get("captureLagSeconds"))))
+        due_tagalysis = session.scalars(select(CanonicalForecastRow).where(
+            CanonicalForecastRow.producer == "tagalysis",
+            CanonicalForecastRow.deadline <= reconciliation_now - missing_job_grace,
+        )).all()
+        for forecast in due_tagalysis:
+            if forecast.forecast_id in capture_job_forecast_ids:
+                continue
+            if session.scalar(select(CanonicalForecastGradeRow).where(
+                CanonicalForecastGradeRow.forecast_id == forecast.forecast_id,
+                CanonicalForecastGradeRow.evaluation_kind == "live",
+            )) is not None:
+                continue
+            if session.scalar(select(ForecastEvaluationDispositionRow).where(
+                ForecastEvaluationDispositionRow.forecast_id == forecast.forecast_id,
+            )) is not None:
+                continue
+            candidates.append((forecast.forecast_id, "capture_job_missing_after_deadline", None))
     classified: list[str] = []
     for forecast_id, reason, lag in candidates:
         lag_text = f" Capture lag was {lag:.3f} seconds." if lag is not None else ""
@@ -394,7 +417,54 @@ def reconcile_missed_deadline_dispositions() -> dict[str, Any]:
         })
         if not disposition["deduplicated"]:
             classified.append(forecast_id)
-    return {"classified": len(classified), "forecastIds": classified, "outcomesCreated": 0, "gradesCreated": 0}
+
+    shadow_classified: list[str] = []
+    with session_scope() as session:
+        tag_rows = session.scalars(select(CanonicalForecastRow).where(
+            CanonicalForecastRow.producer == "tagalysis",
+        )).all()
+        tag_by_deadline = {(row.horizon, row.deadline): row for row in tag_rows}
+        baseline_rows = session.scalars(select(CanonicalForecastRow).where(
+            CanonicalForecastRow.producer == "baseline",
+            CanonicalForecastRow.deadline <= reconciliation_now,
+        )).all()
+        shadow_candidates: list[tuple[str, str]] = []
+        for baseline in baseline_rows:
+            if session.scalar(select(CanonicalForecastGradeRow).where(
+                CanonicalForecastGradeRow.forecast_id == baseline.forecast_id,
+                CanonicalForecastGradeRow.evaluation_kind == "live",
+            )) is not None:
+                continue
+            if session.scalar(select(ForecastEvaluationDispositionRow).where(
+                ForecastEvaluationDispositionRow.forecast_id == baseline.forecast_id,
+            )) is not None:
+                continue
+            tag = tag_by_deadline.get((baseline.horizon, baseline.deadline))
+            if tag is None:
+                continue
+            tag_disposition = session.scalar(select(ForecastEvaluationDispositionRow).where(
+                ForecastEvaluationDispositionRow.forecast_id == tag.forecast_id,
+            ))
+            if tag_disposition is not None and tag_disposition.category != "valid_completed":
+                shadow_candidates.append((baseline.forecast_id, tag_disposition.category))
+    for forecast_id, paired_category in shadow_candidates:
+        disposition = classify_forecast_evaluation(forecast_id, {
+            "category": "ungradable",
+            "reason": (
+                "Paired baseline shadow is ungradable because its TAGalysis forecast "
+                f"has terminal disposition {paired_category}; no outcome was manufactured."
+            ),
+        })
+        if not disposition["deduplicated"]:
+            shadow_classified.append(forecast_id)
+    return {
+        "classified": len(classified),
+        "forecastIds": classified,
+        "shadowClassified": len(shadow_classified),
+        "shadowForecastIds": shadow_classified,
+        "outcomesCreated": 0,
+        "gradesCreated": 0,
+    }
 
 
 def _matched_clean_pairs() -> list[tuple[CanonicalForecastGradeRow, CanonicalForecastGradeRow]]:
