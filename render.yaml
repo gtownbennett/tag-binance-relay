@@ -3,7 +3,7 @@ services:
     name: tag-binance-relay-rc2-preview
     runtime: docker
     region: frankfurt
-    plan: free
+    plan: starter
     healthCheckPath: /health
     autoDeployTrigger: commit
     envVars:
