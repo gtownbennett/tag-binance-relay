@@ -123,6 +123,12 @@ from app.event_driven_chad import (
     record_auto_event_decision,
     reserve_chad_call,
 )
+from app.cost_usage import (
+    cost_usage_refresh_loop,
+    cost_usage_report,
+    persist_snapshot as persist_cost_usage_snapshot,
+    refresh_cost_usage,
+)
 from app.terminal_paper_social import (
     alert_timeline as terminal_alert_timeline,
     cancel_paper_trade,
@@ -2738,6 +2744,10 @@ async def lifespan(_: FastAPI):
         if automatic_live_work and SERVER_JOBS_ENABLED
         else None
     )
+    cost_usage_task = asyncio.create_task(
+        cost_usage_refresh_loop(http_client),
+        name="tagalysis-daily-cost-usage-refresh",
+    )
     # Retain the legacy loop only as an optional fallback. Phase 1 server jobs
     # own collection when enabled so two schedulers cannot create duplicate work.
     if automatic_live_work and not SERVER_JOBS_ENABLED:
@@ -2754,9 +2764,10 @@ async def lifespan(_: FastAPI):
             grader_task.cancel()
         if phase1_task is not None:
             phase1_task.cancel()
+        cost_usage_task.cancel()
         tasks = [
             task
-            for task in (market_task, depth_task, grader_task, phase1_task)
+            for task in (market_task, depth_task, grader_task, phase1_task, cost_usage_task)
             if task is not None
         ]
         await asyncio.gather(
@@ -3272,6 +3283,48 @@ async def tag_chad_usage(
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
     return {"ok": True, **await asyncio.to_thread(chad_usage_report)}
+
+
+@app.get("/v1/tag/cost-usage")
+async def tag_cost_usage(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Normalized cached provider cards. This read never calls a billing provider."""
+    require_relay_key(x_relay_key)
+    return await asyncio.to_thread(cost_usage_report)
+
+
+@app.post("/v1/tag/cost-usage/refresh")
+async def tag_cost_usage_refresh(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Rate-limited read-only provider refresh; failures retain the last valid values."""
+    require_relay_key(x_relay_key)
+    if http_client is None:
+        raise HTTPException(status_code=503, detail="Provider refresh client is unavailable")
+    return await refresh_cost_usage(http_client, force=True)
+
+
+@app.post("/v1/tag/cost-usage/snapshots")
+async def tag_cost_usage_snapshot_import(
+    payload: dict[str, Any] = Body(...),
+    x_admin_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Append a dashboard-verified observation without exposing account secrets to Android."""
+    require_terminal_admin(x_admin_key)
+    providers = payload.get("providers")
+    if not isinstance(providers, dict) or not providers:
+        raise HTTPException(status_code=422, detail="providers must be a non-empty object")
+    stored: list[str] = []
+    try:
+        for provider, snapshot in providers.items():
+            if not isinstance(snapshot, dict):
+                raise ValueError(f"Snapshot for {provider} must be an object")
+            persist_cost_usage_snapshot(str(provider).lower(), snapshot, default_value_status="MANUAL")
+            stored.append(str(provider).lower())
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "immutable": True, "storedProviders": stored}
 
 
 @app.post("/v1/tag/outcomes/verified")

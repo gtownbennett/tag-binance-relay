@@ -53,6 +53,7 @@ from app.prospective_learning import (
     evaluate_prospective_thresholds,
     record_forecast_evidence,
     reconcile_matched_shadow_grades,
+    reconcile_missed_deadline_dispositions,
     register_prospective_tournament,
 )
 from app.terminal_database import (
@@ -666,6 +667,8 @@ def test_completed_late_capture_is_honestly_ungradable_without_an_outcome() -> N
     assert evaluation["missedDeadlineReconciliation"] == {
         "classified": 1,
         "forecastIds": [forecast["forecastId"]],
+        "shadowClassified": 0,
+        "shadowForecastIds": [],
         "outcomesCreated": 0,
         "gradesCreated": 0,
     }
@@ -677,6 +680,49 @@ def test_completed_late_capture_is_honestly_ungradable_without_an_outcome() -> N
         assert session.scalar(select(CanonicalForecastGradeRow).where(
             CanonicalForecastGradeRow.forecast_id == forecast["forecastId"]
         )) is None
+
+
+def test_missing_capture_job_and_paired_shadow_are_terminally_ungradable(monkeypatch) -> None:
+    issued_at = NOW + timedelta(minutes=1)
+    tag = _forecast(horizon="1h", issued_at=issued_at, point=0.0011)
+    baseline = _forecast(
+        horizon="1h", producer="baseline", issued_at=issued_at, point=0.00102
+    )
+    persist_canonical_forecast(tag)
+    persist_canonical_forecast(baseline)
+    reconcile_at = datetime.fromisoformat(tag["deadline"]) + timedelta(minutes=11)
+    monkeypatch.setattr("app.prospective_learning.utc_now", lambda: reconcile_at)
+
+    first = reconcile_missed_deadline_dispositions()
+    second = reconcile_missed_deadline_dispositions()
+
+    assert first == {
+        "classified": 1,
+        "forecastIds": [tag["forecastId"]],
+        "shadowClassified": 1,
+        "shadowForecastIds": [baseline["forecastId"]],
+        "outcomesCreated": 0,
+        "gradesCreated": 0,
+    }
+    assert second == {
+        "classified": 0,
+        "forecastIds": [],
+        "shadowClassified": 0,
+        "shadowForecastIds": [],
+        "outcomesCreated": 0,
+        "gradesCreated": 0,
+    }
+    with session_scope() as session:
+        dispositions = {
+            row.forecast_id: row
+            for row in session.scalars(select(ForecastEvaluationDispositionRow)).all()
+        }
+        assert dispositions[tag["forecastId"]].category == "ungradable"
+        assert "capture_job_missing_after_deadline" in dispositions[tag["forecastId"]].reason
+        assert dispositions[baseline["forecastId"]].category == "ungradable"
+        assert "no outcome was manufactured" in dispositions[baseline["forecastId"]].reason
+        assert session.scalar(select(func.count()).select_from(VerifiedOutcomeRow)) == 0
+        assert session.scalar(select(func.count()).select_from(CanonicalForecastGradeRow)) == 0
 
 
 def test_pre_registration_grade_never_enters_clean_tournament_population() -> None:
