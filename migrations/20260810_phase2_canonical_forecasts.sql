@@ -104,7 +104,7 @@ CREATE TABLE IF NOT EXISTS canonical_forecasts (
         producer IN ('tagalysis', 'chad', 'final_call', 'baseline', 'champion', 'challenger')
     ),
     CONSTRAINT ck_canonical_forecast_horizon CHECK (
-        horizon IN ('1h', '4h', '12h', '24h', '3d', '7d', '30d', '3m', '1y', '5y')
+        horizon IN ('1h', '4h', '12h', '24h', '3d', '7d', '30d', '3m', '6m', '1y', '3y', '5y')
     ),
     CONSTRAINT ck_canonical_forecast_horizon_minutes CHECK (
         (horizon = '1h' AND horizon_minutes = 60) OR
@@ -115,7 +115,9 @@ CREATE TABLE IF NOT EXISTS canonical_forecasts (
         (horizon = '7d' AND horizon_minutes = 10080) OR
         (horizon = '30d' AND horizon_minutes = 43200) OR
         (horizon = '3m' AND horizon_minutes = 129600) OR
+        (horizon = '6m' AND horizon_minutes = 262800) OR
         (horizon = '1y' AND horizon_minutes = 525600) OR
+        (horizon = '3y' AND horizon_minutes = 1576800) OR
         (horizon = '5y' AND horizon_minutes = 2628000)
     ),
     CONSTRAINT ck_canonical_forecast_direction CHECK (

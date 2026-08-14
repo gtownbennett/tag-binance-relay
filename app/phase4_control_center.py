@@ -22,7 +22,7 @@ from app.terminal_database import (
 
 
 CONTROL_CENTER_PRODUCERS = ("tagalysis", "chad", "final_call")
-CONTROL_CENTER_HORIZONS = ("1h", "4h", "12h", "24h", "3d", "7d", "30d", "3m", "1y", "5y")
+CONTROL_CENTER_HORIZONS = ("1h", "4h", "12h", "24h", "3d", "7d", "30d", "3m", "6m", "1y", "3y", "5y")
 GRADE_PENDING_MESSAGE = "Grade pending — verified deadline price unavailable."
 CHAD_PENDING_MESSAGE = "TAGalysis forecast is current. Chad has not reviewed today’s evidence."
 
@@ -227,7 +227,7 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
         # The 24H call remains the normal headline.  When it is stale, a
         # fresh canonical 4H/1H call is still authoritative and must not be
         # hidden behind a false "no current forecast" state.
-        priority = {name: index for index, name in enumerate(("24h", "4h", "1h", "12h", "3d", "7d", "30d", "3m", "1y", "5y"))}
+        priority = {name: index for index, name in enumerate(("24h", "4h", "1h", "12h", "3d", "7d", "30d", "3m", "6m", "1y", "3y", "5y"))}
         return min(
             items,
             key=lambda item: (

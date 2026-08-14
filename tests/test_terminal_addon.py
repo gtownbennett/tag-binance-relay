@@ -41,6 +41,7 @@ from app.terminal_intelligence import (
     heatmap,
     liquidation_feed,
     server_oi_history,
+    server_realized_volatility_24h,
     vision_context,
 )
 from app.terminal_multi_exchange import MultiExchangeService
@@ -205,6 +206,63 @@ def seed_market() -> None:
 
 
 class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
+    def test_trailing_24h_realized_volatility_requires_continuous_observed_prices(self) -> None:
+        clear_tables()
+        now = utc_now()
+        with session_scope() as session:
+            for hours in range(24, -1, -1):
+                price = 0.001 * (1.0 + (24 - hours) * 0.0005 + (hours % 2) * 0.0002)
+                session.add(SpotSnapshotRow(
+                    recorded_at=now - timedelta(hours=hours),
+                    price=price,
+                    market_cap=None,
+                    liquidity_usd=None,
+                    price_change_1h=None,
+                    payload_json="{}",
+                ))
+        result = server_realized_volatility_24h()
+        self.assertTrue(result["available"])
+        self.assertGreater(result["realizedVolatility24hPct"], 0.0)
+        self.assertGreaterEqual(result["coverageHours"], 18.0)
+        self.assertLessEqual(result["maxGapSeconds"], 7_200.0)
+
+    async def test_market_assembly_attaches_24h_oi_and_realized_volatility_to_canonical_sources(self) -> None:
+        terminal_addon.market_cache["time"] = 0.0
+        terminal_addon.market_cache["value"] = None
+        futures = {
+            "exchanges": [{"exchange": "Binance", "available": True}],
+            "activeExchangeCount": 1,
+        }
+        with (
+            patch.object(terminal_addon, "ensure_external_clients", new=AsyncMock()),
+            patch.object(main.multi_exchange_service, "collect", new=AsyncMock(return_value=futures)),
+            patch("app.terminal_addon.server_oi_history", return_value={
+                "coverageKey": "Binance",
+                "change5mPct": 0.1,
+                "change15mPct": 0.2,
+                "change1hPct": 0.3,
+                "change4hPct": 0.4,
+                "change24hPct": 1.5,
+                "status": "fixture",
+            }),
+            patch("app.terminal_addon.server_realized_volatility_24h", return_value={
+                "available": True,
+                "realizedVolatility24hPct": 3.25,
+                "pointCount": 289,
+                "firstObservedAt": "2026-08-13T00:00:00+00:00",
+                "lastObservedAt": "2026-08-14T00:00:00+00:00",
+                "method": "fixture",
+            }),
+        ):
+            result = await terminal_addon.collect_market(
+                {"markPrice": 0.001},
+                {"priceUsd": 0.001, "available": True},
+                independent_results=[],
+            )
+        binance = result["futures"]["exchanges"][0]
+        self.assertEqual(binance["oiChange24hPct"], 1.5)
+        self.assertEqual(result["spot"]["realizedVolatility24hPct"], 3.25)
+
     async def test_exact_trailing_hour_taker_ratio_uses_same_window(self) -> None:
         now_ms = 1_800_000_000_000
         async with main.agg_trade_lock:

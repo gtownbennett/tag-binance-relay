@@ -226,6 +226,77 @@ def server_oi_history(point_limit: int = 288) -> dict[str, Any]:
     }
 
 
+def server_realized_volatility_24h(point_limit: int = 576) -> dict[str, Any]:
+    """Calculate trailing 24-hour DEX realized volatility from stored prices.
+
+    The value is the square root of summed squared consecutive log returns.
+    Sparse or gapped history remains unavailable rather than being replaced by
+    a forecast fallback or by stale Binance Vision data.
+    """
+
+    safe_limit = min(max(int(point_limit), 24), 1_000)
+    cutoff = utc_now() - timedelta(hours=24)
+    with session_scope() as session:
+        rows = list(
+            session.execute(
+                select(SpotSnapshotRow.recorded_at, SpotSnapshotRow.price)
+                .where(
+                    SpotSnapshotRow.recorded_at >= cutoff,
+                    SpotSnapshotRow.price.is_not(None),
+                    SpotSnapshotRow.price > 0,
+                )
+                .order_by(SpotSnapshotRow.recorded_at.desc())
+                .limit(safe_limit)
+            ).all()
+        )
+    rows.reverse()
+    unique_rows: list[Any] = []
+    for row in rows:
+        if unique_rows and _aware(unique_rows[-1].recorded_at) == _aware(row.recorded_at):
+            unique_rows[-1] = row
+        else:
+            unique_rows.append(row)
+    if len(unique_rows) < 2:
+        return {
+            "available": False,
+            "realizedVolatility24hPct": None,
+            "pointCount": len(unique_rows),
+            "status": "Fewer than two stored DEX prices are available in the trailing 24-hour window.",
+        }
+    returns = [
+        math.log(float(right.price) / float(left.price))
+        for left, right in zip(unique_rows, unique_rows[1:])
+        if left.price and right.price and left.price > 0 and right.price > 0
+    ]
+    first_at = _aware(unique_rows[0].recorded_at)
+    last_at = _aware(unique_rows[-1].recorded_at)
+    gaps = [
+        (_aware(right.recorded_at) - _aware(left.recorded_at)).total_seconds()
+        for left, right in zip(unique_rows, unique_rows[1:])
+    ]
+    coverage_hours = max(0.0, (last_at - first_at).total_seconds() / 3_600.0)
+    max_gap_seconds = max(gaps, default=0.0)
+    enough_coverage = len(returns) >= 12 and coverage_hours >= 18.0 and max_gap_seconds <= 7_200.0
+    value = math.sqrt(sum(change * change for change in returns)) * 100.0 if enough_coverage else None
+    return {
+        "available": value is not None and math.isfinite(value) and value > 0,
+        "realizedVolatility24hPct": value if value is not None and math.isfinite(value) and value > 0 else None,
+        "pointCount": len(unique_rows),
+        "returnCount": len(returns),
+        "coverageHours": round(coverage_hours, 3),
+        "maxGapSeconds": round(max_gap_seconds, 3),
+        "firstObservedAt": first_at.isoformat(),
+        "lastObservedAt": last_at.isoformat(),
+        "source": "stored DEX spot snapshots",
+        "method": "sqrt(sum(squared consecutive log returns)) over trailing 24h",
+        "status": (
+            "Observed trailing 24-hour DEX realized volatility is available."
+            if enough_coverage and value is not None and value > 0
+            else "Trailing DEX history is too sparse or gapped for an observed 24-hour realized-volatility value."
+        ),
+    }
+
+
 def vision_context(days: int = 14) -> dict[str, Any]:
     """Summarise stored Binance Vision 5-minute candles for technical context.
 
