@@ -41,8 +41,12 @@ TERMINAL_STATUSES = frozenset({
     "WRONG_ASSET",
     "NO_ACTUAL_FORECAST",
     "CONDITIONAL_SCENARIO_ONLY",
-    "INACCESSIBLE",
+    "INACCESSIBLE_AFTER_FALLBACKS",
     "PAYWALLED_UNAVAILABLE",
+    "CAPTCHA_REQUIRES_OWNER",
+    "LOGIN_REQUIRES_OWNER",
+    "EMAIL_VERIFICATION_REQUIRED",
+    "TELEPHONE_VERIFICATION_REQUIRED",
     "DEAD_PAGE",
     "IDENTITY_UNRESOLVED",
     "LEGAL_OR_TERMS_RESTRICTED",
@@ -94,6 +98,20 @@ def _source_for_url(url: str) -> dict[str, Any] | None:
 def _classification_for_claims(claims: list[Mapping[str, Any]], now: datetime) -> str:
     if any(claim.get("targetSemantics") == "scenario_calculator" for claim in claims):
         return "INGESTED_SCENARIO_CALCULATOR"
+    issue_times: list[datetime] = []
+    for claim in claims:
+        value = claim.get("sourceIssueAt")
+        if not value:
+            continue
+        try:
+            parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            issue_times.append(parsed.astimezone(timezone.utc))
+        except (TypeError, ValueError):
+            pass
+    if issue_times and min(issue_times) < now - timedelta(minutes=5):
+        return "INGESTED_HISTORICAL_DISCOVERED"
     deadlines = [claim.get("deadline") for claim in claims if claim.get("deadline")]
     parsed_deadlines: list[datetime] = []
     for value in deadlines:
@@ -108,7 +126,9 @@ def _classification_for_claims(claims: list[Mapping[str, Any]], now: datetime) -
         return "INGESTED_HISTORICAL_DISCOVERED"
     if all(
         claim.get("targetPrice") is None and claim.get("targetLow") is None
-        and claim.get("targetHigh") is None and claim.get("probability") is None
+        and claim.get("targetHigh") is None and claim.get("targetNativePrice") is None
+        and claim.get("targetNativeLow") is None and claim.get("targetNativeHigh") is None
+        and claim.get("probability") is None
         for claim in claims
     ):
         return "INGESTED_QUALITATIVE"
@@ -126,10 +146,39 @@ def _access_status(response: httpx.Response) -> str | None:
         lowered = response.text[:20_000].lower()
         if any(marker in lowered for marker in ("subscribe to continue", "subscriber-only", "paywall")):
             return "PAYWALLED_UNAVAILABLE"
-        return "INACCESSIBLE"
+        return "FALLBACK_REQUIRED"
     if response.status_code >= 400:
-        return "INACCESSIBLE"
+        return "FALLBACK_REQUIRED"
     return None
+
+
+def _write_fallback_required(
+    *, candidate_id: str, checked_at: datetime, normalized_url: str,
+    resolved_url: str | None, http_status: int | None,
+    response_hash: str | None, reason: str,
+) -> None:
+    """Persist a retryable direct-fetch result without claiming terminal inaccessibility."""
+    with session_scope() as session:
+        row = session.get(TagNextDiscoveryCandidateRow, candidate_id)
+        if row is None:
+            return
+        row.normalized_url = normalized_url
+        row.resolved_url = resolved_url
+        row.domain = (urlsplit(resolved_url or normalized_url).hostname or "").lower()
+        row.state = "retry_scheduled"
+        row.final_status = None
+        row.reason = reason
+        row.last_checked_at = checked_at
+        row.next_check_at = checked_at + timedelta(minutes=1)
+        row.accessibility = "direct_http_unavailable"
+        row.http_status = http_status
+        row.response_hash = response_hash
+        row.retry_status = "fallback_required"
+        row.evidence_json = json_dumps({
+            "validatorVersion": VALIDATOR_VERSION,
+            "decisionReason": reason,
+            "requiredNextWorker": "re_adjudicate_candidate_fallbacks",
+        })
 
 
 def _wrong_asset(text: str, url: str) -> bool:
@@ -249,6 +298,15 @@ def validate_candidate_batch(*, limit: int = 12, timeout_seconds: int = 20) -> d
                 response_hash = hashlib.sha256(response.content).hexdigest()
                 access = _access_status(response)
                 if access:
+                    if access == "FALLBACK_REQUIRED":
+                        _write_fallback_required(
+                            candidate_id=candidate["id"], checked_at=checked_at,
+                            normalized_url=normalized, resolved_url=resolved,
+                            http_status=response.status_code, response_hash=response_hash,
+                            reason="Direct HTTP failed; public renderer, archive, structured-data, and alternate-route review is required.",
+                        )
+                        counts[access] = counts.get(access, 0) + 1
+                        continue
                     _write_result(
                         candidate_id=candidate["id"], status=access, checked_at=checked_at,
                         normalized_url=normalized, resolved_url=resolved,
@@ -337,13 +395,12 @@ def validate_candidate_batch(*, limit: int = 12, timeout_seconds: int = 20) -> d
                 )
                 counts[status] = counts.get(status, 0) + 1
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
-                status = "INACCESSIBLE"
-                _write_result(
-                    candidate_id=candidate["id"], status=status, checked_at=checked_at,
+                status = "FALLBACK_REQUIRED"
+                _write_fallback_required(
+                    candidate_id=candidate["id"], checked_at=checked_at,
                     normalized_url=normalized, resolved_url=None, http_status=None,
-                    response_hash=None, accessibility="network_unavailable", parser_id=None,
-                    source_label=None, independent_family_id=None, identity={},
-                    evidence={"decisionReason": f"Public fetch failed: {type(exc).__name__}."},
+                    response_hash=None,
+                    reason=f"Direct public fetch failed: {type(exc).__name__}; fallback review is required.",
                 )
                 counts[status] = counts.get(status, 0) + 1
 

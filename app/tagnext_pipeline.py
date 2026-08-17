@@ -30,7 +30,12 @@ from .tagnext_external_adapters import (
     parse_document,
     semantics_period_deadline,
 )
-from .tagnext_intelligence import TAG_CONTRACT, detect_revision, provider_registry
+from .tagnext_intelligence import (
+    TAG_CONTRACT,
+    detect_revision,
+    forecast_snapshot_fingerprint,
+    provider_registry,
+)
 from .terminal_database import (
     CanonicalEvidenceSnapshotRow,
     CanonicalForecastGradeRow,
@@ -39,6 +44,7 @@ from .terminal_database import (
     TagNextConsensusGradeRow,
     TagNextChampionImportRow,
     TagNextDiscoveryCandidateRow,
+    TagNextExternalMetadataRevisionRow,
     TagNextExternalOutcomeScheduleRow,
     TagNextExternalGradeRow,
     TagNextExternalRevisionRow,
@@ -48,6 +54,7 @@ from .terminal_database import (
     TagNextFeatureRegistryRow,
     TagNextFeatureSnapshotRow,
     TagNextForecastFeatureLinkRow,
+    TagNextMarketObservationRow,
     TagNextModelRegistryRow,
     TagNextProviderRow,
     TagNextProviderCoverageRow,
@@ -65,6 +72,7 @@ FEATURE_VERSION = "tagnext-shadow-features-v1"
 PARSER_VERSION = "tagnext-semantic-parser-v1"
 CONSENSUS_VERSION = "tagnext-consensus-v2"
 EXTERNAL_GRADER_VERSION = "tagnext-external-semantic-v2"
+OUTCOME_ALIGNMENT_TOLERANCE_SECONDS = 60
 TAGGER_CG_ID = "tagger"
 TAGGER_CMC_ID = 34958
 CONSENSUS_ELIGIBLE_CLAIM_CLASSES = {
@@ -605,6 +613,10 @@ def normalized_prediction_semantics(payload: Mapping[str, Any]) -> dict[str, Any
         "targetPrice": payload.get("targetPrice"),
         "targetLow": payload.get("targetLow"),
         "targetHigh": payload.get("targetHigh"),
+        "targetCurrency": str(payload.get("targetCurrency") or "USD").strip().upper(),
+        "targetNativePrice": payload.get("targetNativePrice"),
+        "targetNativeLow": payload.get("targetNativeLow"),
+        "targetNativeHigh": payload.get("targetNativeHigh"),
         "movePct": payload.get("movePct"),
         "referencePrice": payload.get("referencePrice"),
         "scenarioYear": payload.get("scenarioYear"),
@@ -618,7 +630,104 @@ def normalized_prediction_semantics(payload: Mapping[str, Any]) -> dict[str, Any
 
 
 def external_semantic_fingerprint(payload: Mapping[str, Any]) -> str:
-    return _hash(normalized_prediction_semantics(payload))
+    return forecast_snapshot_fingerprint(normalized_prediction_semantics(payload))
+
+
+def evidence_metadata_fingerprint(
+    payload: Mapping[str, Any], provenance: Mapping[str, Any] | None = None,
+) -> str:
+    """Hash retrieval/identity metadata separately from forecast meaning."""
+    semantics = normalized_prediction_semantics(payload)
+    metadata = {
+        "sourceId": semantics["sourceId"],
+        "sourceIssueAt": semantics["sourceIssueAt"],
+        "sourceUpdateAt": semantics["sourceUpdateAt"],
+        "observedLive": semantics["observedLive"],
+        "provenance": dict(provenance or {}),
+    }
+    return _hash(metadata)
+
+
+def _append_metadata_correction(
+    session: Any, *, snapshot: TagNextExternalSnapshotRow, field_name: str,
+    previous_value: Any, corrected_value: Any, reason: str,
+    corrected_at: datetime, evidence_package_id: str | None = None,
+) -> TagNextExternalMetadataRevisionRow | None:
+    payload = {
+        "snapshotId": snapshot.snapshot_id,
+        "fieldName": field_name,
+        "previousValue": previous_value,
+        "correctedValue": corrected_value,
+        "reason": reason,
+        "evidencePackageId": evidence_package_id,
+    }
+    payload_hash = _hash(payload)
+    existing = session.scalar(select(TagNextExternalMetadataRevisionRow).where(
+        TagNextExternalMetadataRevisionRow.payload_hash == payload_hash
+    ))
+    if existing is not None:
+        return None
+    row = TagNextExternalMetadataRevisionRow(
+        metadata_revision_id=_id("tnefmr", payload),
+        snapshot_id=snapshot.snapshot_id,
+        field_name=field_name,
+        previous_value_json=_stable_json(previous_value),
+        corrected_value_json=_stable_json(corrected_value),
+        reason=reason,
+        evidence_package_id=evidence_package_id,
+        corrected_at=corrected_at,
+        evidence_metadata_hash=_hash({
+            "snapshotId": snapshot.snapshot_id,
+            "fieldName": field_name,
+            "correctedValue": corrected_value,
+            "evidencePackageId": evidence_package_id,
+        }),
+        payload_hash=payload_hash,
+    )
+    session.add(row)
+    return row
+
+
+def record_external_metadata_correction(
+    *, snapshot_id: str, field_name: str, corrected_value: Any, reason: str,
+    corrected_at: datetime | str | None = None,
+    evidence_package_id: str | None = None,
+) -> dict[str, Any]:
+    """Append an immutable non-semantic correction without rewriting a forecast."""
+    if field_name not in {"observed_live", "source_issue_at", "source_update_at", "evidence_url"}:
+        raise ValueError(f"unsupported metadata field: {field_name}")
+    corrected = _time(corrected_at)
+    with session_scope() as session:
+        snapshot = session.get(TagNextExternalSnapshotRow, snapshot_id)
+        if snapshot is None:
+            raise ValueError("snapshot does not exist")
+        latest = session.scalar(select(TagNextExternalMetadataRevisionRow).where(
+            TagNextExternalMetadataRevisionRow.snapshot_id == snapshot_id,
+            TagNextExternalMetadataRevisionRow.field_name == field_name,
+        ).order_by(TagNextExternalMetadataRevisionRow.corrected_at.desc()).limit(1))
+        previous = (
+            json.loads(latest.corrected_value_json)
+            if latest is not None else getattr(snapshot, field_name, None)
+        )
+        row = _append_metadata_correction(
+            session, snapshot=snapshot, field_name=field_name,
+            previous_value=previous, corrected_value=corrected_value,
+            reason=reason, corrected_at=corrected,
+            evidence_package_id=evidence_package_id,
+        )
+        return {
+            "stored": row is not None,
+            "metadataRevisionId": row.metadata_revision_id if row else latest.metadata_revision_id if latest else None,
+            "forecastSemanticHash": snapshot.payload_hash,
+        }
+
+
+def _effective_observed_live(session: Any, snapshot: TagNextExternalSnapshotRow) -> bool:
+    latest = session.scalar(select(TagNextExternalMetadataRevisionRow).where(
+        TagNextExternalMetadataRevisionRow.snapshot_id == snapshot.snapshot_id,
+        TagNextExternalMetadataRevisionRow.field_name == "observed_live",
+    ).order_by(TagNextExternalMetadataRevisionRow.corrected_at.desc()).limit(1))
+    return bool(json.loads(latest.corrected_value_json)) if latest is not None else bool(snapshot.observed_live)
 
 
 def parse_external_forecast_text(
@@ -660,6 +769,7 @@ def store_external_snapshot(
         raise ValueError("sourceId is required")
     captured = _time(captured_at)
     payload_hash = external_semantic_fingerprint(payload)
+    evidence_metadata_hash = evidence_metadata_fingerprint(payload, provenance)
     with session_scope() as session:
         source = session.get(TagNextExternalSourceRow, source_id)
         if source is None or source.access_state != "verified_identity":
@@ -669,7 +779,28 @@ def store_external_snapshot(
             TagNextExternalSnapshotRow.payload_hash == payload_hash,
         ))
         if existing is not None:
-            return {"stored": False, "snapshotId": existing.snapshot_id, "payloadHash": payload_hash}
+            incoming_metadata = {
+                "source_issue_at": semantics["sourceIssueAt"],
+                "source_update_at": semantics["sourceUpdateAt"],
+                "observed_live": semantics["observedLive"],
+            }
+            for field_name, corrected_value in incoming_metadata.items():
+                previous_value = getattr(existing, field_name)
+                if isinstance(previous_value, datetime):
+                    previous_value = _time(previous_value).isoformat()
+                if previous_value != corrected_value:
+                    _append_metadata_correction(
+                        session, snapshot=existing, field_name=field_name,
+                        previous_value=previous_value, corrected_value=corrected_value,
+                        reason="Repeated fetch preserved forecast meaning but clarified evidence metadata.",
+                        corrected_at=captured,
+                    )
+            return {
+                "stored": False, "snapshotId": existing.snapshot_id,
+                "payloadHash": payload_hash,
+                "forecastSemanticHash": payload_hash,
+                "evidenceMetadataHash": evidence_metadata_hash,
+            }
         previous = session.scalar(select(TagNextExternalSnapshotRow).where(
             TagNextExternalSnapshotRow.source_id == source_id,
             TagNextExternalSnapshotRow.horizon == semantics["horizon"],
@@ -686,9 +817,17 @@ def store_external_snapshot(
             target_price=_decimal_value(semantics["targetPrice"]),
             target_low=_decimal_value(semantics["targetLow"]),
             target_high=_decimal_value(semantics["targetHigh"]),
+            target_currency=semantics["targetCurrency"],
+            target_native_price=_decimal_value(semantics["targetNativePrice"]),
+            target_native_low=_decimal_value(semantics["targetNativeLow"]),
+            target_native_high=_decimal_value(semantics["targetNativeHigh"]),
             move_pct=_decimal_value(semantics["movePct"]),
             captured_text=captured_text[:20_000], semantics_json=json_dumps(semantics),
-            payload_hash=payload_hash, provenance_json=json_dumps(dict(provenance or {})),
+            payload_hash=payload_hash, provenance_json=json_dumps({
+                **dict(provenance or {}),
+                "forecastSemanticHash": payload_hash,
+                "evidenceMetadataHash": evidence_metadata_hash,
+            }),
             original_horizon_label=semantics["originalHorizonLabel"],
             normalized_horizon=semantics["normalizedHorizon"],
             target_semantics=semantics["targetSemantics"],
@@ -791,6 +930,8 @@ def store_external_snapshot(
         source.parser_status = "parsed"
     return {
         "stored": True, "snapshotId": snapshot_id, "payloadHash": payload_hash,
+        "forecastSemanticHash": payload_hash,
+        "evidenceMetadataHash": evidence_metadata_hash,
         "revisionId": revision_id, "semantics": semantics,
     }
 
@@ -876,6 +1017,84 @@ def external_discovery_worker_run(*, limit: int = 8, timeout_seconds: int = 15) 
     return {"checked": checked, "newSnapshots": snapshots, "failures": failures, "paidCalls": 0}
 
 
+def record_market_candle(observation: Mapping[str, Any]) -> dict[str, Any]:
+    """Freeze one provider candle used by the outcome-alignment policy."""
+    period_start = _time(str(observation["periodStart"]))
+    period_end = _time(str(observation["periodEnd"]))
+    if period_end <= period_start:
+        raise ValueError("market candle periodEnd must follow periodStart")
+    close_price = _positive_value(observation.get("closePrice") or observation.get("priceUsd"))
+    if close_price is None:
+        raise ValueError("market candle requires a positive closePrice")
+    raw = observation.get("raw") or dict(observation)
+    raw_hash = hashlib.sha256(_stable_json(raw).encode()).hexdigest()
+    payload = {
+        "providerId": str(observation.get("providerId") or "injected_verified_provider"),
+        "venue": str(observation.get("venue") or "unspecified"),
+        "symbol": str(observation.get("symbol") or "TAGUSDT").upper(),
+        "interval": str(observation.get("interval") or "1m"),
+        "periodStart": period_start.isoformat(),
+        "periodEnd": period_end.isoformat(),
+        "open": _positive_value(observation.get("openPrice")),
+        "high": _positive_value(observation.get("highPrice")),
+        "low": _positive_value(observation.get("lowPrice")),
+        "close": close_price,
+        "vwap": _positive_value(observation.get("vwapPrice")),
+        "sampleCount": observation.get("sampleCount"),
+        "rawSha256": raw_hash,
+    }
+    payload_hash = _hash(payload)
+    observation_id = _id("tnmo", payload)
+    with session_scope() as session:
+        existing = session.scalar(select(TagNextMarketObservationRow).where(
+            TagNextMarketObservationRow.payload_hash == payload_hash
+        ))
+        if existing is None:
+            session.add(TagNextMarketObservationRow(
+                observation_id=observation_id,
+                provider_id=payload["providerId"], venue=payload["venue"],
+                symbol=payload["symbol"], interval_label=payload["interval"],
+                period_start=period_start, period_end=period_end,
+                open_price=_decimal_value(payload["open"]), high_price=_decimal_value(payload["high"]),
+                low_price=_decimal_value(payload["low"]), close_price=_decimal_value(close_price),
+                vwap_price=_decimal_value(payload["vwap"]),
+                sample_count=int(payload["sampleCount"]) if payload["sampleCount"] is not None else None,
+                retrieved_at=_time(str(observation.get("retrievedAt") or utc_now().isoformat())),
+                source_url=str(observation.get("sourceReference") or observation.get("sourceUrl") or "local:verified-candle"),
+                raw_sha256=raw_hash, verification_status="verified",
+                payload_hash=payload_hash,
+            ))
+        else:
+            observation_id = existing.observation_id
+    return {
+        "stored": existing is None, "observationId": observation_id,
+        "periodStart": period_start.isoformat(), "periodEnd": period_end.isoformat(),
+        "closePrice": close_price, "payloadHash": payload_hash,
+    }
+
+
+def _aligned_outcome(
+    session: Any, deadline: datetime, *, tolerance_seconds: int = OUTCOME_ALIGNMENT_TOLERANCE_SECONDS,
+) -> tuple[VerifiedOutcomeRow | None, int | None]:
+    """Select exact first, otherwise the nearest verified observation in tolerance."""
+    deadline = _time(deadline)
+    rows = list(session.scalars(select(VerifiedOutcomeRow).where(
+        VerifiedOutcomeRow.asset_symbol == "TAG",
+        VerifiedOutcomeRow.verification_status == "verified",
+        VerifiedOutcomeRow.observed_at >= deadline - timedelta(seconds=tolerance_seconds),
+        VerifiedOutcomeRow.observed_at <= deadline + timedelta(seconds=tolerance_seconds),
+    )))
+    if not rows:
+        return None, None
+    rows.sort(key=lambda row: (
+        abs((_time(row.observed_at) - deadline).total_seconds()),
+        0 if _time(row.observed_at) <= deadline else 1,
+        _time(row.retrieved_at),
+    ))
+    selected = rows[0]
+    return selected, int((_time(selected.observed_at) - deadline).total_seconds())
+
+
 def capture_due_external_outcomes(
     *, now: datetime | str | None = None,
     price_observation: Mapping[str, Any] | None = None,
@@ -883,8 +1102,9 @@ def capture_due_external_outcomes(
 ) -> dict[str, Any]:
     """Run due exact-point and period capture jobs with provider timestamps.
 
-    A late worker never backdates a price.  If it missed an exact deadline, the
-    schedule records that fact and grading remains unavailable.
+    A late worker never backdates a price. Exact observations are preferred;
+    verified one-minute candle endpoints can align within a documented
+    60-second tolerance, with the signed offset retained for grading.
     """
     current = _time(now)
     with session_scope() as session:
@@ -919,6 +1139,11 @@ def capture_due_external_outcomes(
             "sourceReference": str(response.url),
             "raw": payload,
         }
+    candle_result = None
+    if observation.get("periodStart") and observation.get("periodEnd"):
+        candle_result = record_market_candle(observation)
+        observation["priceUsd"] = candle_result["closePrice"]
+        observation["observedAt"] = candle_result["periodEnd"]
     price = _positive_value(observation.get("priceUsd"))
     observed_at = _time(str(observation.get("observedAt") or current.isoformat()))
     retrieved_at = _time(str(observation.get("retrievedAt") or current.isoformat()))
@@ -931,6 +1156,8 @@ def capture_due_external_outcomes(
         "assetSymbol": "TAG", "observedAt": observed_at.isoformat(),
         "priceUsd": price, "sourceName": source_name,
         "sourceReference": source_reference,
+        "marketObservationId": candle_result["observationId"] if candle_result else None,
+        "deadlineSelectionPolicy": "exact_then_nearest_verified_within_60s_v1",
     }
     outcome_hash = _hash(outcome_payload)
     outcome_id = _id("outcome", outcome_payload)
@@ -948,7 +1175,8 @@ def capture_due_external_outcomes(
             )
             or (
                 not (row.target_semantics.startswith("period_") or row.target_semantics == "range_for_period")
-                and row.deadline is not None and observed_at == _time(row.deadline)
+                and row.deadline is not None
+                and abs((observed_at - _time(row.deadline)).total_seconds()) <= OUTCOME_ALIGNMENT_TOLERANCE_SECONDS
             )
             for row in schedules
         )
@@ -969,7 +1197,9 @@ def capture_due_external_outcomes(
             semantics = schedule.target_semantics
             is_period = semantics.startswith("period_") or semantics == "range_for_period"
             if not is_period:
-                if schedule.deadline and observed_at == _time(schedule.deadline):
+                if schedule.deadline and abs(
+                    (observed_at - _time(schedule.deadline)).total_seconds()
+                ) <= OUTCOME_ALIGNMENT_TOLERANCE_SECONDS:
                     schedule.status = "complete"
                     schedule.capture_count += 1
                     schedule.last_capture_at = observed_at
@@ -1054,6 +1284,7 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
             target_semantics = snapshot.target_semantics or semantics.get("targetSemantics") or "point_at_deadline"
             period_outcome = None
             outcome = None
+            outcome_offset_seconds = None
             if target_semantics.startswith("period_") or target_semantics == "range_for_period":
                 period_outcome = session.scalar(select(TagNextPeriodOutcomeRow).where(
                     TagNextPeriodOutcomeRow.snapshot_id == snapshot.snapshot_id
@@ -1069,11 +1300,9 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                     if period_outcome else None
                 )
             else:
-                outcome = session.scalar(select(VerifiedOutcomeRow).where(
-                    VerifiedOutcomeRow.asset_symbol == "TAG",
-                    VerifiedOutcomeRow.observed_at == snapshot.deadline,
-                    VerifiedOutcomeRow.verification_status == "verified",
-                ).order_by(VerifiedOutcomeRow.retrieved_at.asc()).limit(1))
+                outcome, outcome_offset_seconds = _aligned_outcome(
+                    session, _time(snapshot.deadline)
+                )
                 actual = Decimal(str(outcome.price_usd)) if outcome else None
                 outcome_source = outcome.source_name if outcome else None
             if actual is None:
@@ -1085,6 +1314,7 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                 metrics: dict[str, Any] = {
                     "targetSemantics": target_semantics,
                     "requiredOutcome": "period_aggregate" if target_semantics.startswith("period_") else "exact_deadline",
+                    "outcomeAlignmentPolicy": "exact_then_nearest_verified_within_60s_v1",
                 }
                 unavailable += 1
             else:
@@ -1144,7 +1374,8 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                     "rangeCoverage": range_coverage,
                     "widthPenalty": width_penalty,
                     "intervalScore": interval_score,
-                    "multiIntervalWIS": interval_score,
+                    "multiIntervalWIS": None,
+                    "wisStatus": "not_computed_single_central_interval_only",
                     "brierScore": brier,
                     "probabilityCalibrationError": calibration,
                     "bias": point_error,
@@ -1157,6 +1388,8 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                     "skillVersusTAGalysis": None,
                     "skillVersusTAGneXt": None,
                     "decisionUsefulness": decision_usefulness,
+                    "outcomeAlignmentPolicy": "exact_then_nearest_verified_within_60s_v1",
+                    "outcomeOffsetSeconds": outcome_offset_seconds,
                 }
                 disposition = "scenario_graded" if target_semantics == "scenario_calculator" else "graded"
                 graded += 1
@@ -1322,7 +1555,7 @@ def build_external_consensus(*, horizon: str, issued_at: datetime | str | None =
                 or row.target_semantics == "scenario_calculator"
             )
         ]
-        historical = [row for row in latest_rows if not row.observed_live]
+        historical = [row for row in latest_rows if not _effective_observed_live(session, row)]
         stale = [
             row for row in components
             if sources[row.source_id].next_check_at is not None
@@ -1402,11 +1635,7 @@ def grade_due_consensus(*, now: datetime | str | None = None) -> dict[str, Any]:
             ))
             if existing is not None:
                 continue
-            outcome = session.scalar(select(VerifiedOutcomeRow).where(
-                VerifiedOutcomeRow.asset_symbol == "TAG",
-                VerifiedOutcomeRow.observed_at == deadline,
-                VerifiedOutcomeRow.verification_status == "verified",
-            ).order_by(VerifiedOutcomeRow.retrieved_at.asc()).limit(1))
+            outcome, outcome_offset_seconds = _aligned_outcome(session, deadline)
             if outcome is None:
                 outcome_id = actual = direction_correct = absolute_error = None
                 disposition = "exact_deadline_outcome_unavailable"
@@ -1438,8 +1667,15 @@ def grade_due_consensus(*, now: datetime | str | None = None) -> dict[str, Any]:
                 outcome_id=outcome_id, actual_price=actual,
                 direction_correct=direction_correct, absolute_error=absolute_error,
                 disposition=disposition, grader_version=EXTERNAL_GRADER_VERSION,
+                metrics_json=json_dumps({
+                    "outcomeAlignmentPolicy": "exact_then_nearest_verified_within_60s_v1",
+                    "outcomeOffsetSeconds": outcome_offset_seconds,
+                }),
             ))
-    return {"graded": graded, "outcomeUnavailable": unavailable, "exactDeadlineOnly": True}
+    return {
+        "graded": graded, "outcomeUnavailable": unavailable,
+        "outcomeAlignmentPolicy": "exact_then_nearest_verified_within_60s_v1",
+    }
 
 
 def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
@@ -1559,6 +1795,10 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
                     "previousCapturedAt": prior.captured_at.isoformat() if prior is not None else None,
                     "currentCapturedAt": current.captured_at.isoformat() if current is not None else None,
                 })
+            metadata_revisions = list(session.scalars(select(TagNextExternalMetadataRevisionRow).where(
+                TagNextExternalMetadataRevisionRow.snapshot_id == row.snapshot_id
+            ).order_by(TagNextExternalMetadataRevisionRow.corrected_at.asc())))
+            effective_observed_live = _effective_observed_live(session, row)
             is_stale = bool(
                 source is not None
                 and source.next_check_at is not None
@@ -1581,6 +1821,10 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
                 "horizon": row.horizon, "direction": row.direction,
                 "targetPrice": row.target_price, "targetLow": row.target_low,
                 "targetHigh": row.target_high, "movePct": row.move_pct,
+                "targetCurrency": row.target_currency,
+                "targetNativePrice": row.target_native_price,
+                "targetNativeLow": row.target_native_low,
+                "targetNativeHigh": row.target_native_high,
                 "lastChanged": row.captured_at.isoformat(),
                 "lastChecked": source.last_checked_at.isoformat() if source and source.last_checked_at else None,
                 "sourceIssueAt": row.source_issue_at.isoformat() if row.source_issue_at else None,
@@ -1588,7 +1832,8 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
                 "deadline": row.deadline.isoformat() if row.deadline else None,
                 "targetSemantics": row.target_semantics,
                 "gradeability": row.gradeability,
-                "observedLive": row.observed_live,
+                "observedLive": effective_observed_live,
+                "observationClass": "LIVE_OBSERVED" if effective_observed_live else "HISTORICAL_DISCOVERED",
                 "stale": is_stale,
                 "influenceState": "eligible" if consensus_eligible else "zero_influence",
                 "methodology": row.methodology_version or source_state.get("methodology"),
@@ -1596,6 +1841,8 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
                 "identityEvidence": json.loads(source.identity_chain_json or "{}") if source else {},
                 "conditionalTrigger": row.conditional_trigger,
                 "snapshotId": row.snapshot_id, "gradedCount": grade_counts[row.source_id],
+                "forecastSemanticHash": row.payload_hash,
+                "evidenceMetadataHash": json.loads(row.provenance_json or "{}").get("evidenceMetadataHash"),
                 "popularity": popularity,
                 "accuracy": None if score is None else {
                     "sampleCount": score.sample_count,
@@ -1611,6 +1858,15 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
                     "absoluteError": grade.absolute_error,
                 },
                 "revisionHistory": revision_payloads,
+                "metadataRevisionHistory": [{
+                    "metadataRevisionId": item.metadata_revision_id,
+                    "fieldName": item.field_name,
+                    "previousValue": json.loads(item.previous_value_json),
+                    "correctedValue": json.loads(item.corrected_value_json),
+                    "reason": item.reason,
+                    "correctedAt": item.corrected_at.isoformat(),
+                    "evidenceMetadataHash": item.evidence_metadata_hash,
+                } for item in metadata_revisions],
                 "chasingScore": (
                     sum(bool(item["possibleOutcomeChasing"]) for item in revision_payloads)
                     / len(revision_payloads)

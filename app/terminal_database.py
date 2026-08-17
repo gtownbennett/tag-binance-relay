@@ -1569,6 +1569,10 @@ class TagNextExternalSnapshotRow(Base):
     target_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
     target_low: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
     target_high: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    target_currency: Mapped[str] = mapped_column(Text, default="USD")
+    target_native_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    target_native_low: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    target_native_high: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
     move_pct: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
     captured_text: Mapped[str | None] = mapped_column(Text)
     semantics_json: Mapped[str] = mapped_column(Text, default="{}")
@@ -1737,6 +1741,133 @@ class TagNextDiscoverySearchAttemptRow(Base):
     retry_status: Mapped[str] = mapped_column(Text, index=True)
     alternative_engine: Mapped[str | None] = mapped_column(Text)
     evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class TagNextCandidateAccessAttemptRow(Base):
+    __tablename__ = "tagnext_candidate_access_attempts"
+
+    attempt_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    candidate_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("tagnext_discovery_candidates.candidate_id"), index=True
+    )
+    method: Mapped[str] = mapped_column(Text)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    requested_url: Mapped[str] = mapped_column(Text)
+    resolved_url: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class TagNextExternalEvidencePackageRow(Base):
+    __tablename__ = "tagnext_external_evidence_packages"
+
+    evidence_package_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    source_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("tagnext_external_forecast_sources.source_id"), index=True
+    )
+    candidate_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("tagnext_discovery_candidates.candidate_id"), index=True
+    )
+    snapshot_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"), index=True
+    )
+    evidence_kind: Mapped[str] = mapped_column(Text)
+    retrieval_method: Mapped[str] = mapped_column(Text)
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    original_url: Mapped[str] = mapped_column(Text)
+    archive_url: Mapped[str | None] = mapped_column(Text)
+    mime_type: Mapped[str | None] = mapped_column(Text)
+    raw_sha256: Mapped[str] = mapped_column(String(64))
+    raw_size_bytes: Mapped[int] = mapped_column(BigInteger)
+    storage_path: Mapped[str | None] = mapped_column(Text)
+    extraction_map_json: Mapped[str] = mapped_column(Text, default="{}")
+    parser_version: Mapped[str | None] = mapped_column(Text)
+    legal_state: Mapped[str] = mapped_column(Text, default="public_evidence")
+    rendered_title: Mapped[str | None] = mapped_column(Text)
+    rendered_url: Mapped[str | None] = mapped_column(Text)
+    raw_text: Mapped[str | None] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class TagNextExternalMetadataRevisionRow(Base):
+    __tablename__ = "tagnext_external_forecast_metadata_revisions"
+
+    metadata_revision_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"), index=True
+    )
+    field_name: Mapped[str] = mapped_column(Text, index=True)
+    previous_value_json: Mapped[str] = mapped_column(Text)
+    corrected_value_json: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text)
+    evidence_package_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("tagnext_external_evidence_packages.evidence_package_id")
+    )
+    corrected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    evidence_metadata_hash: Mapped[str] = mapped_column(String(64))
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class TagNextSourcePopularityComponentRow(Base):
+    __tablename__ = "tagnext_source_popularity_components"
+
+    component_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    source_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("tagnext_external_forecast_sources.source_id"), index=True
+    )
+    component_name: Mapped[str] = mapped_column(Text)
+    source_url: Mapped[str] = mapped_column(Text)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    raw_rank: Mapped[int | None] = mapped_column(BigInteger)
+    normalized_score: Mapped[Decimal] = mapped_column(Numeric(20, 12))
+    confidence: Mapped[str] = mapped_column(Text)
+    evidence_package_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("tagnext_external_evidence_packages.evidence_package_id")
+    )
+    method_json: Mapped[str] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class TagNextMarketObservationRow(Base):
+    __tablename__ = "tagnext_market_observations"
+
+    observation_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    provider_id: Mapped[str] = mapped_column(Text)
+    venue: Mapped[str] = mapped_column(Text)
+    symbol: Mapped[str] = mapped_column(Text, index=True)
+    interval_label: Mapped[str] = mapped_column(Text)
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    open_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    high_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    low_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    close_price: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    vwap_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    sample_count: Mapped[int | None] = mapped_column(BigInteger)
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source_url: Mapped[str] = mapped_column(Text)
+    raw_sha256: Mapped[str] = mapped_column(String(64))
+    verification_status: Mapped[str] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class TagNextCanonicalCorpusRunRow(Base):
+    __tablename__ = "tagnext_canonical_corpus_runs"
+
+    corpus_run_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    discovery_version: Mapped[str] = mapped_column(Text)
+    retained_candidate_count: Mapped[int] = mapped_column(Integer)
+    newly_discovered_count: Mapped[int] = mapped_column(Integer)
+    canonical_candidate_count: Mapped[int] = mapped_column(Integer)
+    terminal_candidate_count: Mapped[int] = mapped_column(Integer)
+    query_count: Mapped[int] = mapped_column(Integer)
+    query_failure_count: Mapped[int] = mapped_column(Integer)
+    reconciliation_json: Mapped[str] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
 
 
 class TagNextSourceHistoryRow(Base):

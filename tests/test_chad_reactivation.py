@@ -322,12 +322,12 @@ class ChadReactivationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_health_exposes_safe_gate_status_without_secrets(self) -> None:
         with (
-            patch.object(main, "OPENAI_API_KEY", "sk-sensitive-test-value"),
+            patch.object(main, "OPENAI_API_KEY", "synthetic-openai-key-for-test"),
             patch.object(main, "RELAY_TOKEN", "relay-sensitive-test-value"),
         ):
             payload = await main.health()
         serialized = json.dumps(payload)
-        self.assertNotIn("sk-sensitive-test-value", serialized)
+        self.assertNotIn("synthetic-openai-key-for-test", serialized)
         self.assertNotIn("relay-sensitive-test-value", serialized)
         self.assertIn("chadReactivation", payload)
         self.assertEqual(payload["healthCheckSideEffects"], "none")

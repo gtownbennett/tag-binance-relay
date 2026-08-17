@@ -222,6 +222,8 @@ def _claim(
     update_at: datetime | None = None, probability: float | None = None,
     scenario_class: str | None = None, methodology_version: str | None = None,
     conditional_trigger: str | None = None, gradeability: str = "point",
+    target_currency: str = "USD", native_value: float | None = None,
+    native_low: float | None = None, native_high: float | None = None,
 ) -> dict[str, Any]:
     horizon = normalize_horizon(label, issue_at=issue_at or update_at)
     if semantics not in TARGET_SEMANTICS:
@@ -230,6 +232,10 @@ def _claim(
         "sourceId": source_id, "assetAuthority": "tagger",
         **horizon, "targetSemantics": semantics,
         "targetPrice": value, "targetLow": low, "targetHigh": high,
+        "targetCurrency": target_currency,
+        "targetNativePrice": native_value,
+        "targetNativeLow": native_low,
+        "targetNativeHigh": native_high,
         "direction": direction, "sourceIssueAt": issue_at,
         "sourceUpdateAt": update_at, "probability": probability,
         "scenarioClass": scenario_class,
@@ -491,6 +497,160 @@ def _cmc_ai_claims(
     )]
 
 
+def _annual_rendered_min_avg_max_claims(
+    source_id: str, document: ForecastDocument, *, issue_at: datetime,
+    adapter_id: str,
+) -> list[dict[str, Any]]:
+    claims: list[dict[str, Any]] = []
+    for year, minimum, average, maximum in re.findall(
+        r"\b(20\d{2})\s+\$\s*([0-9.]+)\s+\$\s*([0-9.]+)\s+\$\s*([0-9.]+)",
+        document.visible_text,
+    ):
+        for semantics, raw_value in (
+            ("period_minimum", minimum),
+            ("period_average", average),
+            ("period_maximum", maximum),
+        ):
+            value = _number(raw_value)
+            if value is not None:
+                claims.append(_claim(
+                    source_id=source_id, label=year, semantics=semantics,
+                    value=value, issue_at=issue_at,
+                    methodology_version=f"{adapter_id}:rendered_annual_table",
+                    gradeability="period",
+                ))
+    return deduplicate_claims(claims)
+
+
+def _tradersunion_rendered_claims(
+    source_id: str, document: ForecastDocument, *, issue_at: datetime,
+    adapter_id: str,
+) -> list[dict[str, Any]]:
+    text = document.visible_text
+    claims: list[dict[str, Any]] = []
+    months = {name.lower(): index for index, name in enumerate(calendar.month_name) if name}
+    for month_name, year_text, minimum, maximum, average in re.findall(
+        r"\b(" + "|".join(calendar.month_name[1:]) + r")\s+(20\d{2})\s+"
+        r"\$\s*([0-9.]+)\s+\$\s*([0-9.]+)\s+\$\s*([0-9.]+)",
+        text, re.I,
+    ):
+        year = int(year_text)
+        month = months[month_name.lower()]
+        last_day = calendar.monthrange(year, month)[1]
+        start = datetime(year, month, 1, tzinfo=timezone.utc)
+        end = datetime(year, month, last_day, 23, 59, 59, tzinfo=timezone.utc)
+        for semantics, raw_value in (
+            ("period_minimum", minimum),
+            ("period_maximum", maximum),
+            ("period_average", average),
+        ):
+            claim = _claim(
+                source_id=source_id, label=f"{month_name} {year}", semantics=semantics,
+                value=_number(raw_value), issue_at=issue_at,
+                methodology_version=f"{adapter_id}:rendered_monthly_table",
+                gradeability="period",
+            )
+            claim.update({
+                "normalizedHorizon": f"{year:04d}-{month:02d}",
+                "periodStart": start, "periodEnd": end, "deadline": end,
+            })
+            claims.append(claim)
+    long_term_table = text
+    long_term_header = re.search(
+        r"Year\s+Price in the middle of the year\s+Price at the end of the year",
+        text, re.I,
+    )
+    if long_term_header:
+        long_term_table = text[long_term_header.end():]
+        long_term_table = re.split(r"How our forecasts work", long_term_table, maxsplit=1, flags=re.I)[0]
+    else:
+        long_term_table = ""
+    for year, mid_year, year_end in re.findall(
+        r"\b(20\d{2})\s+\$\s*([0-9.]+)\s+\$\s*([0-9.]+)", long_term_table
+    ):
+        claims.append(_claim(
+            source_id=source_id, label=year, semantics="mid_year",
+            value=_number(mid_year), issue_at=issue_at,
+            methodology_version=f"{adapter_id}:rendered_long_term_table",
+        ))
+        claims.append(_claim(
+            source_id=source_id, label=year, semantics="year_end",
+            value=_number(year_end), issue_at=issue_at,
+            methodology_version=f"{adapter_id}:rendered_long_term_table",
+        ))
+    return deduplicate_claims(claims)
+
+
+def _gate_native_currency_claims(
+    source_id: str, document: ForecastDocument, *, issue_at: datetime,
+    adapter_id: str,
+) -> list[dict[str, Any]]:
+    """Freeze Gate's CNY table without silently relabeling CNY values as USD."""
+    claims: list[dict[str, Any]] = []
+    pattern = re.compile(
+        r"\b(20\d{2})\s*[\t ]+¥\s*([0-9.]+)\s*[\t ]+¥\s*([0-9.]+)\s*[\t ]+¥\s*([0-9.]+)",
+        re.I,
+    )
+    for match in pattern.finditer(document.visible_text):
+        year, minimum, maximum, average = match.groups()
+        for semantics, native_value in (
+            ("period_minimum", _number(minimum)),
+            ("period_maximum", _number(maximum)),
+            ("period_average", _number(average)),
+        ):
+            if native_value is None:
+                continue
+            claims.append(_claim(
+                source_id=source_id, label=year, semantics=semantics,
+                issue_at=issue_at, methodology_version=adapter_id,
+                gradeability="native_currency_period",
+                target_currency="CNY", native_value=native_value,
+            ))
+    return deduplicate_claims(claims)
+
+
+def _scenario_calculator_text_claims(
+    source_id: str, document: ForecastDocument, *, issue_at: datetime,
+    adapter_id: str,
+) -> list[dict[str, Any]]:
+    text = document.visible_text
+    currency = "CAD" if re.search(r"\bCAD scenarios\b", text, re.I) else "USD"
+    growth = re.search(r"(?:based on|with)\s+(\d+(?:\.\d+)?)%", text, re.I)
+    trigger = (
+        f"default {growth.group(1)}% annual growth input shown by source"
+        if growth else "default growth input shown by source"
+    )
+    claims: list[dict[str, Any]] = []
+    for year, raw_value in re.findall(r"\b(20\d{2})\s+\$\s*([0-9]+(?:\.[0-9]+)?)", text):
+        value = _number(raw_value)
+        if value is None or value <= 0:
+            continue
+        claims.append(_claim(
+            source_id=source_id, label=year, semantics="scenario_calculator",
+            value=value if currency == "USD" else None,
+            native_value=value, target_currency=currency,
+            issue_at=issue_at, scenario_class="user_input_growth_calculator",
+            methodology_version=f"{adapter_id}:rendered_text",
+            conditional_trigger=trigger, gradeability="scenario",
+        ))
+    if not claims:
+        top = re.search(
+            r"(?:TAG Target Price\s+|Predicted Price for [^\n]+ in 5 years\s+)\$\s*([0-9]+(?:\.[0-9]+)?)",
+            text, re.I,
+        )
+        value = _number(top.group(1)) if top else None
+        if value is not None and value > 0:
+            claims.append(_claim(
+                source_id=source_id, label="5 years", semantics="scenario_calculator",
+                value=value if currency == "USD" else None,
+                native_value=value, target_currency=currency,
+                issue_at=issue_at, scenario_class="user_input_growth_calculator",
+                methodology_version=f"{adapter_id}:rendered_text",
+                conditional_trigger=trigger, gradeability="scenario",
+            ))
+    return deduplicate_claims(claims)
+
+
 def _document_issue_at(document: ForecastDocument) -> datetime:
     text = document.visible_text
     match = re.search(
@@ -503,12 +663,22 @@ def _document_issue_at(document: ForecastDocument) -> datetime:
             f"{match.group(1)} {match.group(2)}", "%Y-%m-%d %H:%M:%S"
         ).replace(tzinfo=offset)
         return parsed.astimezone(timezone.utc)
-    # A source without a declared issue/update time is a first-seen rolling
-    # model.  Day precision prevents scrape microseconds from becoming false
-    # semantic revisions while still freezing a new daily issue.
-    return document.fetched_at.astimezone(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0,
+    dated_article = re.search(
+        r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(\d{1,2}\s+[A-Za-z]+\s+20\d{2})\b",
+        text, re.I,
     )
+    if dated_article:
+        try:
+            return datetime.strptime(dated_article.group(1), "%d %b %Y").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            pass
+    # A source without a declared issue/update time is frozen at the exact
+    # first-seen retrieval time.  The semantic fingerprint deliberately omits
+    # issue/update metadata, so a later identical fetch cannot create a false
+    # forecast revision.
+    return document.fetched_at.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -539,6 +709,33 @@ class SourceAdapter:
             )
         if self.parser_kind == "cmc_ai":
             return _cmc_ai_claims(source_id, document, adapter_id=self.adapter_id)
+        if self.parser_kind == "gate_native":
+            return _gate_native_currency_claims(
+                source_id, document, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            )
+        if self.parser_kind == "annual_rendered":
+            return _annual_rendered_min_avg_max_claims(
+                source_id, document, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            )
+        if self.parser_kind == "tradersunion":
+            structured = _structured_claims(
+                source_id, document.structured_data, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            )
+            if structured:
+                return structured
+            tabular = _table_claims(
+                source_id, document.table_rows, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            )
+            if tabular:
+                return tabular
+            return _tradersunion_rendered_claims(
+                source_id, document, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            )
         claims = _structured_claims(
             source_id, document.structured_data, issue_at=effective_issue_at,
             adapter_id=self.adapter_id,
@@ -551,6 +748,11 @@ class SourceAdapter:
         if self.scenario_calculator and not claims:
             claims.extend(_paired_header_table_claims(
                 source_id, document.table_rows, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            ))
+        if self.scenario_calculator and not claims:
+            claims.extend(_scenario_calculator_text_claims(
+                source_id, document, issue_at=effective_issue_at,
                 adapter_id=self.adapter_id,
             ))
         if not claims and not self.scenario_calculator:
@@ -570,8 +772,8 @@ ADAPTERS: tuple[SourceAdapter, ...] = (
     SourceAdapter("coincodex_tagger_v2", ("coincodex.com",), "algorithmic_forecast", 86_400),
     SourceAdapter("pricepredictions_ai_tagger_v2", ("pricepredictions.ai",), "machine_learning_forecast", 2_592_000),
     SourceAdapter("pricepredictions_com_tagger_v2", ("pricepredictions.com",), "algorithmic_forecast", 2_592_000),
-    SourceAdapter("beincrypto_tagger_v2", ("beincrypto.com",), "technical_analysis_article", 2_592_000),
-    SourceAdapter("tradersunion_tagger_v2", ("tradersunion.com",), "algorithmic_forecast", 1_209_600),
+    SourceAdapter("beincrypto_tagger_rendered_v3", ("beincrypto.com",), "technical_analysis_article", 2_592_000, parser_kind="annual_rendered"),
+    SourceAdapter("tradersunion_tagger_rendered_v3", ("tradersunion.com",), "algorithmic_forecast", 1_209_600, parser_kind="tradersunion"),
     SourceAdapter("coinarbitragebot_tagger_v2", ("coinarbitragebot.com",), "algorithmic_forecast", 2_592_000),
     SourceAdapter("midforex_tagger_v2", ("midforex.com",), "machine_learning_forecast", 2_592_000),
     SourceAdapter("bitscreener_tagger_v2", ("bitscreener.com",), "algorithmic_forecast", 1_209_600),
@@ -579,7 +781,8 @@ ADAPTERS: tuple[SourceAdapter, ...] = (
     SourceAdapter("walletinvestor_tagger_v2", ("walletinvestor.com",), "algorithmic_forecast", 1_209_600, parser_kind="walletinvestor"),
     SourceAdapter("blockspot_tagger_v2", ("blockspot.io",), "algorithmic_forecast", 2_592_000),
     SourceAdapter("coinmarketcap_ai_tagger_v2", ("coinmarketcap.com",), "ai_summary", 1_209_600, parser_kind="cmc_ai"),
-    SourceAdapter("exchange_scenario_calculator_v2", ("mexc.com", "coinbase.com", "bitget.com", "gate.com", "tapbit.com"), "scenario_calculator", 2_592_000, True, "exchange_scenario"),
+    SourceAdapter("gate_tagger_native_currency_v3", ("miniapp.gate.com",), "algorithmic_forecast", 1_209_600, parser_kind="gate_native"),
+    SourceAdapter("exchange_scenario_calculator_v3", ("mexc.com", "coinbase.com", "bitget.com", "tapbit.com", "gate.com"), "scenario_calculator", 2_592_000, True, "exchange_scenario"),
 )
 
 
@@ -602,6 +805,9 @@ def deduplicate_claims(claims: Sequence[Mapping[str, Any]]) -> list[dict[str, An
             "semantics": claim.get("targetSemantics"),
             "target": claim.get("targetPrice"),
             "low": claim.get("targetLow"), "high": claim.get("targetHigh"),
+            "currency": claim.get("targetCurrency"),
+            "nativeTarget": claim.get("targetNativePrice"),
+            "nativeLow": claim.get("targetNativeLow"), "nativeHigh": claim.get("targetNativeHigh"),
             "direction": claim.get("direction"), "probability": claim.get("probability"),
         }, sort_keys=True, default=str)
         if key not in seen:

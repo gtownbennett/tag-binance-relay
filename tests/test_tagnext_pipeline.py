@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.tagnext_pipeline import (
     FEATURE_VERSION,
     build_external_consensus,
     capture_shadow_features,
     external_semantic_fingerprint,
+    capture_due_external_outcomes,
+    grade_due_external_forecasts,
     predictions_payload,
     parse_external_forecast_text,
     register_external_source,
@@ -21,12 +24,17 @@ from app.terminal_database import (
     TagNextConsensusRow,
     TagNextConsensusGradeRow,
     TagNextExternalRevisionRow,
+    TagNextExternalGradeRow,
+    TagNextExternalOutcomeScheduleRow,
     TagNextExternalSnapshotRow,
     TagNextExternalSourceRow,
     TagNextFeatureSnapshotRow,
+    TagNextMarketObservationRow,
+    VerifiedOutcomeRow,
     init_db,
     session_scope,
 )
+from scripts.import_rc2_public_popularity import _set_popularity_summary
 
 
 NOW = datetime(2026, 8, 17, 12, tzinfo=timezone.utc)
@@ -54,9 +62,10 @@ def setup_function() -> None:
     init_db()
     with session_scope() as session:
         for model in (
-            TagNextConsensusGradeRow, TagNextConsensusRow, TagNextExternalRevisionRow,
+            TagNextConsensusGradeRow, TagNextConsensusRow, TagNextExternalGradeRow,
+            TagNextExternalOutcomeScheduleRow, TagNextExternalRevisionRow,
             TagNextExternalSnapshotRow, TagNextExternalSourceRow,
-            TagNextFeatureSnapshotRow,
+            TagNextMarketObservationRow, VerifiedOutcomeRow, TagNextFeatureSnapshotRow,
         ):
             session.execute(delete(model))
         session.execute(delete(CanonicalEvidenceSnapshotRow).where(
@@ -70,6 +79,23 @@ def test_identity_chain_does_not_require_contract_on_forecast_page() -> None:
     assert result["forecastPageContractRequired"] is False
 
 
+def test_public_rank_summary_is_persisted_on_the_active_session_row() -> None:
+    register_external_source({
+        "sourceId": "popularity-source", "label": "popularity-source",
+        "canonicalUrl": "https://example.test/popularity-source",
+        "identityChain": IDENTITY_CHAIN,
+    })
+    summary = {
+        "metric": "public_rank_composite_v1", "score": 42.5,
+        "searchHitCountsUsed": False,
+    }
+    with session_scope() as session:
+        _set_popularity_summary(session, "popularity-source", summary)
+    with session_scope() as session:
+        source = session.get(TagNextExternalSourceRow, "popularity-source")
+        assert json.loads(source.popularity_json) == summary
+
+
 def test_external_fingerprint_hashes_semantics_not_ads_layout_or_scrape_time() -> None:
     meaning = {
         "sourceId": "example", "horizon": "2027",
@@ -79,6 +105,21 @@ def test_external_fingerprint_hashes_semantics_not_ads_layout_or_scrape_time() -
     first = {**meaning, "capturedText": "ad A header layout", "capturedAt": "2026-08-17T00:00:00Z"}
     second = {**meaning, "capturedText": "ad B redesigned page", "capturedAt": "2026-08-18T00:00:00Z"}
     assert external_semantic_fingerprint(first) == external_semantic_fingerprint(second)
+
+
+def test_external_fingerprint_separates_evidence_metadata_but_keeps_native_meaning() -> None:
+    base = {
+        "sourceId": "gate", "horizon": "2027", "targetSemantics": "period_average",
+        "targetCurrency": "CNY", "targetNativePrice": 0.006689,
+    }
+    metadata_change = {
+        **base, "sourceIssueAt": "2026-08-17T00:00:00Z",
+        "sourceUpdateAt": "2026-08-18T00:00:00Z", "observedLive": False,
+    }
+    assert external_semantic_fingerprint(base) == external_semantic_fingerprint(metadata_change)
+    assert external_semantic_fingerprint(base) != external_semantic_fingerprint({
+        **base, "targetCurrency": "USD"
+    })
 
 
 def test_unknown_raw_text_is_not_parsed_by_the_removed_dollar_after_year_heuristic() -> None:
@@ -161,3 +202,39 @@ def test_scenario_calculators_are_visible_but_never_consensus_components() -> No
     assert consensus["sourceCount"] == 1
     assert consensus["targetPrice"] == 0.01
     assert {row["sourceId"] for row in predictions_payload(horizon="2030")["externalForecasts"]} == {"forecast", "calculator"}
+
+
+def test_verified_candle_alignment_is_recorded_and_single_interval_is_not_called_wis() -> None:
+    deadline = NOW.replace(second=0, microsecond=0)
+    register_external_source({
+        "sourceId": "aligned", "label": "aligned",
+        "canonicalUrl": "https://example.test/aligned",
+        "identityChain": {**IDENTITY_CHAIN, "forecastAssetPage": "https://example.test/aligned"},
+    })
+    store_external_snapshot({
+        "sourceId": "aligned", "horizon": "point",
+        "deadline": deadline.isoformat(), "direction": "HIGHER",
+        "targetPrice": 0.0012, "targetLow": 0.0010, "targetHigh": 0.0014,
+        "referencePrice": 0.0009,
+    }, captured_at=deadline.replace(hour=11))
+    capture = capture_due_external_outcomes(
+        now=deadline + timedelta(seconds=30),
+        price_observation={
+            "providerId": "test-candles", "venue": "test", "symbol": "TAGUSDT",
+            "interval": "1m", "periodStart": (deadline - timedelta(seconds=60)).isoformat(),
+            "periodEnd": (deadline + timedelta(seconds=30)).isoformat(),
+            "openPrice": 0.0010, "highPrice": 0.0013, "lowPrice": 0.0009,
+            "closePrice": 0.0011, "sampleCount": 12,
+            "retrievedAt": (deadline + timedelta(seconds=31)).isoformat(),
+            "sourceName": "verified test candle", "sourceReference": "local:test-candle",
+        },
+    )
+    assert capture["completed"] == 1
+    assert grade_due_external_forecasts(now=deadline + timedelta(minutes=2))["graded"] == 1
+    with session_scope() as session:
+        grade = session.scalar(select(TagNextExternalGradeRow))
+        metrics = __import__("json").loads(grade.metrics_json)
+        assert metrics["outcomeOffsetSeconds"] == 30
+        assert metrics["intervalScore"] is not None
+        assert metrics["multiIntervalWIS"] is None
+        assert metrics["wisStatus"] == "not_computed_single_central_interval_only"

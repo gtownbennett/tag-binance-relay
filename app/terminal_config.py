@@ -93,7 +93,7 @@ DATABASE_DIAGNOSTIC = {
 RELAY_TOKEN = os.getenv("RELAY_TOKEN", "").strip()
 ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
 COLLECT_SECONDS = max(300, int(os.getenv("COLLECT_SECONDS", "300")))
-APP_VERSION = "tagnext-1.0.0-correction1"
+APP_VERSION = "tagnext-1.0.0-rc2"
 
 # Project-specific user context used only for risk framing, never for automatic orders.
 TAG_BAG_TOKENS = float(os.getenv("TAG_BAG_TOKENS", "100812406"))

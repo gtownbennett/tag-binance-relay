@@ -161,7 +161,16 @@ def discovery_query_plan() -> list[dict[str, str]]:
             query = f'site:{seed["domain"]} "TAGGER" (forecast OR prediction)'
             for engine in ("bing_rss", "duckduckgo_html"):
                 plan.append({"engine": engine, "language": "en", "query": query})
-    return plan
+    # A named-source seed can duplicate a generic source-specific query.
+    # Preserve order while executing each engine/language/query exactly once.
+    distinct: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in plan:
+        key = (item["engine"], item["language"], item["query"])
+        if key not in seen:
+            seen.add(key)
+            distinct.append(item)
+    return distinct
 
 
 def public_discovery_worker_run(

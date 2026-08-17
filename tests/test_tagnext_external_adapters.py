@@ -84,3 +84,76 @@ def test_repeat_fetch_is_semantically_stable_and_real_revision_changes_hash_inpu
         adapter.parse(source_id="coincodex-tagger", document=layout_change)
     )
     assert first_claims != adapter.parse(source_id="coincodex-tagger", document=revision)
+
+
+def test_rendered_beincrypto_table_preserves_min_average_and_maximum() -> None:
+    fetched = datetime(2026, 8, 17, 21, tzinfo=timezone.utc)
+    url = "https://beincrypto.com/price/tagger/price-prediction/"
+    document = parse_document(
+        url=url,
+        html=(
+            "TAGGER (TAG) Price Prediction Mon, 17 Aug 2026 "
+            "Year Min Price Avg Price Max Price 2027 $0.00030 $0.00088 $0.00174"
+        ),
+        fetched_at=fetched,
+    )
+    claims = adapter_for_url(url).parse(source_id="beincrypto-tagger", document=document)
+    assert [(row["targetSemantics"], row["targetPrice"]) for row in claims] == [
+        ("period_minimum", 0.00030),
+        ("period_average", 0.00088),
+        ("period_maximum", 0.00174),
+    ]
+    assert all(row["sourceIssueAt"] == datetime(2026, 8, 17, tzinfo=timezone.utc) for row in claims)
+
+
+def test_tradersunion_monthly_rows_do_not_become_false_annual_rows() -> None:
+    fetched = datetime(2026, 8, 17, 21, tzinfo=timezone.utc)
+    url = "https://tradersunion.com/currencies/forecast/tag-usd/"
+    document = parse_document(
+        url=url,
+        html=(
+            "TAGGER TAG/USD Month Minimum Price Maximum Price Average Price "
+            "September 2026 $0.0029 $0.0031 $0.0030 "
+            "Year Price in the middle of the year Price at the end of the year "
+            "2027 $0.0079 $0.0043 How our forecasts work"
+        ),
+        fetched_at=fetched,
+    )
+    claims = adapter_for_url(url).parse(source_id="tradersunion-tagger", document=document)
+    assert len(claims) == 5
+    assert sum(row["normalizedHorizon"] == "2026-09" for row in claims) == 3
+    assert {(row["normalizedHorizon"], row["targetSemantics"]) for row in claims[-2:]} == {
+        ("2027", "mid_year"), ("2027", "year_end")
+    }
+
+
+def test_gate_native_currency_table_is_never_silently_labeled_usd() -> None:
+    fetched = datetime(2026, 8, 17, 21, tzinfo=timezone.utc)
+    url = "https://miniapp.gate.com/zh/price-prediction/tagger-tag"
+    document = parse_document(
+        url=url,
+        html="TAGGER TAG 2027\t¥0.005217\t¥0.007759\t¥0.006689",
+        fetched_at=fetched,
+    )
+    claims = adapter_for_url(url).parse(source_id="gate-tagger-forecast", document=document)
+    assert len(claims) == 3
+    assert all(row["targetCurrency"] == "CNY" for row in claims)
+    assert all(row["targetPrice"] is None for row in claims)
+    assert {row["targetNativePrice"] for row in claims} == {0.005217, 0.007759, 0.006689}
+
+
+def test_exchange_calculator_is_conditional_and_preserves_native_currency() -> None:
+    fetched = datetime(2026, 8, 17, 21, tzinfo=timezone.utc)
+    url = "https://www.tapbit.com/en/price-prediction/tagger"
+    document = parse_document(
+        url=url,
+        html="TAGGER TAG price prediction CAD scenarios based on 5% 2027 $0.000989",
+        fetched_at=fetched,
+    )
+    claims = adapter_for_url(url).parse(source_id="tapbit-tagger-calculator", document=document)
+    assert len(claims) == 1
+    assert claims[0]["targetSemantics"] == "scenario_calculator"
+    assert claims[0]["scenarioClass"] == "user_input_growth_calculator"
+    assert claims[0]["targetCurrency"] == "CAD"
+    assert claims[0]["targetPrice"] is None
+    assert claims[0]["targetNativePrice"] == 0.000989

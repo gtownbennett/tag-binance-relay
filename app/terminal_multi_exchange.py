@@ -106,7 +106,7 @@ class MultiExchangeService:
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(18.0, connect=10.0),
             follow_redirects=True,
-            headers={"User-Agent": "TAGneXt-Relay/tagnext-1.0.0-correction1"},
+            headers={"User-Agent": "TAGneXt-Relay/tagnext-1.0.0-rc2"},
         )
 
     async def stop(self) -> None:
