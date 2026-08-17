@@ -93,22 +93,66 @@ def _metrics_analysis(rows: list[list[str]]) -> dict[str, Any]:
         return {"status": "unavailable", "reason": "Empty metrics archive"}
     header = [value.strip() for value in rows[0]]
     data = [dict(zip(header, row)) for row in rows[1:] if len(row) == len(header)]
-    oi_key = next((key for key in header if "open_interest_value" in key.lower()), None)
-    if not data or oi_key is None:
-        return {"status": "unavailable", "headers": header, "reason": "OI value column unavailable"}
-    usable = [(row, _number(row.get(oi_key))) for row in data]
-    usable = [(row, value) for row, value in usable if value is not None]
+    token_oi_key = next(
+        (key for key in header if key.lower() == "sum_open_interest"), None
+    )
+    value_oi_key = next(
+        (key for key in header if "open_interest_value" in key.lower()), None
+    )
+    if not data or token_oi_key is None or value_oi_key is None:
+        return {
+            "status": "unavailable",
+            "headers": header,
+            "reason": "Token-denominated and USD-valued OI columns are both required",
+        }
+    usable = [
+        (row, _number(row.get(token_oi_key)), _number(row.get(value_oi_key)))
+        for row in data
+    ]
+    usable = [
+        (row, token_oi, value_oi)
+        for row, token_oi, value_oi in usable
+        if token_oi is not None and value_oi is not None
+    ]
     if not usable:
-        return {"status": "unavailable", "headers": header, "reason": "No finite OI values"}
+        return {
+            "status": "unavailable",
+            "headers": header,
+            "reason": "No rows have both finite token and USD OI values",
+        }
     first, last = usable[0], usable[-1]
-    minimum = min(usable, key=lambda pair: pair[1])
-    maximum = max(usable, key=lambda pair: pair[1])
+    token_minimum = min(usable, key=lambda row: row[1])
+    token_maximum = max(usable, key=lambda row: row[1])
+    value_minimum = min(usable, key=lambda row: row[2])
+    value_maximum = max(usable, key=lambda row: row[2])
+    coverage_start = str(first[0].get("create_time") or "")
+    coverage_end = str(last[0].get("create_time") or "")
     return {
         "status": "available", "rows": len(data), "headers": header,
-        "openInterestValueStart": first[1], "openInterestValueEnd": last[1],
-        "openInterestValueChangePct": (last[1] / first[1] - 1.0) * 100.0 if first[1] else None,
-        "minimum": {"time": minimum[0].get("create_time"), "value": minimum[1]},
-        "maximum": {"time": maximum[0].get("create_time"), "value": maximum[1]},
+        "coverageStartUtc": f"{coverage_start}Z" if coverage_start else None,
+        "coverageEndUtc": f"{coverage_end}Z" if coverage_end else None,
+        "coverageCompleteUtcDay": False,
+        "coverageNote": "Retained metrics span approximately 00:40–23:05 UTC, not the complete UTC day.",
+        "tokenOpenInterest": {
+            "unit": "TAG",
+            "start": first[1],
+            "end": last[1],
+            "changePct": (last[1] / first[1] - 1.0) * 100.0 if first[1] else None,
+            "minimum": {"time": token_minimum[0].get("create_time"), "value": token_minimum[1]},
+            "maximum": {"time": token_maximum[0].get("create_time"), "value": token_maximum[1]},
+        },
+        "usdOpenInterestValue": {
+            "unit": "USD",
+            "start": first[2],
+            "end": last[2],
+            "changePct": (last[2] / first[2] - 1.0) * 100.0 if first[2] else None,
+            "minimum": {"time": value_minimum[0].get("create_time"), "value": value_minimum[2]},
+            "maximum": {"time": value_maximum[0].get("create_time"), "value": value_maximum[2]},
+        },
+        "interpretation": (
+            "Sticky token-denominated OI with dollar-exposure compression caused primarily "
+            "by the price collapse."
+        ),
     }
 
 
@@ -159,7 +203,9 @@ def main() -> None:
         except Exception as error:
             dex = {"status": "unavailable", "reason": f"{type(error).__name__}: {error}"}
     report = {
-        "schemaVersion": 1, "systemId": "tagnext", "episode": DAY,
+        "schemaVersion": 2, "systemId": "tagnext", "episode": DAY,
+        "episodeLabel": "sticky_token_oi_price_driven_usd_exposure_compression",
+        "learningStatus": "forensic_observation_only_not_promoted",
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "identity": {
             "token": "0x208bf3e7da9639f1eaefa2de78c23396b0682025",
@@ -171,6 +217,8 @@ def main() -> None:
         "geckoTerminalDex": dex,
         "archiveProvenance": provenance, "downloadErrors": errors,
         "limitations": [
+            "Retained Binance metrics span approximately 00:40–23:05 UTC, not the complete UTC day.",
+            "A fall in USD-valued open interest during a price collapse is not evidence that token-denominated OI was flushed.",
             "No wallet/entity attribution was made without verified BNB-chain transfer evidence.",
             "No real liquidation map was available; none is inferred from price candles.",
             "Premium-index candles are evidence, not a substitute for liquidation records.",

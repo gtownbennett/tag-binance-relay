@@ -16,7 +16,7 @@ from app.tagnext_intelligence import (
     provider_registry,
     simulate_orderbook_exit,
     validate_tag_identity,
-    weighted_interval_score,
+    interval_score,
 )
 
 
@@ -69,6 +69,8 @@ def test_heatmap_risk_is_never_presented_as_observed_liquidations() -> None:
     result = estimated_liquidation_risk({"fundingZ": 1.2, "openInterestChangePct": 0.8})
     assert result["kind"] == "estimated_not_observed"
     assert "not a real liquidation map" in result["warning"]
+    assert result["influencesForecast"] is False
+    assert result["basis"]["mode"] == "shadow_only"
 
 
 def test_orderbook_exit_is_partial_fill_aware_and_non_executing() -> None:
@@ -97,6 +99,6 @@ def test_provider_registry_preserves_unavailable_state() -> None:
     assert bscscan["influences_forecast"] is False
 
 
-def test_weighted_interval_score_penalizes_miss() -> None:
-    assert weighted_interval_score(9, 11, 10) == 2
-    assert weighted_interval_score(9, 11, 12) > 2
+def test_interval_score_penalizes_miss_without_calling_one_interval_wis() -> None:
+    assert interval_score(9, 11, 10) == 2
+    assert interval_score(9, 11, 12) > 2

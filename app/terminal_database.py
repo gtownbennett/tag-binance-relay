@@ -882,8 +882,25 @@ class CanonicalForecastRow(Base):
             name="ck_canonical_forecast_producer",
         ),
         CheckConstraint(
-            "horizon IN ('1h','4h','12h','24h','3d','7d','30d','3m','6m','1y','3y','5y')",
+            "horizon IN ('1h','4h','6h','12h','24h','3d','7d','30d','3m','6m','1y','3y','5y','2026','2027','2028','2029','2030')",
             name="ck_canonical_forecast_horizon",
+        ),
+        CheckConstraint(
+            "(horizon = '1h' AND horizon_minutes = 60) OR "
+            "(horizon = '4h' AND horizon_minutes = 240) OR "
+            "(horizon = '6h' AND horizon_minutes = 360) OR "
+            "(horizon = '12h' AND horizon_minutes = 720) OR "
+            "(horizon = '24h' AND horizon_minutes = 1440) OR "
+            "(horizon = '3d' AND horizon_minutes = 4320) OR "
+            "(horizon = '7d' AND horizon_minutes = 10080) OR "
+            "(horizon = '30d' AND horizon_minutes = 43200) OR "
+            "(horizon = '3m' AND horizon_minutes = 129600) OR "
+            "(horizon = '6m' AND horizon_minutes = 262800) OR "
+            "(horizon = '1y' AND horizon_minutes = 525600) OR "
+            "(horizon = '3y' AND horizon_minutes = 1576800) OR "
+            "(horizon = '5y' AND horizon_minutes = 2628000) OR "
+            "(horizon IN ('2026','2027','2028','2029','2030') AND horizon_minutes > 0)",
+            name="ck_canonical_forecast_horizon_minutes",
         ),
         CheckConstraint(
             "direction IN ('HIGHER','LOWER','SIDEWAYS','NEUTRAL')",
@@ -1016,6 +1033,10 @@ class CanonicalForecastGradeRow(Base):
         CheckConstraint(
             "evaluation_kind IN ('live','historical_backtest')",
             name="ck_canonical_grade_kind",
+        ),
+        CheckConstraint(
+            "horizon IN ('1h','4h','6h','12h','24h','3d','7d','30d','3m','6m','1y','3y','5y','2026','2027','2028','2029','2030')",
+            name="ck_canonical_grade_horizon",
         ),
         CheckConstraint("composite_score >= 0 AND composite_score <= 100", name="ck_canonical_grade_composite"),
     )
@@ -1409,6 +1430,393 @@ class ProviderUsageSnapshotRow(Base):
     )
 
 
+class TagNextProviderRow(Base):
+    __tablename__ = "tagnext_provider_registry"
+
+    provider_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    label: Mapped[str] = mapped_column(Text)
+    tier: Mapped[str] = mapped_column(Text)
+    evidence_class: Mapped[str] = mapped_column(Text)
+    free_access: Mapped[bool] = mapped_column(Boolean, default=True)
+    status: Mapped[str] = mapped_column(Text, index=True)
+    influences_forecast: Mapped[bool] = mapped_column(Boolean, default=False)
+    limitation: Mapped[str | None] = mapped_column(Text)
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextFeatureRegistryRow(Base):
+    __tablename__ = "tagnext_feature_registry"
+
+    feature_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    label: Mapped[str] = mapped_column(Text)
+    evidence_class: Mapped[str] = mapped_column(Text)
+    units: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, default="candidate", index=True)
+    promotion_state: Mapped[str] = mapped_column(Text, default="not_evaluated", index=True)
+    definition_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextModelRegistryRow(Base):
+    __tablename__ = "tagnext_model_registry"
+    __table_args__ = (
+        UniqueConstraint("model_id", "version", name="uq_tagnext_model_version"),
+        CheckConstraint("status IN ('candidate','shadow','challenger','retired')", name="ck_tagnext_model_status"),
+    )
+
+    model_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    version: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, index=True)
+    feature_set_hash: Mapped[str] = mapped_column(Text)
+    config_json: Mapped[str] = mapped_column(Text)
+    training_cutoff: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextFeatureSnapshotRow(Base):
+    __tablename__ = "tagnext_feature_snapshots"
+    __table_args__ = (
+        CheckConstraint("mode IN ('collection_only','shadow','promoted')", name="ck_tagnext_feature_snapshot_mode"),
+        UniqueConstraint("feature_version", "evidence_snapshot_id", name="uq_tagnext_feature_snapshot_evidence"),
+    )
+
+    snapshot_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    feature_version: Mapped[str] = mapped_column(Text, index=True)
+    evidence_snapshot_id: Mapped[str] = mapped_column(String(64), ForeignKey("canonical_evidence_snapshots.snapshot_id"), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    mode: Mapped[str] = mapped_column(Text, index=True)
+    values_json: Mapped[str] = mapped_column(Text)
+    evidence_ids_json: Mapped[str] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextFeaturePromotionRow(Base):
+    __tablename__ = "tagnext_feature_promotions"
+    __table_args__ = (
+        CheckConstraint("evaluation_kind = 'walk_forward_oos'", name="ck_tagnext_promotion_oos"),
+        UniqueConstraint("feature_version", "cutoff_at", name="uq_tagnext_promotion_cutoff"),
+    )
+
+    promotion_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    feature_version: Mapped[str] = mapped_column(Text, index=True)
+    cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    evaluation_kind: Mapped[str] = mapped_column(Text)
+    sample_count: Mapped[int] = mapped_column(Integer)
+    passed: Mapped[bool] = mapped_column(Boolean, default=False)
+    metrics_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextForecastFeatureLinkRow(Base):
+    __tablename__ = "tagnext_forecast_feature_links"
+    __table_args__ = (
+        CheckConstraint("mode IN ('baseline','collection_only','shadow','promoted')", name="ck_tagnext_forecast_feature_mode"),
+        UniqueConstraint("forecast_id", "feature_version", name="uq_tagnext_forecast_feature_link"),
+    )
+
+    link_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    forecast_id: Mapped[str] = mapped_column(String(64), ForeignKey("canonical_forecasts.forecast_id"), index=True)
+    feature_version: Mapped[str] = mapped_column(Text, index=True)
+    mode: Mapped[str] = mapped_column(Text, index=True)
+    evidence_ids_json: Mapped[str] = mapped_column(Text)
+    feature_snapshot_ids_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+
+
+class TagNextExternalSourceRow(Base):
+    __tablename__ = "tagnext_external_forecast_sources"
+
+    source_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    label: Mapped[str] = mapped_column(Text)
+    canonical_url: Mapped[str | None] = mapped_column(Text)
+    access_state: Mapped[str] = mapped_column(Text, index=True)
+    claim_class: Mapped[str | None] = mapped_column(Text)
+    adapter_id: Mapped[str | None] = mapped_column(Text)
+    identity_chain_json: Mapped[str] = mapped_column(Text, default="{}")
+    popularity_json: Mapped[str] = mapped_column(Text, default="{}")
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TagNextExternalSnapshotRow(Base):
+    __tablename__ = "tagnext_external_forecast_snapshots"
+    __table_args__ = (UniqueConstraint("source_id", "payload_hash", name="uq_tagnext_external_source_semantics"),)
+
+    snapshot_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    source_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_sources.source_id"), index=True)
+    asset_contract: Mapped[str] = mapped_column(Text)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    source_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    horizon: Mapped[str | None] = mapped_column(Text, index=True)
+    direction: Mapped[str | None] = mapped_column(Text)
+    target_price: Mapped[float | None] = mapped_column(Float)
+    target_low: Mapped[float | None] = mapped_column(Float)
+    target_high: Mapped[float | None] = mapped_column(Float)
+    move_pct: Mapped[float | None] = mapped_column(Float)
+    captured_text: Mapped[str | None] = mapped_column(Text)
+    semantics_json: Mapped[str] = mapped_column(Text, default="{}")
+    payload_hash: Mapped[str] = mapped_column(Text, index=True)
+    provenance_json: Mapped[str] = mapped_column(Text)
+
+
+class TagNextExternalRevisionRow(Base):
+    __tablename__ = "tagnext_external_forecast_revisions"
+    __table_args__ = (UniqueConstraint("previous_snapshot_id", "current_snapshot_id", name="uq_tagnext_external_revision_pair"),)
+
+    revision_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    previous_snapshot_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"))
+    current_snapshot_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"))
+    possible_outcome_chasing: Mapped[bool] = mapped_column(Boolean, default=False)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextExternalGradeRow(Base):
+    __tablename__ = "tagnext_external_forecast_grades"
+    __table_args__ = (UniqueConstraint("snapshot_id", "deadline", "grader_version", name="uq_tagnext_external_grade"),)
+
+    grade_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"), index=True)
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    actual_price: Mapped[float | None] = mapped_column(Float)
+    direction_correct: Mapped[bool | None] = mapped_column(Boolean)
+    absolute_error: Mapped[float | None] = mapped_column(Float)
+    disposition: Mapped[str] = mapped_column(Text, index=True)
+    grader_version: Mapped[str] = mapped_column(Text)
+    graded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextSourceScoreRow(Base):
+    __tablename__ = "tagnext_source_scores"
+
+    score_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    source_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_sources.source_id"), index=True)
+    horizon: Mapped[str] = mapped_column(Text, index=True)
+    sample_count: Mapped[int] = mapped_column(Integer)
+    direction_accuracy: Mapped[float | None] = mapped_column(Float)
+    mean_absolute_error: Mapped[float | None] = mapped_column(Float)
+    brier_score: Mapped[float | None] = mapped_column(Float)
+    cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    score_json: Mapped[str] = mapped_column(Text)
+
+
+class TagNextConsensusRow(Base):
+    __tablename__ = "tagnext_consensus_snapshots"
+
+    consensus_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    horizon: Mapped[str] = mapped_column(Text, index=True)
+    component_snapshot_ids_json: Mapped[str] = mapped_column(Text)
+    probability_json: Mapped[str] = mapped_column(Text)
+    method_version: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextConsensusGradeRow(Base):
+    __tablename__ = "tagnext_consensus_grades"
+    __table_args__ = (UniqueConstraint("consensus_id", "grader_version", name="uq_tagnext_consensus_grade"),)
+
+    grade_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    consensus_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_consensus_snapshots.consensus_id"), index=True)
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    outcome_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("verified_outcomes.outcome_id"))
+    actual_price: Mapped[float | None] = mapped_column(Float)
+    direction_correct: Mapped[bool | None] = mapped_column(Boolean)
+    absolute_error: Mapped[float | None] = mapped_column(Float)
+    disposition: Mapped[str] = mapped_column(Text, index=True)
+    grader_version: Mapped[str] = mapped_column(Text)
+    graded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextDiscoveryCandidateRow(Base):
+    __tablename__ = "tagnext_discovery_candidates"
+    __table_args__ = (UniqueConstraint("url", name="uq_tagnext_discovery_url"),)
+
+    candidate_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    url: Mapped[str] = mapped_column(Text)
+    discovered_via: Mapped[str] = mapped_column(Text)
+    discovery_query: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text, default="unreviewed", index=True)
+    reason: Mapped[str | None] = mapped_column(Text)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextSourceHistoryRow(Base):
+    __tablename__ = "tagnext_source_history"
+    __table_args__ = (UniqueConstraint("source_id", "checked_at", "response_hash", name="uq_tagnext_source_history_check"),)
+
+    history_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    source_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_sources.source_id"), index=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(Text)
+    response_hash: Mapped[str] = mapped_column(String(64))
+    parser_version: Mapped[str] = mapped_column(Text)
+    provenance_json: Mapped[str] = mapped_column(Text)
+
+
+class TagNextWhaleEntityRow(Base):
+    __tablename__ = "tagnext_whale_entities"
+    __table_args__ = (UniqueConstraint("chain", "address", name="uq_tagnext_whale_chain_address"),)
+
+    entity_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    address: Mapped[str] = mapped_column(Text, index=True)
+    chain: Mapped[str] = mapped_column(Text, default="bsc")
+    label: Mapped[str | None] = mapped_column(Text)
+    verification_state: Mapped[str] = mapped_column(Text, default="unverified", index=True)
+    entity_confidence: Mapped[float | None] = mapped_column(Float)
+    provenance_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class TagNextHolderHistoryRow(Base):
+    __tablename__ = "tagnext_holder_history"
+    __table_args__ = (UniqueConstraint("entity_id", "token_contract", "observed_at", name="uq_tagnext_holder_observation"),)
+
+    observation_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    entity_id: Mapped[str | None] = mapped_column(Text, ForeignKey("tagnext_whale_entities.entity_id"), index=True)
+    token_contract: Mapped[str] = mapped_column(Text)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    balance: Mapped[float | None] = mapped_column(Float)
+    share_of_supply: Mapped[float | None] = mapped_column(Float)
+    provenance_json: Mapped[str] = mapped_column(Text)
+
+
+class TagNextWhaleEventRow(Base):
+    __tablename__ = "tagnext_whale_events"
+    __table_args__ = (UniqueConstraint("tx_hash", "entity_id", name="uq_tagnext_whale_tx_entity"),)
+
+    event_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    entity_id: Mapped[str | None] = mapped_column(Text, ForeignKey("tagnext_whale_entities.entity_id"), index=True)
+    tx_hash: Mapped[str | None] = mapped_column(Text, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    direction: Mapped[str | None] = mapped_column(Text)
+    token_quantity: Mapped[float | None] = mapped_column(Float)
+    quote_value: Mapped[float | None] = mapped_column(Float)
+    destination_class: Mapped[str | None] = mapped_column(Text)
+    provenance_json: Mapped[str] = mapped_column(Text)
+
+
+class TagNextOnchainEventRow(Base):
+    __tablename__ = "tagnext_onchain_events"
+    __table_args__ = (
+        CheckConstraint("event_type IN ('transfer','large_swap','lp_mint','lp_burn')", name="ck_tagnext_onchain_event_type"),
+        UniqueConstraint("chain_id", "tx_hash", "log_index", name="uq_tagnext_onchain_log"),
+    )
+
+    event_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(Integer, default=56)
+    event_type: Mapped[str] = mapped_column(Text, index=True)
+    tx_hash: Mapped[str] = mapped_column(Text, index=True)
+    log_index: Mapped[int] = mapped_column(Integer)
+    block_number: Mapped[int] = mapped_column(BigInteger, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    address_from: Mapped[str | None] = mapped_column(Text, index=True)
+    address_to: Mapped[str | None] = mapped_column(Text, index=True)
+    token_quantity: Mapped[float | None] = mapped_column(Float)
+    quote_quantity: Mapped[float | None] = mapped_column(Float)
+    entity_confidence: Mapped[float | None] = mapped_column(Float)
+    label_state: Mapped[str] = mapped_column(Text, default="unverified")
+    provenance_json: Mapped[str] = mapped_column(Text)
+
+
+class TagNextEventOutcomeRow(Base):
+    __tablename__ = "tagnext_event_outcomes"
+    __table_args__ = (UniqueConstraint("event_id", "horizon", name="uq_tagnext_event_outcome_horizon"),)
+
+    outcome_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    event_id: Mapped[str] = mapped_column(Text, index=True)
+    horizon: Mapped[str] = mapped_column(Text)
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    outcome_price: Mapped[float | None] = mapped_column(Float)
+    move_pct: Mapped[float | None] = mapped_column(Float)
+    disposition: Mapped[str] = mapped_column(Text)
+    evidence_id: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextHeatmapRow(Base):
+    __tablename__ = "tagnext_heatmap_snapshots"
+    __table_args__ = (CheckConstraint("kind IN ('observed_orderbook','observed_provider_liquidation','estimated_liquidation_risk','illustrative_band')", name="ck_tagnext_heatmap_kind"),)
+
+    heatmap_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    kind: Mapped[str] = mapped_column(Text, index=True)
+    source_ids_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+    model_version: Mapped[str | None] = mapped_column(Text)
+    influences_forecast: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextFuturePathRow(Base):
+    __tablename__ = "tagnext_future_paths"
+    __table_args__ = (CheckConstraint("probability >= 0 AND probability <= 1", name="ck_tagnext_future_path_probability"),)
+
+    path_set_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    path_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    horizon: Mapped[str] = mapped_column(Text, index=True)
+    probability: Mapped[float] = mapped_column(Float)
+    scenario_json: Mapped[str] = mapped_column(Text)
+    model_version: Mapped[str] = mapped_column(Text)
+
+
+class TagNextChampionComparisonRow(Base):
+    __tablename__ = "tagnext_champion_comparisons"
+
+    comparison_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    champion_build_id: Mapped[str] = mapped_column(Text)
+    challenger_build_id: Mapped[str] = mapped_column(Text)
+    frozen_cutoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    horizon: Mapped[str] = mapped_column(Text, index=True)
+    paired_sample_count: Mapped[int] = mapped_column(Integer)
+    metrics_json: Mapped[str] = mapped_column(Text)
+    decision: Mapped[str] = mapped_column(Text, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextPairedOutcomeRow(Base):
+    __tablename__ = "tagnext_paired_outcomes"
+    __table_args__ = (UniqueConstraint("champion_forecast_id", "challenger_forecast_id", name="uq_tagnext_paired_forecasts"),)
+
+    pair_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    champion_forecast_id: Mapped[str] = mapped_column(String(64), index=True)
+    challenger_forecast_id: Mapped[str] = mapped_column(String(64), ForeignKey("canonical_forecasts.forecast_id"), index=True)
+    horizon: Mapped[str] = mapped_column(Text, index=True)
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    outcome_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("verified_outcomes.outcome_id"))
+    champion_metrics_json: Mapped[str] = mapped_column(Text, default="{}")
+    challenger_metrics_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextAblationRow(Base):
+    __tablename__ = "tagnext_ablation_results"
+
+    ablation_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    model_version: Mapped[str] = mapped_column(Text, index=True)
+    removed_feature_id: Mapped[str] = mapped_column(Text)
+    frozen_cutoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    sample_count: Mapped[int] = mapped_column(Integer)
+    metrics_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextExportRunRow(Base):
+    __tablename__ = "tagnext_export_runs"
+
+    export_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    state: Mapped[str] = mapped_column(Text, default="requested", index=True)
+    manifest_hash: Mapped[str | None] = mapped_column(Text)
+    record_counts_json: Mapped[str] = mapped_column(Text, default="{}")
+    artifact_location: Mapped[str | None] = mapped_column(Text)
+
+
 connect_args: dict[str, Any] = {}
 if DATABASE_URL.startswith("sqlite"):
     connect_args["check_same_thread"] = False
@@ -1475,17 +1883,23 @@ def _migrate_postgres_timestamp_columns() -> None:
 
 
 def _migrate_canonical_horizon_constraints() -> None:
-    """Extend existing production checks for scenario-only 6m and 3y rows."""
+    """Repair legacy producer/horizon checks without broadening valid values."""
 
     if engine.dialect.name != "postgresql":
         return
     definitions = {
-        "ck_canonical_forecast_horizon": (
-            "horizon IN ('1h','4h','12h','24h','3d','7d','30d','3m','6m','1y','3y','5y')"
+        ("canonical_forecasts", "ck_canonical_forecast_producer"): (
+            "producer IN ('tagalysis','chad','final_call','baseline','champion','challenger','tagnext')",
+            ("'tagnext'",),
         ),
-        "ck_canonical_forecast_horizon_minutes": (
+        ("canonical_forecasts", "ck_canonical_forecast_horizon"): (
+            "horizon IN ('1h','4h','6h','12h','24h','3d','7d','30d','3m','6m','1y','3y','5y','2026','2027','2028','2029','2030')",
+            ("'6h'", "'2030'"),
+        ),
+        ("canonical_forecasts", "ck_canonical_forecast_horizon_minutes"): (
             "(horizon = '1h' AND horizon_minutes = 60) OR "
             "(horizon = '4h' AND horizon_minutes = 240) OR "
+            "(horizon = '6h' AND horizon_minutes = 360) OR "
             "(horizon = '12h' AND horizon_minutes = 720) OR "
             "(horizon = '24h' AND horizon_minutes = 1440) OR "
             "(horizon = '3d' AND horizon_minutes = 4320) OR "
@@ -1495,42 +1909,47 @@ def _migrate_canonical_horizon_constraints() -> None:
             "(horizon = '6m' AND horizon_minutes = 262800) OR "
             "(horizon = '1y' AND horizon_minutes = 525600) OR "
             "(horizon = '3y' AND horizon_minutes = 1576800) OR "
-            "(horizon = '5y' AND horizon_minutes = 2628000)"
+            "(horizon = '5y' AND horizon_minutes = 2628000) OR "
+            "(horizon IN ('2026','2027','2028','2029','2030') AND horizon_minutes > 0)",
+            ("horizon = '6h'", "'2030'"),
+        ),
+        ("canonical_forecast_grades", "ck_canonical_grade_producer"): (
+            "producer IN ('tagalysis','chad','final_call','baseline','champion','challenger','tagnext','social_call')",
+            ("'tagnext'", "'social_call'"),
+        ),
+        ("canonical_forecast_grades", "ck_canonical_grade_horizon"): (
+            "horizon IN ('1h','4h','6h','12h','24h','3d','7d','30d','3m','6m','1y','3y','5y','2026','2027','2028','2029','2030')",
+            ("'6h'", "'2030'"),
         ),
     }
     with engine.begin() as connection:
-        existing = {
-            row.conname: row.definition
-            for row in connection.execute(
-                text(
-                    "SELECT conname, pg_get_constraintdef(oid) AS definition "
-                    "FROM pg_constraint WHERE conrelid = 'canonical_forecasts'::regclass "
-                    "AND conname IN ('ck_canonical_forecast_horizon', "
-                    "'ck_canonical_forecast_horizon_minutes')"
-                )
-            )
-        }
-        for name, definition in definitions.items():
-            current = str(existing.get(name) or "")
-            if "'6m'" in current and "'3y'" in current:
+        for (table, name), (definition, markers) in definitions.items():
+            current = str(connection.execute(text(
+                "SELECT COALESCE(pg_get_constraintdef(oid), '') FROM pg_constraint "
+                "WHERE conrelid = to_regclass(:table) AND conname = :name"
+            ), {"table": table, "name": name}).scalar_one_or_none() or "")
+            if all(marker in current for marker in markers):
                 continue
-            replacement = f"{name}_v2"
+            replacement = f"{name}_tagnext_correction"
+            connection.execute(text(
+                f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {replacement}"
+            ))
             connection.execute(
                 text(
-                    f"ALTER TABLE canonical_forecasts ADD CONSTRAINT {replacement} "
+                    f"ALTER TABLE {table} ADD CONSTRAINT {replacement} "
                     f"CHECK ({definition}) NOT VALID"
                 )
             )
             connection.execute(
-                text(f"ALTER TABLE canonical_forecasts VALIDATE CONSTRAINT {replacement}")
+                text(f"ALTER TABLE {table} VALIDATE CONSTRAINT {replacement}")
             )
             if current:
                 connection.execute(
-                    text(f"ALTER TABLE canonical_forecasts DROP CONSTRAINT {name}")
+                    text(f"ALTER TABLE {table} DROP CONSTRAINT {name}")
                 )
             connection.execute(
                 text(
-                    f"ALTER TABLE canonical_forecasts RENAME CONSTRAINT {replacement} TO {name}"
+                    f"ALTER TABLE {table} RENAME CONSTRAINT {replacement} TO {name}"
                 )
             )
 

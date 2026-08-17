@@ -1,0 +1,136 @@
+{
+  "schemaVersion": 1,
+  "systemId": "tagnext",
+  "retrievedAt": "2026-08-17T06:18:23.747449+00:00",
+  "evidenceKind": "public_web_indexed_page_capture",
+  "limitations": [
+    "Values are immutable observations of publicly indexed page content, not endorsements or investment advice.",
+    "Crawler/index timestamps can lag the source page. The sourceAsOf field is present only where the page exposed an update time.",
+    "Annual min/average/max tables are normalized as scenario contracts evaluated at the stated year-end deadline; this convention is recorded in provenance.",
+    "Search results and unverified candidates are never promoted into forecast snapshots."
+  ],
+  "identityAuthorityObservation": {
+    "canonicalAssetPage": "https://www.coingecko.com/en/coins/tagger",
+    "coinGeckoUrl": "https://www.coingecko.com/en/coins/tagger",
+    "coinMarketCapUrl": "https://coinmarketcap.com/currencies/tagger/",
+    "coinGeckoId": "tagger",
+    "coinMarketCapId": 34958,
+    "contract": "0x208bf3e7da9639f1eaefa2de78c23396b0682025",
+    "coinGeckoContract": "0x208bf3e7da9639f1eaefa2de78c23396b0682025",
+    "coinMarketCapContract": "0x208bf3e7da9639f1eaefa2de78c23396b0682025",
+    "name": "TAGGER",
+    "coinGeckoName": "TAGGER",
+    "coinMarketCapName": "Tagger",
+    "coinGeckoCirculatingSupply": 108864805114,
+    "coinMarketCapCirculatingSupply": 108404572594,
+    "coinGeckoPriceUsd": 0.001066,
+    "coinMarketCapPriceUsd": 0.001048,
+    "observationNote": "Both authority pages exposed the exact BNB-chain contract. Circulating-supply spread is about 0.423%, and observed-price spread is about 1.689%."
+  },
+  "verifiedSources": [
+    {
+      "sourceId": "coincodex-tagger",
+      "label": "CoinCodex TAGGER",
+      "canonicalUrl": "https://coincodex.com/crypto/tagger/price-prediction/",
+      "claimClass": "algorithmic_forecast",
+      "adapterId": "annual_target_v1",
+      "popularity": {"score": 6, "metric": "audited_discovery_host_hit_count", "accuracyMetric": false},
+      "sourceAsOf": "2026-07-29T10:34:00+00:00",
+      "capturedEvidenceSummary": "The indexed TAGGER page reported a $0.001167 reference price and explicit end-of-year model estimates for 2026 and 2030.",
+      "claims": [
+        {"horizon": "2026", "targetPrice": 0.0008758, "referencePrice": 0.001167},
+        {"horizon": "2030", "targetPrice": 0.003112, "referencePrice": 0.001167}
+      ]
+    },
+    {
+      "sourceId": "pricepredictions-ai-tagger",
+      "label": "PricePredictions.ai TAGGER",
+      "canonicalUrl": "https://www.pricepredictions.ai/tagger-price-prediction",
+      "claimClass": "machine_learning_forecast",
+      "adapterId": "annual_min_avg_max_v1",
+      "popularity": {"score": 0, "metric": "audited_discovery_host_hit_count", "accuracyMetric": false},
+      "sourceAsOf": "2026-07-18T00:00:00+00:00",
+      "capturedEvidenceSummary": "The indexed TAGGER page reported a $0.0009708 reference price and min/average/max scenarios for 2026 through 2030.",
+      "claims": [
+        {"horizon": "2026", "targetLow": 0.0002609, "targetPrice": 0.0009707, "targetHigh": 0.001673, "referencePrice": 0.0009708},
+        {"horizon": "2027", "targetLow": 0.0007408, "targetPrice": 0.001024, "targetHigh": 0.00153, "referencePrice": 0.0009708},
+        {"horizon": "2028", "targetLow": 0.003212, "targetPrice": 0.004715, "targetHigh": 0.007506, "referencePrice": 0.0009708},
+        {"horizon": "2029", "targetLow": 0.003607, "targetPrice": 0.005578, "targetHigh": 0.00932, "referencePrice": 0.0009708},
+        {"horizon": "2030", "targetLow": 0.002081, "targetPrice": 0.003375, "targetHigh": 0.005869, "referencePrice": 0.0009708}
+      ]
+    },
+    {
+      "sourceId": "beincrypto-tagger",
+      "label": "BeInCrypto TAGGER",
+      "canonicalUrl": "https://beincrypto.com/price/tagger/price-prediction/",
+      "claimClass": "technical_analysis_article",
+      "adapterId": "annual_min_avg_max_v1",
+      "popularity": {"score": 1, "metric": "audited_discovery_host_hit_count", "accuracyMetric": false},
+      "sourceAsOf": "2026-07-24T00:00:00+00:00",
+      "capturedEvidenceSummary": "The indexed TAGGER technical-analysis page reported a $0.00105 reference price and min/average/max scenarios for 2026 through 2029.",
+      "claims": [
+        {"horizon": "2026", "targetLow": 0.00026, "targetPrice": 0.00075, "targetHigh": 0.00158, "referencePrice": 0.00105},
+        {"horizon": "2027", "targetLow": 0.00029, "targetPrice": 0.00082, "targetHigh": 0.00174, "referencePrice": 0.00105},
+        {"horizon": "2028", "targetLow": 0.00032, "targetPrice": 0.00091, "targetHigh": 0.00191, "referencePrice": 0.00105},
+        {"horizon": "2029", "targetLow": 0.00035, "targetPrice": 0.001, "targetHigh": 0.0021, "referencePrice": 0.00105}
+      ]
+    },
+    {
+      "sourceId": "tradersunion-tagger",
+      "label": "Traders Union TAGGER",
+      "canonicalUrl": "https://tradersunion.com/currencies/forecast/tag-usd/",
+      "claimClass": "algorithmic_forecast",
+      "adapterId": "annual_mid_end_v1",
+      "popularity": {"score": 8, "metric": "audited_discovery_host_hit_count", "accuracyMetric": false},
+      "capturedEvidenceSummary": "The indexed TAGGER page exposed a December 2026 range/average and year-end estimates for 2027 through 2030.",
+      "claims": [
+        {"horizon": "2026", "targetLow": 0.0028197, "targetPrice": 0.0028772, "targetHigh": 0.0029347, "referencePrice": 0.0009273},
+        {"horizon": "2027", "targetPrice": 0.0040713, "referencePrice": 0.0009273},
+        {"horizon": "2028", "targetPrice": 0.0045409, "referencePrice": 0.0009273},
+        {"horizon": "2029", "targetPrice": 0.0030395, "referencePrice": 0.0009273},
+        {"horizon": "2030", "targetPrice": 0.0069608, "referencePrice": 0.0009273}
+      ]
+    },
+    {
+      "sourceId": "coinarbitragebot-tagger",
+      "label": "Coin Arbitrage Bot TAGGER",
+      "canonicalUrl": "https://coinarbitragebot.com/price-prediction/tagger.html",
+      "claimClass": "algorithmic_forecast",
+      "adapterId": "annual_min_avg_max_v1",
+      "popularity": {"score": 0, "metric": "audited_discovery_host_hit_count", "accuracyMetric": false},
+      "sourceAsOf": "2026-02-09T07:44:00+00:00",
+      "capturedEvidenceSummary": "The indexed TAGGER page reported a $0.0002897 reference price, end-year estimates for 2026-2028, and December scenarios for 2029-2030.",
+      "claims": [
+        {"horizon": "2026", "targetPrice": 0.00107, "referencePrice": 0.0002897},
+        {"horizon": "2027", "targetPrice": 0.0008228, "referencePrice": 0.0002897},
+        {"horizon": "2028", "targetPrice": 0.001181, "referencePrice": 0.0002897},
+        {"horizon": "2029", "targetLow": 0.001464, "targetPrice": 0.001584, "targetHigh": 0.001709, "referencePrice": 0.0002897},
+        {"horizon": "2030", "targetLow": 0.003004, "targetPrice": 0.003251, "targetHigh": 0.003508, "referencePrice": 0.0002897}
+      ]
+    },
+    {
+      "sourceId": "midforex-tagger",
+      "label": "Midforex TAGGER",
+      "canonicalUrl": "https://midforex.com/crypto/tagger-forecast",
+      "claimClass": "machine_learning_forecast",
+      "adapterId": "annual_min_avg_max_v1",
+      "popularity": {"score": 1, "metric": "audited_discovery_host_hit_count", "accuracyMetric": false},
+      "sourceAsOf": "2026-07-23T11:00:00+00:00",
+      "capturedEvidenceSummary": "The indexed TAGGER AI-forecast page reported a $0.001028 reference price and annual low/average/high scenarios for 2027 through 2030.",
+      "claims": [
+        {"horizon": "2027", "targetLow": 0.001562, "targetPrice": 0.001953, "targetHigh": 0.002343, "referencePrice": 0.001028},
+        {"horizon": "2028", "targetLow": 0.002441, "targetPrice": 0.003255, "targetHigh": 0.004069, "referencePrice": 0.001028},
+        {"horizon": "2029", "targetLow": 0.00403, "targetPrice": 0.005757, "targetHigh": 0.007484, "referencePrice": 0.001028},
+        {"horizon": "2030", "targetLow": 0.005368, "targetPrice": 0.008259, "targetHigh": 0.0111, "referencePrice": 0.001028}
+      ]
+    }
+  ],
+  "nonConsensusSources": [
+    {
+      "sourceId": "mexc-tagger-calculator",
+      "url": "https://www.mexc.com/en-GB/price-prediction/TAG",
+      "classification": "scenario_calculator",
+      "reason": "A user-input growth calculator is not an independent forecast and is excluded from consensus and reliability grading."
+    }
+  ]
+}

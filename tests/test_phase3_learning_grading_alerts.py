@@ -230,7 +230,7 @@ def _forecast(
             "final_call": "deterministic-final-call",
             "champion": "champion-specialist",
             "challenger": "challenger-specialist",
-            "tagnext": "tagnext-challenger",
+            "tagnext": "tagnext-baseline",
         }[producer]
     if point is not None:
         record["pointForecastUsd"] = point
@@ -973,7 +973,7 @@ def test_phase3_migration_is_additive_immutable_and_covers_all_domains() -> None
     assert "weighted_interval_score" in CanonicalForecastGradeRow.__table__.columns
     assert weighted_interval_score(
         {"p50Usd": 1.0, "quantilesUsd": {"p10": 0.8, "p25": 0.9, "p75": 1.1, "p90": 1.2}}, 1.0
-    ) > 0
+    ) == pytest.approx(3.6)
 
 
 def test_phase3_runs_in_server_jobs_and_contains_no_paid_provider_path() -> None:

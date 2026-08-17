@@ -473,13 +473,19 @@ def _interval_score(low: float, high: float, actual: float, alpha: float) -> flo
 
 
 def weighted_interval_score(record: Mapping[str, Any], actual: float) -> float:
+    """Proper WIS for the median plus 50% and 80% central intervals.
+
+    For K intervals, WIS divides the weighted sum by K + 0.5. The stored
+    percentage is normalized by the positive realized price.
+    """
     quantiles = record["quantilesUsd"]
     p50 = float(record["p50Usd"])
-    score = (
+    weighted_sum = (
         0.5 * abs(actual - p50)
         + 0.1 * _interval_score(float(quantiles["p10"]), float(quantiles["p90"]), actual, 0.2)
         + 0.25 * _interval_score(float(quantiles["p25"]), float(quantiles["p75"]), actual, 0.5)
-    ) / 0.85
+    )
+    score = weighted_sum / 2.5
     return score / actual * 100.0
 
 

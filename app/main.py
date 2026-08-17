@@ -21,6 +21,7 @@ from app.chad_reactivation import (
 )
 from app.terminal_config import (
     COLLECT_SECONDS,
+    DATABASE_DIAGNOSTIC,
     DATABASE_URL as TERMINAL_DATABASE_URL,
     FORECAST_PRODUCER,
     SYSTEM_ID,
@@ -94,6 +95,31 @@ from app.tagnext_intelligence import (
     precursor_state,
     provider_registry,
     validate_tag_identity,
+)
+from app.tagnext_pipeline import (
+    external_discovery_worker_run,
+    feature_status_payload,
+    grade_due_external_forecasts,
+    grade_due_consensus,
+    predictions_payload,
+    rebuild_source_scores,
+    seed_tagnext_registries,
+)
+from app.tagnext_discovery import (
+    public_discovery_worker_run,
+    source_seed_inventory,
+)
+from app.tagnext_onchain import (
+    collect_bnb_chain_once,
+    grade_due_onchain_event_outcomes,
+    heatmap_payload as tagnext_heatmap_payload,
+    onchain_payload as tagnext_onchain_payload,
+)
+from app.tagnext_comparison import (
+    build_paired_same_deadline_outcomes,
+    create_full_brain_export,
+    rolling_comparison_report,
+    run_shadow_ablation_report,
 )
 from app.supply_truth import (
     SupplyTruthError,
@@ -192,7 +218,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.11.0-phase3"
+SERVICE_VERSION = "tagnext-1.0.0-correction1"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -277,6 +303,7 @@ phase1_state: dict[str, Any] = {
 phase1_coalescer = AsyncCoalescingCache()
 prediction_ledger = PredictionLedger(
     LEDGER_DB_PATH,
+    database_url=TERMINAL_DATABASE_URL,
     deadband_pct=LEDGER_DEADBAND_PCT,
     max_records=LEDGER_MAX_RECORDS,
     backup_path=LEDGER_BACKUP_PATH,
@@ -2545,6 +2572,24 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
     if job_type == "issue_due_tagnext_forecasts":
         # TAGneXt is deterministic and has no Chad/OpenAI path.
         return await asyncio.to_thread(issue_due_tagnext_forecasts)
+    if job_type == "discover_tagnext_external_forecasts":
+        discovery = await asyncio.to_thread(public_discovery_worker_run)
+        revisit = await asyncio.to_thread(external_discovery_worker_run)
+        return {"publicDiscovery": discovery, "verifiedSourceRevisit": revisit}
+    if job_type == "grade_tagnext_external_forecasts":
+        result = await asyncio.to_thread(grade_due_external_forecasts)
+        result["consensusGrades"] = await asyncio.to_thread(grade_due_consensus)
+        result["sourceScores"] = await asyncio.to_thread(rebuild_source_scores)
+        return result
+    if job_type == "collect_tagnext_bnb_chain":
+        return await asyncio.to_thread(collect_bnb_chain_once)
+    if job_type == "grade_tagnext_onchain_events":
+        return await asyncio.to_thread(grade_due_onchain_event_outcomes)
+    if job_type == "compare_tagnext_to_champion":
+        paired = await asyncio.to_thread(build_paired_same_deadline_outcomes)
+        comparisons = await asyncio.to_thread(rolling_comparison_report)
+        ablations = await asyncio.to_thread(run_shadow_ablation_report)
+        return {"paired": paired, "comparisons": comparisons, "ablations": ablations}
     if job_type == "validate_helper_candidate":
         candidate_id = str((job.get("payload") or {}).get("candidateId") or "")
         if not candidate_id:
@@ -2633,6 +2678,51 @@ async def phase1_job_loop() -> None:
                     enqueue_phase3_jobs,
                     interval_seconds=max(300, COLLECT_SECONDS),
                 )
+                if SYSTEM_ID == "tagnext":
+                    discovery_bucket = int(time.time()) // 21_600 * 21_600
+                    await asyncio.to_thread(
+                        enqueue_job,
+                        job_type="discover_tagnext_external_forecasts",
+                        idempotency_key=f"tagnext-external-discovery:{discovery_bucket}",
+                        origin="server-scheduler",
+                        payload={"bucket": discovery_bucket, "frequency": "low"},
+                        max_attempts=2,
+                    )
+                    chain_bucket = int(time.time()) // 300 * 300
+                    await asyncio.to_thread(
+                        enqueue_job,
+                        job_type="collect_tagnext_bnb_chain",
+                        idempotency_key=f"tagnext-bnb-chain:{chain_bucket}",
+                        origin="server-scheduler",
+                        payload={"bucket": chain_bucket, "access": "free_direct_readonly"},
+                        max_attempts=2,
+                    )
+                    await asyncio.to_thread(
+                        enqueue_job,
+                        job_type="grade_tagnext_onchain_events",
+                        idempotency_key=f"tagnext-onchain-grades:{chain_bucket}",
+                        origin="server-scheduler",
+                        payload={"bucket": chain_bucket, "deadlinePolicy": "exact"},
+                        max_attempts=2,
+                    )
+                    comparison_bucket = int(time.time()) // 86_400 * 86_400
+                    await asyncio.to_thread(
+                        enqueue_job,
+                        job_type="compare_tagnext_to_champion",
+                        idempotency_key=f"tagnext-champion-comparison:{comparison_bucket}",
+                        origin="server-scheduler",
+                        payload={"bucket": comparison_bucket, "pairing": "same_deadline"},
+                        max_attempts=2,
+                    )
+                    grading_bucket = int(time.time()) // 300 * 300
+                    await asyncio.to_thread(
+                        enqueue_job,
+                        job_type="grade_tagnext_external_forecasts",
+                        idempotency_key=f"tagnext-external-grading:{grading_bucket}",
+                        origin="server-scheduler",
+                        payload={"bucket": grading_bucket, "deadlinePolicy": "exact"},
+                        max_attempts=2,
+                    )
                 history_bucket = int(time.time()) // 3_600 * 3_600
                 await asyncio.to_thread(
                     enqueue_job,
@@ -2734,7 +2824,7 @@ async def lifespan(_: FastAPI):
 
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(15.0, connect=10.0),
-        headers={"User-Agent": f"TAG-Terminal-Relay/{SERVICE_VERSION}"},
+        headers={"User-Agent": f"TAGneXt-Relay/{SERVICE_VERSION}"},
         follow_redirects=True,
     )
     if LEDGER_ENABLED and DB_BOOTSTRAP_ON_START:
@@ -2747,7 +2837,7 @@ async def lifespan(_: FastAPI):
 
     openai_client = httpx.AsyncClient(
         timeout=httpx.Timeout(float(OPENAI_TIMEOUT_SECONDS), connect=15.0),
-        headers={"User-Agent": f"TAG-Terminal-Chad/{SERVICE_VERSION}"},
+        headers={"User-Agent": f"TAGneXt-Chad/{SERVICE_VERSION}"},
         follow_redirects=True,
     )
     market_task = (
@@ -2910,6 +3000,7 @@ async def health() -> dict[str, Any]:
         "buildId": BUILD_ID,
         "systemId": SYSTEM_ID,
         "forecastProducer": FORECAST_PRODUCER,
+        "database": DATABASE_DIAGNOSTIC,
         "symbol": SYMBOL,
         "operatingStatus": operating_status(SERVICE_VERSION),
         "healthCheckSideEffects": "none",
@@ -2978,12 +3069,18 @@ async def tagnext_identity(x_relay_key: str | None = Header(default=None)) -> di
         pool_address=PRIMARY_POOL,
         symbol=PAIR_SYMBOL,
     )
-    return {"ok": True, "systemId": SYSTEM_ID, "identity": identity}
+    return {
+        "ok": True,
+        "systemId": SYSTEM_ID,
+        "identity": identity,
+        "database": DATABASE_DIAGNOSTIC,
+    }
 
 
 @app.get("/v1/tagnext/providers")
 async def tagnext_providers(x_relay_key: str | None = Header(default=None)) -> dict[str, Any]:
     require_relay_key(x_relay_key)
+    seed_tagnext_registries()
     providers = provider_registry()
     return {
         "ok": True,
@@ -3003,9 +3100,78 @@ async def tagnext_precursors(
     require_relay_key(x_relay_key)
     return {
         "ok": True,
+        "mode": "client_supplied_simulation_only",
+        "canonicalForecastInfluence": False,
         "precursor": precursor_state(payload),
         "liquidationRisk": estimated_liquidation_risk(payload),
     }
+
+
+@app.get("/v1/tagnext/features/current")
+async def tagnext_features_current(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, **await asyncio.to_thread(feature_status_payload)}
+
+
+@app.get("/v1/tagnext/predictions")
+async def tagnext_predictions(
+    horizon: str = "24h",
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    supported = {"1h","4h","6h","12h","24h","7d","30d","3m","6m","1y","2026","2027","2028","2029","2030"}
+    selected = horizon.strip().lower()
+    if selected not in supported:
+        raise HTTPException(status_code=422, detail="unsupported TAGneXt prediction horizon")
+    return {"ok": True, **await asyncio.to_thread(predictions_payload, horizon=selected)}
+
+
+@app.get("/v1/tagnext/discovery/inventory")
+async def tagnext_discovery_inventory(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, **source_seed_inventory()}
+
+
+@app.get("/v1/tagnext/onchain")
+async def tagnext_onchain(
+    limit: int = Query(100, ge=1, le=500),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, **await asyncio.to_thread(tagnext_onchain_payload, limit=limit)}
+
+
+@app.get("/v1/tagnext/heatmaps")
+async def tagnext_heatmaps(
+    limit: int = Query(50, ge=1, le=200),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, **await asyncio.to_thread(tagnext_heatmap_payload, limit=limit)}
+
+
+@app.get("/v1/tagnext/comparisons")
+async def tagnext_comparisons(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, **await asyncio.to_thread(rolling_comparison_report)}
+
+
+@app.post("/v1/tagnext/exports/full-brain")
+async def tagnext_full_brain_export(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("TAGneXt export-run metadata")
+    export_directory = os.getenv("TAGNEXT_EXPORT_DIR", "exports")
+    filename = f"TAGneXt_FULL_BRAIN_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.zip"
+    result = await asyncio.to_thread(create_full_brain_export, os.path.join(export_directory, filename))
+    return {"ok": True, **result}
 
 
 @app.post("/v1/tagnext/future-paths/normalize")
@@ -3234,7 +3400,7 @@ async def tag_current_evidence(
     return {
         "ok": packet is not None,
         "authoritative": True,
-        "authority": "TAGalysis server / Neon PostgreSQL",
+        "authority": "TAGneXt challenger server / isolated PostgreSQL",
         "serverTime": utc_iso(),
         "packet": packet,
         "freshness": {

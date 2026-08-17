@@ -15,10 +15,10 @@ services:
         value: "true"
       - key: TAGNEXT_DATABASE_URL
         sync: false
-      - key: CHAMPION_DATABASE_READ_ONLY_URL
-        sync: false
       - key: REPAIR_MODE
         value: "false"
+      - key: TAGNEXT_RUNTIME_MODE
+        value: "preview"
       - key: LIVE_COLLECTORS_ENABLED
         value: "true"
       - key: SERVER_JOBS_ENABLED

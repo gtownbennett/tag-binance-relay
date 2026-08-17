@@ -281,6 +281,7 @@ class PredictionLedger:
         self,
         db_path: str,
         *,
+        database_url: str | None = None,
         deadband_pct: float = 1.0,
         max_records: int = 5000,
         backup_path: str | None = None,
@@ -289,7 +290,8 @@ class PredictionLedger:
         self.db_path = db_path
         configured_database_url = (
             os.getenv("LEDGER_DATABASE_URL", "").strip()
-            or os.getenv("TERMINAL_DATABASE_URL", "").strip()
+            or str(database_url or "").strip()
+            or os.getenv("TAGNEXT_DATABASE_URL", "").strip()
         )
         self._database_url: str | None = None
         self._engine: Engine | None = None
@@ -328,13 +330,13 @@ class PredictionLedger:
     @property
     def persistent_hint(self) -> str:
         if self._database_url:
-            return "The ledger is stored durably in PostgreSQL through TERMINAL_DATABASE_URL."
+            return "The ledger is stored durably in the isolated TAGneXt PostgreSQL database."
         normalized = os.path.abspath(self.db_path)
         if normalized.startswith("/tmp/") or normalized == "/tmp":
             return (
                 "The ledger is using temporary container storage. It can be lost after a Render "
                 "restart or redeploy. Use LEDGER_DB_PATH on a persistent disk or configure "
-                "TERMINAL_DATABASE_URL for durable memory."
+                "TAGNEXT_DATABASE_URL or LEDGER_DATABASE_URL for durable memory."
             )
         return "The ledger is stored at the configured LEDGER_DB_PATH."
 
@@ -1387,7 +1389,7 @@ class PredictionLedger:
         if self._database_url:
             return {
                 "backend": "postgresql",
-                "dbPath": "PostgreSQL via TERMINAL_DATABASE_URL",
+                "dbPath": "PostgreSQL via isolated TAGneXt database",
                 "dbExists": True,
                 "dbBytes": 0,
                 "backupPath": self.backup_path,

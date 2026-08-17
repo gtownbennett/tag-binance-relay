@@ -35,6 +35,7 @@ PRODUCERS = (
     "challenger",
     "tagnext",
 )
+TAGNEXT_BASELINE = "tagnext-baseline-v1"
 
 
 class ForecastValidationError(ValueError):
@@ -68,6 +69,11 @@ HORIZON_SPECS: dict[str, HorizonSpec] = {
         "4h", 240, "1h-4h", "realizedVolatility4hPct", 2.2, 6.0, 0.40,
         (("priceChange4h", 0.20), ("oiChange4h", 0.28), ("fundingTrend4h", -0.18), ("orderBookDepth4h", 0.18), ("spotConfirmation4h", 0.16)),
         "Four-hour leverage persistence, funding, depth, and spot confirmation.",
+    ),
+    "6h": HorizonSpec(
+        "6h", 360, "1h-6h", "realizedVolatility6hPct", 2.9, 8.0, 0.50,
+        (("priceChange6h", 0.20), ("oiChange6h", 0.24), ("fundingTrend6h", -0.14), ("spotVolume6h", 0.23), ("cexDexAgreement6h", 0.19)),
+        "Six-hour leverage persistence requires spot participation and cross-venue confirmation.",
     ),
     "12h": HorizonSpec(
         "12h", 720, "4h-12h", "realizedVolatility12hPct", 3.8, 10.0, 0.65,
@@ -109,6 +115,31 @@ HORIZON_SPECS: dict[str, HorizonSpec] = {
         (("adoptionTrend1y", 0.30), ("liquidityTrend1y", 0.24), ("listingAccess1y", 0.18), ("supplyTrend1y", -0.12), ("cryptoRegime1y", 0.16)),
         "One-year scenario outlook uses adoption, exchange access, liquidity durability, supply, and cycle regime.",
     ),
+    "2026": HorizonSpec(
+        "2026", 1_440, "calendar-2026", "scenarioDispersion2026Pct", 60.0, 160.0, 9.0,
+        (("adoptionTrend2026", 0.30), ("liquidityTrend2026", 0.24), ("listingAccess2026", 0.18), ("supplyTrend2026", -0.12), ("cryptoRegime2026", 0.16)),
+        "Calendar-2026 scenario outlook; broad regions only, with no false point precision.",
+    ),
+    "2027": HorizonSpec(
+        "2027", 1_440, "calendar-2027", "scenarioDispersion2027Pct", 70.0, 220.0, 10.0,
+        (("adoptionTrend2027", 0.30), ("liquidityTrend2027", 0.24), ("listingAccess2027", 0.18), ("supplyTrend2027", -0.12), ("cryptoRegime2027", 0.16)),
+        "Calendar-2027 scenario outlook; broad regions only, with survival risk explicit.",
+    ),
+    "2028": HorizonSpec(
+        "2028", 1_440, "calendar-2028", "scenarioDispersion2028Pct", 78.0, 280.0, 11.0,
+        (("adoptionTrend2028", 0.30), ("liquidityTrend2028", 0.24), ("listingAccess2028", 0.18), ("supplyTrend2028", -0.12), ("cryptoRegime2028", 0.16)),
+        "Calendar-2028 scenario outlook; broad regions only, with survival risk explicit.",
+    ),
+    "2029": HorizonSpec(
+        "2029", 1_440, "calendar-2029", "scenarioDispersion2029Pct", 82.0, 340.0, 11.5,
+        (("adoptionTrend2029", 0.30), ("liquidityTrend2029", 0.24), ("listingAccess2029", 0.18), ("supplyTrend2029", -0.12), ("cryptoRegime2029", 0.16)),
+        "Calendar-2029 scenario outlook; broad regions only, with survival risk explicit.",
+    ),
+    "2030": HorizonSpec(
+        "2030", 1_440, "calendar-2030", "scenarioDispersion2030Pct", 85.0, 400.0, 12.0,
+        (("adoptionTrend2030", 0.30), ("liquidityTrend2030", 0.24), ("listingAccess2030", 0.18), ("supplyTrend2030", -0.12), ("cryptoRegime2030", 0.16)),
+        "Calendar-2030 scenario outlook; broad regions only, with survival risk explicit.",
+    ),
     "3y": HorizonSpec(
         "3y", 1_576_800, "1y-3y", "scenarioDispersion3yPct", 72.0, 280.0, 10.0,
         (("adoptionTrend3y", 0.31), ("liquidityTrend3y", 0.25), ("listingAccess3y", 0.17), ("supplyTrend3y", -0.12), ("cryptoRegime3y", 0.15)),
@@ -125,6 +156,7 @@ HORIZON_SPECS: dict[str, HorizonSpec] = {
 MINIMUM_INDEPENDENT_SAMPLES: dict[str, int | None] = {
     "1h": 30,
     "4h": 30,
+    "6h": 30,
     "12h": 25,
     "24h": 25,
     "3d": 20,
@@ -133,12 +165,37 @@ MINIMUM_INDEPENDENT_SAMPLES: dict[str, int | None] = {
     "3m": 12,
     "6m": None,
     "1y": None,
+    "2026": None,
+    "2027": None,
+    "2028": None,
+    "2029": None,
+    "2030": None,
     "3y": None,
     "5y": None,
 }
 
 
-SCENARIO_ONLY_HORIZONS = frozenset({"6m", "1y", "3y", "5y"})
+ANNUAL_HORIZONS = frozenset({"2026", "2027", "2028", "2029", "2030"})
+SCENARIO_ONLY_HORIZONS = frozenset({"6m", "1y", "3y", "5y", *ANNUAL_HORIZONS})
+
+
+def _deadline_for_horizon(horizon: str, issued: datetime, spec: HorizonSpec) -> datetime:
+    if horizon in ANNUAL_HORIZONS:
+        deadline = datetime(int(horizon) + 1, 1, 1, tzinfo=timezone.utc)
+        if deadline <= issued:
+            raise ForecastValidationError(f"calendar horizon {horizon} has already matured")
+        return deadline
+    return issued + timedelta(minutes=spec.minutes)
+
+
+def _horizon_minutes(horizon: str, issued: datetime, spec: HorizonSpec) -> int:
+    if horizon in ANNUAL_HORIZONS:
+        return max(1, int((_deadline_for_horizon(horizon, issued, spec) - issued).total_seconds() // 60))
+    return spec.minutes
+
+
+def _issuance_cadence_minutes(horizon: str, spec: HorizonSpec) -> int:
+    return 1_440 if horizon in ANNUAL_HORIZONS else spec.minutes
 
 
 def _stable_json(value: Any) -> str:
@@ -590,13 +647,20 @@ def _issue_due_deterministic_forecasts(
         base_features["evidenceReferences"].append(price_source_id)
     created: list[str] = []
     skipped: list[str] = []
+    shadow_snapshot_id: str | None = None
+    if producer == "tagnext":
+        from .tagnext_pipeline import capture_shadow_features
+        shadow_snapshot_id = str(capture_shadow_features(str(packet["snapshotId"]))["snapshotId"])
     for horizon, spec in HORIZON_SPECS.items():
         latest = latest_canonical_forecast(producer=producer, horizon=horizon)
         if latest is not None:
             latest_issued = _parse_time(latest["issuedAt"], "issuedAt")
-            if issued < latest_issued + timedelta(minutes=spec.minutes):
+            if issued < latest_issued + timedelta(minutes=_issuance_cadence_minutes(horizon, spec)):
                 skipped.append(horizon)
                 continue
+        if horizon in ANNUAL_HORIZONS and int(horizon) < issued.year:
+            skipped.append(horizon)
+            continue
         record = build_tagalysis_forecast(
             horizon=horizon,
             evidence_snapshot_id=str(packet["snapshotId"]),
@@ -646,6 +710,13 @@ def _issue_due_deterministic_forecasts(
                 )
             from .prospective_learning import record_forecast_evidence
             record_forecast_evidence(result["forecastId"])
+            if producer == "tagnext":
+                from .tagnext_pipeline import link_forecast_features
+                link_forecast_features(
+                    result["forecastId"],
+                    evidence_ids=record["evidenceReferences"],
+                    feature_snapshot_ids=[shadow_snapshot_id] if shadow_snapshot_id else [],
+                )
             if baseline_result["stored"]:
                 record_forecast_evidence(baseline_result["forecastId"])
         else:
@@ -676,7 +747,7 @@ def issue_due_tagnext_forecasts(*, now: datetime | str | None = None) -> dict[st
 
     return _issue_due_deterministic_forecasts(
         producer="tagnext",
-        model_version="tagnext-baseline-v1",
+        model_version=TAGNEXT_BASELINE,
         now=now,
     )
 
@@ -808,6 +879,11 @@ def _long_term_scenarios(
     scenario_moves = {
         "6m": (-35.0, 90.0, 220.0),
         "1y": (-45.0, 140.0, 400.0),
+        "2026": (-45.0, 120.0, 320.0),
+        "2027": (-52.0, 180.0, 500.0),
+        "2028": (-58.0, 240.0, 700.0),
+        "2029": (-64.0, 320.0, 1_000.0),
+        "2030": (-70.0, 400.0, 1_300.0),
         "3y": (-60.0, 300.0, 900.0),
         "5y": (-70.0, 450.0, 1_500.0),
     }
@@ -1011,7 +1087,8 @@ def build_tagalysis_forecast(
     edge_statement = "No strong edge — continue watching." if direction == "SIDEWAYS" or max(up, down) < 0.58 else f"{direction.title()} edge with horizon-specific confirmation required."
     green_price = max(price * (1.0 + spec.neutral_threshold_pct / 100.0), q75 if direction != "LOWER" else p50)
     red_price = min(price * (1.0 - spec.neutral_threshold_pct / 100.0), q25 if direction != "HIGHER" else p50)
-    deadline = issued + timedelta(minutes=spec.minutes)
+    deadline = _deadline_for_horizon(canonical_horizon, issued, spec)
+    horizon_minutes = _horizon_minutes(canonical_horizon, issued, spec)
     record: dict[str, Any] = {
         "schemaVersion": 2,
         "producer": producer,
@@ -1025,7 +1102,7 @@ def build_tagalysis_forecast(
         "dataAsOf": _iso(as_of),
         "deadline": _iso(deadline),
         "horizon": canonical_horizon,
-        "horizonMinutes": spec.minutes,
+        "horizonMinutes": horizon_minutes,
         "currentPriceUsd": price,
         "verifiedSupplyTokens": supply,
         "fullyDilutedSupplyTokens": supply_snapshot.get("fullyDilutedSupplyTokens"),
@@ -1056,7 +1133,7 @@ def build_tagalysis_forecast(
                 "simple-baseline" if producer == "baseline" else
                 "champion-specialist" if producer == "champion" else
                 "challenger-specialist" if producer == "challenger" else
-                "tagnext-challenger" if producer == "tagnext" else
+                "tagnext-baseline" if producer == "tagnext" else
                 "tagalysis-deterministic"
             ),
             "featureWindow": spec.feature_window,
@@ -1086,14 +1163,17 @@ def canonicalize_forecast(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ForecastValidationError("producer must remain one of the six canonical producer roles")
     horizon = str(record.get("horizon") or "").lower()
     spec = HORIZON_SPECS.get(horizon)
-    if spec is None or int(record.get("horizonMinutes") or 0) != spec.minutes:
-        raise ForecastValidationError("horizon and horizonMinutes do not match the canonical horizon table")
+    if spec is None:
+        raise ForecastValidationError("unsupported canonical horizon")
     issued = _parse_time(record.get("issuedAt"), "issuedAt")
+    expected_minutes = _horizon_minutes(horizon, issued, spec)
+    if int(record.get("horizonMinutes") or 0) != expected_minutes:
+        raise ForecastValidationError("horizon and horizonMinutes do not match the canonical horizon table")
     data_as_of = _parse_time(record.get("dataAsOf"), "dataAsOf")
     deadline = _parse_time(record.get("deadline"), "deadline")
     if data_as_of > issued:
         raise ForecastValidationError("dataAsOf cannot be after issuedAt")
-    if abs((deadline - (issued + timedelta(minutes=spec.minutes))).total_seconds()) > 0.001:
+    if abs((deadline - _deadline_for_horizon(horizon, issued, spec)).total_seconds()) > 0.001:
         raise ForecastValidationError("deadline must be calculated from the actual issuedAt and horizon")
     current = _finite_positive(record.get("currentPriceUsd"), "currentPriceUsd")
     supply = _finite_positive(record.get("verifiedSupplyTokens"), "verifiedSupplyTokens")
@@ -1122,8 +1202,8 @@ def canonicalize_forecast(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ForecastValidationError("Final Call requires deterministic-final-call provenance")
     if producer == "tagalysis" and producer_method != "tagalysis-deterministic":
         raise ForecastValidationError("TAGalysis records require deterministic TAGalysis provenance")
-    if producer == "tagnext" and producer_method != "tagnext-challenger":
-        raise ForecastValidationError("TAGneXt records require tagnext-challenger provenance")
+    if producer == "tagnext" and producer_method != "tagnext-baseline":
+        raise ForecastValidationError("TAGneXt baseline records require tagnext-baseline provenance")
     probabilities = record.get("directionProbability")
     if not isinstance(probabilities, dict):
         raise ForecastValidationError("directionProbability is required")

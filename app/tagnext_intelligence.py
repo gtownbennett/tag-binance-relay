@@ -117,14 +117,18 @@ def classify_external_forecast(text: str) -> str:
 
 
 def forecast_snapshot_fingerprint(snapshot: Mapping[str, Any]) -> str:
+    """Hash normalized prediction meaning, never page chrome or scrape time."""
     stable = {
-        "source": snapshot.get("source"),
-        "asset": snapshot.get("asset"),
-        "asOf": snapshot.get("asOf"),
+        "sourceId": snapshot.get("sourceId") or snapshot.get("source"),
+        "assetAuthority": snapshot.get("assetAuthority") or snapshot.get("asset"),
         "horizon": snapshot.get("horizon"),
-        "target": snapshot.get("target"),
+        "deadline": snapshot.get("deadline"),
+        "targetPrice": snapshot.get("targetPrice") if "targetPrice" in snapshot else snapshot.get("target"),
+        "targetLow": snapshot.get("targetLow"),
+        "targetHigh": snapshot.get("targetHigh"),
+        "movePct": snapshot.get("movePct"),
         "direction": snapshot.get("direction"),
-        "capturedText": snapshot.get("capturedText"),
+        "scenarioYear": snapshot.get("scenarioYear"),
     }
     encoded = json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -134,13 +138,13 @@ def detect_revision(previous: Mapping[str, Any], current: Mapping[str, Any]) -> 
     old_hash = forecast_snapshot_fingerprint(previous)
     new_hash = forecast_snapshot_fingerprint(current)
     changed = old_hash != new_hash
-    old_as_of = str(previous.get("asOf") or "")
-    new_as_of = str(current.get("asOf") or "")
+    old_deadline = str(previous.get("deadline") or previous.get("asOf") or "")
+    new_deadline = str(current.get("deadline") or current.get("asOf") or "")
     return {
         "changed": changed,
         "previousFingerprint": old_hash,
         "currentFingerprint": new_hash,
-        "possibleOutcomeChasing": changed and bool(old_as_of) and old_as_of == new_as_of,
+        "possibleOutcomeChasing": changed and bool(old_deadline) and old_deadline == new_deadline,
     }
 
 
@@ -163,7 +167,7 @@ def normalize_future_paths(paths: Sequence[Mapping[str, Any]]) -> list[dict[str,
 
 
 def precursor_state(features: Mapping[str, Any]) -> dict[str, Any]:
-    """Score only supplied, finite evidence; absent features remain explicit."""
+    """Uncalibrated shadow score; never a canonical forecast input."""
     directions = {
         "fundingZ": 1.0,
         "openInterestChangePct": 0.7,
@@ -184,16 +188,27 @@ def precursor_state(features: Mapping[str, Any]) -> dict[str, Any]:
             continue
         contributions[key] = round(max(-3.0, min(3.0, value)) * weight, 6)
     if not contributions:
-        return {"state": "unknown", "score": None, "contributions": {}, "unavailable": unavailable}
+        return {
+            "state": "unknown", "score": None, "contributions": {},
+            "unavailable": unavailable, "mode": "shadow_only",
+            "calibrationStatus": "unvalidated", "influencesForecast": False,
+        }
     score = sum(contributions.values()) / sum(abs(weight) for key, weight in directions.items() if key in contributions)
     state = "elevated" if abs(score) >= 0.75 else "watch" if abs(score) >= 0.35 else "quiet"
-    return {"state": state, "score": round(score, 6), "contributions": contributions, "unavailable": unavailable}
+    return {
+        "state": state, "score": round(score, 6), "contributions": contributions,
+        "unavailable": unavailable, "mode": "shadow_only",
+        "calibrationStatus": "unvalidated", "influencesForecast": False,
+    }
 
 
 def estimated_liquidation_risk(features: Mapping[str, Any]) -> dict[str, Any]:
     precursor = precursor_state(features)
     if precursor["score"] is None:
-        return {"status": "unknown", "kind": "estimated_not_observed", "risk": None, "basis": precursor}
+        return {
+            "status": "unknown", "kind": "estimated_not_observed", "risk": None,
+            "basis": precursor, "influencesForecast": False,
+        }
     risk = min(1.0, abs(float(precursor["score"])) / 1.5)
     return {
         "status": "available",
@@ -201,6 +216,8 @@ def estimated_liquidation_risk(features: Mapping[str, Any]) -> dict[str, Any]:
         "risk": round(risk, 6),
         "basis": precursor,
         "warning": "This is a modelled risk estimate, not a real liquidation map.",
+        "calibrationStatus": "unvalidated_shadow_only",
+        "influencesForecast": False,
     }
 
 
@@ -279,7 +296,8 @@ def brier_score(probability: float, outcome: bool) -> float:
     return (p - (1.0 if outcome else 0.0)) ** 2
 
 
-def weighted_interval_score(lower: float, upper: float, actual: float, *, alpha: float = 0.2) -> float:
+def interval_score(lower: float, upper: float, actual: float, *, alpha: float = 0.2) -> float:
+    """Score one central prediction interval; this is not a multi-interval WIS."""
     if upper < lower or not 0 < alpha < 1:
         raise ValueError("Invalid interval or alpha.")
     width = upper - lower

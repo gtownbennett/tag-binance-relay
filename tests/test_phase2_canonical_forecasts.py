@@ -244,7 +244,7 @@ def test_all_producers_are_separate_and_deterministic_builder_cannot_impersonate
             record["promptVersion"] = "chad-independent-prompt-v1"
             record["forecastMethod"]["producerMethod"] = "independent-chad"
         elif producer == "tagnext":
-            record["forecastMethod"]["producerMethod"] = "tagnext-challenger"
+            record["forecastMethod"]["producerMethod"] = "tagnext-baseline"
         elif producer == "final_call":
             record["forecastMethod"]["producerMethod"] = "deterministic-final-call"
         elif producer == "baseline":
@@ -309,11 +309,15 @@ def test_direction_uses_probability_and_p50_and_supports_no_strong_edge() -> Non
 
 def test_every_horizon_has_distinct_logic_deadline_and_explanation() -> None:
     forecasts = {horizon: _forecast(horizon) for horizon in HORIZON_SPECS}
-    assert len({tuple(row["forecastMethod"]["featureNames"]) for row in forecasts.values()}) == 12
-    assert len({row["forecastMethod"]["featureWindow"] for row in forecasts.values()}) == 12
-    assert len({row["evidenceSummary"] for row in forecasts.values()}) == 12
+    assert len({tuple(row["forecastMethod"]["featureNames"]) for row in forecasts.values()}) == len(HORIZON_SPECS)
+    assert len({row["forecastMethod"]["featureWindow"] for row in forecasts.values()}) == len(HORIZON_SPECS)
+    assert len({row["evidenceSummary"] for row in forecasts.values()}) == len(HORIZON_SPECS)
     for horizon, row in forecasts.items():
-        expected = datetime.fromisoformat(row["issuedAt"]) + timedelta(minutes=HORIZON_SPECS[horizon].minutes)
+        expected = (
+            datetime(int(horizon) + 1, 1, 1, tzinfo=timezone.utc)
+            if horizon.isdigit()
+            else datetime.fromisoformat(row["issuedAt"]) + timedelta(minutes=HORIZON_SPECS[horizon].minutes)
+        )
         assert datetime.fromisoformat(row["deadline"]) == expected
     assert forecasts["24h"]["pointForecastUsd"] != forecasts["7d"]["pointForecastUsd"]
     assert "one-hour" not in forecasts["7d"]["evidenceSummary"].lower()
