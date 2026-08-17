@@ -56,6 +56,7 @@ from app.prospective_learning import (
     reconcile_missed_deadline_dispositions,
     register_prospective_tournament,
 )
+from app.terminal_config import FORECAST_PRODUCER
 from app.terminal_database import (
     AlertCaseRow,
     AlertOutcomeRow,
@@ -200,7 +201,7 @@ def _truth(evidence_time: datetime = NOW) -> tuple[dict, dict, str]:
 def _forecast(
     *,
     horizon: str = "24h",
-    producer: str = "tagalysis",
+    producer: str = FORECAST_PRODUCER,
     issued_at: datetime = NOW + timedelta(minutes=1),
     point: float | None = None,
     interval_scale: float = 1.0,
@@ -229,6 +230,7 @@ def _forecast(
             "final_call": "deterministic-final-call",
             "champion": "champion-specialist",
             "challenger": "challenger-specialist",
+            "tagnext": "tagnext-challenger",
         }[producer]
     if point is not None:
         record["pointForecastUsd"] = point
@@ -301,13 +303,13 @@ def test_producer_live_backtest_baseline_and_overlap_samples_stay_separate() -> 
     assert tag_live["gradeId"] != tag_backtest["gradeId"]
     assert tag_live["independentSample"] is True
     assert overlap_grade["independentSample"] is False
-    assert grade_report(producer="tagalysis", horizon="24h", evaluation_kind="live")["independentSamples"] == 1
-    assert grade_report(producer="tagalysis", horizon="24h", evaluation_kind="historical_backtest")["independentSamples"] == 1
+    assert grade_report(producer=FORECAST_PRODUCER, horizon="24h", evaluation_kind="live")["independentSamples"] == 1
+    assert grade_report(producer=FORECAST_PRODUCER, horizon="24h", evaluation_kind="historical_backtest")["independentSamples"] == 1
 
 
 def test_all_forecast_producers_and_final_call_receive_separate_grade_rows() -> None:
     producer_ids = {}
-    for producer in ("tagalysis", "chad", "final_call", "baseline", "champion", "challenger"):
+    for producer in ("tagalysis", "tagnext", "chad", "final_call", "baseline", "champion", "challenger"):
         record = _forecast(producer=producer)
         persist_canonical_forecast(record)
         result = grade_canonical_forecast(
@@ -315,7 +317,7 @@ def test_all_forecast_producers_and_final_call_receive_separate_grade_rows() -> 
             _outcome(datetime.fromisoformat(record["deadline"]), suffix=f"producer-{producer}"),
         )
         producer_ids[producer] = result["gradeId"]
-    assert len(set(producer_ids.values())) == 6
+    assert len(set(producer_ids.values())) == 7
     with session_scope() as session:
         rows = session.scalars(select(CanonicalForecastGradeRow)).all()
     assert {row.producer for row in rows} == set(producer_ids)
@@ -991,7 +993,7 @@ def test_phase4_control_center_never_fakes_chad_or_final_call() -> None:
     persist_canonical_forecast(tagalysis)
     tag_only = canonical_control_center_snapshot(now=NOW + timedelta(minutes=2))
     assert tag_only["currentCall"] == {
-        "producer": "tagalysis",
+        "producer": FORECAST_PRODUCER,
         "forecastId": tagalysis["forecastId"],
         "message": CHAD_PENDING_MESSAGE,
         "finalCallEligible": False,
@@ -1014,7 +1016,7 @@ def test_phase4_control_center_uses_newest_issue_and_same_producer_revision() ->
     snapshot = canonical_control_center_snapshot(now=NOW + timedelta(minutes=32))
     envelope = next(
         row for row in snapshot["forecasts"]
-        if row["record"]["producer"] == "tagalysis" and row["record"]["horizon"] == "24h"
+        if row["record"]["producer"] == FORECAST_PRODUCER and row["record"]["horizon"] == "24h"
     )
     assert envelope["record"]["forecastId"] == newer["forecastId"]
     assert envelope["previousRecord"]["forecastId"] == older["forecastId"]
@@ -1034,7 +1036,7 @@ def test_phase4_current_call_falls_back_to_a_fresh_shorter_horizon() -> None:
     persist_canonical_forecast(fresh_4h)
 
     snapshot = canonical_control_center_snapshot(now=NOW + timedelta(minutes=2))
-    assert snapshot["currentCall"]["producer"] == "tagalysis"
+    assert snapshot["currentCall"]["producer"] == FORECAST_PRODUCER
     assert snapshot["currentCall"]["forecastId"] == fresh_4h["forecastId"]
     assert snapshot["currentCall"]["message"] == CHAD_PENDING_MESSAGE
 

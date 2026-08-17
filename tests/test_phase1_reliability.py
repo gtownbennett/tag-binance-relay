@@ -515,7 +515,7 @@ def test_migration_is_additive_and_idempotent_on_sqlite(tmp_path: Path) -> None:
 
 def test_render_manifest_keeps_phase1_live_and_all_paid_ai_off() -> None:
     manifest = (Path(__file__).parents[1] / "render.yaml").read_text(encoding="utf-8")
-    assert "plan: starter" in manifest
+    assert "plan: free" in manifest
     assert 'key: REPAIR_MODE\n        value: "false"' in manifest
     assert 'key: LIVE_COLLECTORS_ENABLED\n        value: "true"' in manifest
     assert 'key: SERVER_JOBS_ENABLED\n        value: "true"' in manifest

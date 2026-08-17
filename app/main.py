@@ -19,7 +19,12 @@ from app.chad_reactivation import (
     FORECAST_GRADE_TOLERANCE_SECONDS,
     chad_reactivation_gate,
 )
-from app.terminal_config import COLLECT_SECONDS, DATABASE_URL as TERMINAL_DATABASE_URL
+from app.terminal_config import (
+    COLLECT_SECONDS,
+    DATABASE_URL as TERMINAL_DATABASE_URL,
+    FORECAST_PRODUCER,
+    SYSTEM_ID,
+)
 from app.terminal_addon import (
     APP_VERSION as TERMINAL_ADDON_VERSION,
     alert_feed as terminal_alert_feed,
@@ -72,10 +77,23 @@ from app.canonical_forecast import (
     ForecastValidationError,
     format_canonical_forecast,
     issue_due_tagalysis_forecasts,
+    issue_due_tagnext_forecasts,
     latest_canonical_forecast,
     persist_asset_truth_snapshot,
     persist_canonical_forecast,
     persist_portfolio_position_snapshot,
+)
+from app.tagnext_intelligence import (
+    PAIR_SYMBOL,
+    PRIMARY_POOL,
+    TAG_CONTRACT,
+    WBNB_CONTRACT,
+    estimated_liquidation_risk,
+    normalize_future_paths,
+    position_exit_ladder,
+    precursor_state,
+    provider_registry,
+    validate_tag_identity,
 )
 from app.supply_truth import (
     SupplyTruthError,
@@ -2524,6 +2542,9 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
     if job_type == "issue_due_tagalysis_forecasts":
         # Deterministic server-side TAGalysis issuance has no Chad/OpenAI path.
         return await asyncio.to_thread(issue_due_tagalysis_forecasts)
+    if job_type == "issue_due_tagnext_forecasts":
+        # TAGneXt is deterministic and has no Chad/OpenAI path.
+        return await asyncio.to_thread(issue_due_tagnext_forecasts)
     if job_type == "validate_helper_candidate":
         candidate_id = str((job.get("payload") or {}).get("candidateId") or "")
         if not candidate_id:
@@ -2595,10 +2616,15 @@ async def phase1_job_loop() -> None:
                     max_attempts=2,
                 )
                 forecast_bucket = int(time.time()) // max(300, COLLECT_SECONDS) * max(300, COLLECT_SECONDS)
+                forecast_job_type = (
+                    "issue_due_tagnext_forecasts"
+                    if SYSTEM_ID == "tagnext"
+                    else "issue_due_tagalysis_forecasts"
+                )
                 await asyncio.to_thread(
                     enqueue_job,
-                    job_type="issue_due_tagalysis_forecasts",
-                    idempotency_key=f"issue-tagalysis-forecasts:{forecast_bucket}",
+                    job_type=forecast_job_type,
+                    idempotency_key=f"issue-{SYSTEM_ID}-forecasts:{forecast_bucket}",
                     origin="server-scheduler",
                     payload={"bucket": forecast_bucket},
                     max_attempts=2,
@@ -2882,6 +2908,8 @@ async def health() -> dict[str, Any]:
         "serviceTime": utc_iso(),
         "version": SERVICE_VERSION,
         "buildId": BUILD_ID,
+        "systemId": SYSTEM_ID,
+        "forecastProducer": FORECAST_PRODUCER,
         "symbol": SYMBOL,
         "operatingStatus": operating_status(SERVICE_VERSION),
         "healthCheckSideEffects": "none",
@@ -2939,6 +2967,83 @@ async def health() -> dict[str, Any]:
         ),
         "terminalStorageError": None,
     }
+
+
+@app.get("/v1/tagnext/identity")
+async def tagnext_identity(x_relay_key: str | None = Header(default=None)) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    identity = validate_tag_identity(
+        token_address=TAG_CONTRACT,
+        quote_address=WBNB_CONTRACT,
+        pool_address=PRIMARY_POOL,
+        symbol=PAIR_SYMBOL,
+    )
+    return {"ok": True, "systemId": SYSTEM_ID, "identity": identity}
+
+
+@app.get("/v1/tagnext/providers")
+async def tagnext_providers(x_relay_key: str | None = Header(default=None)) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    providers = provider_registry()
+    return {
+        "ok": True,
+        "providers": providers,
+        "counts": {
+            "configured": sum(row["status"] == "configured" for row in providers),
+            "unavailable": sum(row["status"] != "configured" for row in providers),
+        },
+    }
+
+
+@app.post("/v1/tagnext/precursors")
+async def tagnext_precursors(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {
+        "ok": True,
+        "precursor": precursor_state(payload),
+        "liquidationRisk": estimated_liquidation_risk(payload),
+    }
+
+
+@app.post("/v1/tagnext/future-paths/normalize")
+async def tagnext_future_paths(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    paths = payload.get("paths")
+    if not isinstance(paths, list):
+        raise HTTPException(status_code=422, detail="paths must be a list")
+    try:
+        normalized = normalize_future_paths(paths)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {"ok": True, "paths": normalized, "probabilitiesSumTo": 1.0}
+
+
+@app.post("/v1/tagnext/position/exit-simulation")
+async def tagnext_exit_simulation(
+    payload: dict[str, Any] = Body(...),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    levels = payload.get("levels")
+    if not isinstance(levels, list):
+        raise HTTPException(status_code=422, detail="levels must be a list")
+    try:
+        result = position_exit_ladder(
+            levels=levels,
+            position_quantity=float(payload.get("positionQuantity", 100_812_406.0)),
+            reference_price=(
+                None if payload.get("referencePrice") is None else float(payload["referencePrice"])
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {"ok": True, **result}
 
 
 async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
@@ -3217,7 +3322,7 @@ async def tag_canonical_forecast_write(
 
 @app.get("/v1/tag/forecasts/canonical/latest")
 async def tag_canonical_forecast_latest(
-    producer: str = Query("tagalysis"),
+    producer: str = Query(FORECAST_PRODUCER),
     horizon: str = Query("24h"),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
@@ -3385,7 +3490,7 @@ async def tag_canonical_social_call_grade(
 
 @app.get("/v1/tag/grades/report")
 async def tag_canonical_grade_report(
-    producer: str = Query("tagalysis"),
+    producer: str = Query(FORECAST_PRODUCER),
     horizon: str = Query("24h"),
     evaluation_kind: str = Query("live", alias="evaluationKind"),
     x_relay_key: str | None = Header(default=None),

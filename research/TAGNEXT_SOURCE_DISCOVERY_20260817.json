@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "systemId": "tagnext",
+  "capturedAt": "2026-08-17T04:00:00Z",
+  "assetIdentity": {
+    "name": "TAGGER",
+    "symbol": "TAG",
+    "chain": "bsc",
+    "contract": "0x208bf3e7da9639f1eaefa2de78c23396b0682025",
+    "quoteContract": "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+    "primaryPool": "0xf0750c373ebbb3baeef7e03d8300caad1983d67c",
+    "coinMarketCapId": 34958
+  },
+  "identityAuthorities": [
+    {
+      "id": "coinmarketcap-tagger",
+      "url": "https://coinmarketcap.com/currencies/tagger/",
+      "identityState": "verified_exact_contract_and_cmc_id",
+      "status": "primary_reference"
+    },
+    {
+      "id": "coingecko-tagger",
+      "url": "https://www.coingecko.com/en/coins/tagger",
+      "identityState": "verified_exact_contract",
+      "status": "primary_reference"
+    }
+  ],
+  "directSources": [
+    {
+      "id": "binance-futures",
+      "url": "https://developers.binance.com/en/docs/catalog",
+      "access": "public_no_auth",
+      "evidence": ["mark", "index", "funding", "open_interest", "taker_flow", "order_book", "trades"],
+      "status": "implemented"
+    },
+    {
+      "id": "binance-vision",
+      "url": "https://data.binance.vision/data/futures/um/",
+      "access": "public_no_auth",
+      "evidence": ["klines", "mark_price", "index_price", "premium_index", "metrics", "agg_trades", "funding"],
+      "status": "implemented"
+    },
+    {
+      "id": "geckoterminal",
+      "url": "https://api.geckoterminal.com/api/v2",
+      "access": "public_no_auth_approximately_10_calls_per_minute",
+      "evidence": ["exact_pool_identity", "ohlcv", "liquidity", "transactions", "recent_trades"],
+      "status": "implemented_rate_limited"
+    },
+    {
+      "id": "pancakeswap-v3-subgraph",
+      "url": "https://github.com/pancakeswap/pancake-subgraph",
+      "access": "public_or_graph_gateway",
+      "evidence": ["v3_pool", "ticks", "liquidity", "volume"],
+      "status": "candidate_endpoint_requires_revalidation"
+    },
+    {
+      "id": "bscscan",
+      "url": "https://info.bscscan.com/apis/",
+      "access": "free_key_required",
+      "evidence": ["bep20_transfers", "balances", "supply", "transactions"],
+      "status": "verification_queue_fail_closed"
+    }
+  ],
+  "externalForecastCandidates": [
+    {
+      "id": "beincrypto-tagger",
+      "url": "https://beincrypto.com/price/tagger/price-prediction/",
+      "classification": "explicit_forecast",
+      "identityState": "candidate_slug_and_name_match_contract_not_exposed",
+      "influencesForecast": false
+    },
+    {
+      "id": "coincodex-tagger",
+      "url": "https://coincodex.com/crypto/tagger/price-prediction/",
+      "classification": "explicit_forecast",
+      "identityState": "candidate_linked_asset_page_requires_snapshot_verification",
+      "influencesForecast": false
+    },
+    {
+      "id": "blox-tagger",
+      "url": "https://weareblox.com/en-eu/price-prediction-tagger",
+      "classification": "explicit_simulation",
+      "identityState": "candidate_name_match_only",
+      "influencesForecast": false
+    },
+    {
+      "id": "tapbit-tagger",
+      "url": "https://www.tapbit.com/en/price-prediction/tagger",
+      "classification": "user_input_growth_calculator",
+      "identityState": "candidate_name_match_only",
+      "influencesForecast": false
+    },
+    {
+      "id": "mexc-tagger-prediction",
+      "url": "https://www.mexc.com/en-GB/price-prediction/TAG",
+      "classification": "growth_calculator_or_forecast",
+      "identityState": "candidate_exchange_symbol_ambiguous",
+      "influencesForecast": false
+    },
+    {
+      "id": "bitget-tagger-prediction",
+      "url": "https://www.bitget.com/price/tagger/price-prediction",
+      "classification": "growth_calculator",
+      "identityState": "candidate_linked_asset_page_requires_snapshot_verification",
+      "influencesForecast": false
+    },
+    {
+      "id": "dmcnews-tagger",
+      "url": "https://dmcnews.org/prices/tagger/",
+      "classification": "explicit_forecast",
+      "identityState": "candidate_name_match_only",
+      "influencesForecast": false
+    },
+    {
+      "id": "cryptoticker-tagger",
+      "url": "https://cryptoticker.io/en/prediction/tagger-price-prediction/",
+      "classification": "explicit_forecast_article",
+      "identityState": "candidate_name_match_only",
+      "influencesForecast": false
+    }
+  ],
+  "rejectedWrongAssetSources": [
+    {
+      "asset": "Tag Protocol",
+      "reason": "Same ticker but not the required TAGGER contract",
+      "urls": [
+        "https://pricepredictions.com/forecast/tag-protocol",
+        "https://coincodex.com/crypto/tag-protocol/price-prediction/",
+        "https://coindataflow.com/en/prediction/tag-protocol",
+        "https://walletinvestor.com/forecast/tag-protocol-prediction"
+      ]
+    }
+  ],
+  "saturation": {
+    "queryFamiliesExecuted": 4,
+    "predictionDomainsDiscovered": 8,
+    "identityAuthorities": 2,
+    "wrongAssetDomainsRejected": 4,
+    "verifiedExternalPredictionsFrozen": 0,
+    "reasonNoPredictionsFrozen": "No candidate page exposed the exact contract in the captured discovery result; fail-closed identity policy applies."
+  }
+}

@@ -16,7 +16,7 @@ IMAGE_WORKFLOW = (ROOT / ".github/workflows/publish-image.yml").read_text(
 class FullForecastContractTests(unittest.TestCase):
     def test_version_and_workflows_cover_current_production_lineage(self):
         self.assertIn('SERVICE_VERSION = "2.11.0-phase3"', MAIN)
-        self.assertIn('APP_VERSION = "2.11.0-phase3"', CONFIG)
+        self.assertIn('APP_VERSION = "tagnext-1.0.0-alpha1"', CONFIG)
         for workflow in (TEST_WORKFLOW, IMAGE_WORKFLOW):
             self.assertIn(
                 "v2.8.6-rc6-3-full-forecast-contract",

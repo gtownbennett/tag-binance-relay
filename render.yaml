@@ -1,12 +1,22 @@
 services:
   - type: web
-    name: tag-binance-relay-rc2-preview
+    name: tagnext-challenger
     runtime: docker
     region: frankfurt
-    plan: starter
+    plan: free
     healthCheckPath: /health
     autoDeployTrigger: commit
     envVars:
+      - key: SYSTEM_ID
+        value: "tagnext"
+      - key: FORECAST_PRODUCER
+        value: "tagnext"
+      - key: TAGNEXT_DATABASE_REQUIRED
+        value: "true"
+      - key: TAGNEXT_DATABASE_URL
+        sync: false
+      - key: CHAMPION_DATABASE_READ_ONLY_URL
+        sync: false
       - key: REPAIR_MODE
         value: "false"
       - key: LIVE_COLLECTORS_ENABLED

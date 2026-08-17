@@ -33,6 +33,7 @@ PRODUCERS = (
     "baseline",
     "champion",
     "challenger",
+    "tagnext",
 )
 
 
@@ -527,8 +528,16 @@ def canonical_features_from_evidence_packet(packet: Mapping[str, Any]) -> dict[s
     return features
 
 
-def issue_due_tagalysis_forecasts(*, now: datetime | str | None = None) -> dict[str, Any]:
-    """Issue due deterministic TAGalysis records from frozen server evidence only."""
+def _issue_due_deterministic_forecasts(
+    *,
+    producer: str,
+    model_version: str,
+    now: datetime | str | None = None,
+) -> dict[str, Any]:
+    """Issue one deterministic producer from frozen server evidence only."""
+
+    if producer not in {"tagalysis", "tagnext"}:
+        raise ForecastValidationError("automatic deterministic issuance is restricted to named system producers")
 
     from .phase1_reliability import latest_evidence_packet
 
@@ -582,7 +591,7 @@ def issue_due_tagalysis_forecasts(*, now: datetime | str | None = None) -> dict[
     created: list[str] = []
     skipped: list[str] = []
     for horizon, spec in HORIZON_SPECS.items():
-        latest = latest_canonical_forecast(producer="tagalysis", horizon=horizon)
+        latest = latest_canonical_forecast(producer=producer, horizon=horizon)
         if latest is not None:
             latest_issued = _parse_time(latest["issuedAt"], "issuedAt")
             if issued < latest_issued + timedelta(minutes=spec.minutes):
@@ -599,6 +608,8 @@ def issue_due_tagalysis_forecasts(*, now: datetime | str | None = None) -> dict[
             source_availability=source_availability,
             freshness=freshness,
             issued_at=issued,
+            producer=producer,
+            model_version=model_version,
         )
         result = persist_canonical_forecast(record)
         if result["stored"]:
@@ -612,7 +623,7 @@ def issue_due_tagalysis_forecasts(*, now: datetime | str | None = None) -> dict[
             )
             # Persistence is the single bounded prospective baseline shadow.
             # It shares the exact frozen cutoff/outcome but is never shown as
-            # the user-facing TAGalysis champion.
+            # the user-facing named system producer.
             baseline = build_tagalysis_forecast(
                 horizon=horizon,
                 evidence_snapshot_id=packet["snapshotId"],
@@ -648,6 +659,26 @@ def issue_due_tagalysis_forecasts(*, now: datetime | str | None = None) -> dict[
         "priceSourceId": price_source_id,
         "automaticPaidAiCalls": 0,
     }
+
+
+def issue_due_tagalysis_forecasts(*, now: datetime | str | None = None) -> dict[str, Any]:
+    """Champion-compatible issuance retained for the untouched TAGalysis deployment."""
+
+    return _issue_due_deterministic_forecasts(
+        producer="tagalysis",
+        model_version="tagalysis-horizon-specialists-v1",
+        now=now,
+    )
+
+
+def issue_due_tagnext_forecasts(*, now: datetime | str | None = None) -> dict[str, Any]:
+    """Issue isolated TAGneXt challenger forecasts with their own producer/model identity."""
+
+    return _issue_due_deterministic_forecasts(
+        producer="tagnext",
+        model_version="tagnext-baseline-v1",
+        now=now,
+    )
 
 
 def persist_portfolio_position_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -834,7 +865,7 @@ def build_tagalysis_forecast(
     spec = HORIZON_SPECS.get(canonical_horizon)
     if spec is None:
         raise ForecastValidationError(f"unsupported horizon: {horizon}")
-    if producer not in {"tagalysis", "baseline", "champion", "challenger"}:
+    if producer not in {"tagalysis", "baseline", "champion", "challenger", "tagnext"}:
         raise ForecastValidationError(
             "the deterministic TAGalysis builder cannot manufacture Chad or Final Call records"
         )
@@ -1025,6 +1056,7 @@ def build_tagalysis_forecast(
                 "simple-baseline" if producer == "baseline" else
                 "champion-specialist" if producer == "champion" else
                 "challenger-specialist" if producer == "challenger" else
+                "tagnext-challenger" if producer == "tagnext" else
                 "tagalysis-deterministic"
             ),
             "featureWindow": spec.feature_window,
@@ -1090,6 +1122,8 @@ def canonicalize_forecast(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ForecastValidationError("Final Call requires deterministic-final-call provenance")
     if producer == "tagalysis" and producer_method != "tagalysis-deterministic":
         raise ForecastValidationError("TAGalysis records require deterministic TAGalysis provenance")
+    if producer == "tagnext" and producer_method != "tagnext-challenger":
+        raise ForecastValidationError("TAGneXt records require tagnext-challenger provenance")
     probabilities = record.get("directionProbability")
     if not isinstance(probabilities, dict):
         raise ForecastValidationError("directionProbability is required")

@@ -1,3 +1,11 @@
+# TAGneXt backend challenger
+
+This repository is an independent clone of the frozen TAGalysis champion. It
+runs with `SYSTEM_ID=tagnext`, issues producer `tagnext`, and refuses to start
+when `TAGNEXT_DATABASE_REQUIRED=true` without a dedicated
+`TAGNEXT_DATABASE_URL`. It never executes trades and all paid/automatic AI
+paths remain disabled.
+
 # TAG Terminal Relay 2.8.7 RC6.5 — Binance-safe grading
 
 ## RC6.5 grading correction

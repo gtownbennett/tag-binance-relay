@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from .forecast_research import persist_research_run
 from .phase1_reliability import stable_hash
+from .terminal_config import FORECAST_PRODUCER
 from .terminal_database import (
     CanonicalEvidenceSnapshotRow,
     CanonicalForecastGradeRow,
@@ -211,7 +212,7 @@ def _clean_grades() -> list[tuple[CanonicalForecastGradeRow, CanonicalForecastRo
             ForecastEvaluationDispositionRow.forecast_id == CanonicalForecastGradeRow.forecast_id,
         ).where(
             CanonicalForecastGradeRow.evaluation_kind == "live",
-            CanonicalForecastRow.producer == "tagalysis",
+            CanonicalForecastRow.producer == FORECAST_PRODUCER,
             ForecastEvaluationDispositionRow.category == "valid_completed",
         )))
         clean = []
@@ -236,7 +237,7 @@ def forecast_grade_census() -> dict[str, Any]:
     now = utc_now()
     with session_scope() as session:
         forecasts = session.scalars(select(CanonicalForecastRow).where(
-            CanonicalForecastRow.producer == "tagalysis"
+            CanonicalForecastRow.producer == FORECAST_PRODUCER
         )).all()
         shadows = session.scalars(select(CanonicalForecastRow).where(
             CanonicalForecastRow.producer == "baseline"
@@ -309,7 +310,7 @@ def reconcile_matched_shadow_grades() -> dict[str, Any]:
     excluded: list[dict[str, str]] = []
     with session_scope() as session:
         tag_grades = session.scalars(select(CanonicalForecastGradeRow).where(
-            CanonicalForecastGradeRow.producer == "tagalysis",
+            CanonicalForecastGradeRow.producer == FORECAST_PRODUCER,
             CanonicalForecastGradeRow.evaluation_kind == "live",
         )).all()
         candidates: list[tuple[str, str]] = []
@@ -379,7 +380,7 @@ def reconcile_missed_deadline_dispositions() -> dict[str, Any]:
             deadline = None if forecast is None else (
                 forecast.deadline if forecast.deadline.tzinfo else forecast.deadline.replace(tzinfo=timezone.utc)
             )
-            if forecast is None or forecast.producer != "tagalysis" or deadline > utc_now():
+            if forecast is None or forecast.producer != FORECAST_PRODUCER or deadline > utc_now():
                 continue
             if session.scalar(select(CanonicalForecastGradeRow).where(
                 CanonicalForecastGradeRow.forecast_id == forecast_id,
@@ -392,7 +393,7 @@ def reconcile_missed_deadline_dispositions() -> dict[str, Any]:
                 continue
             candidates.append((forecast_id, reason, _finite(result.get("captureLagSeconds"))))
         due_tagalysis = session.scalars(select(CanonicalForecastRow).where(
-            CanonicalForecastRow.producer == "tagalysis",
+            CanonicalForecastRow.producer == FORECAST_PRODUCER,
             CanonicalForecastRow.deadline <= reconciliation_now - missing_job_grace,
         )).all()
         for forecast in due_tagalysis:
@@ -421,7 +422,7 @@ def reconcile_missed_deadline_dispositions() -> dict[str, Any]:
     shadow_classified: list[str] = []
     with session_scope() as session:
         tag_rows = session.scalars(select(CanonicalForecastRow).where(
-            CanonicalForecastRow.producer == "tagalysis",
+            CanonicalForecastRow.producer == FORECAST_PRODUCER,
         )).all()
         tag_by_deadline = {(row.horizon, row.deadline): row for row in tag_rows}
         baseline_rows = session.scalars(select(CanonicalForecastRow).where(
@@ -499,7 +500,7 @@ def prospective_population() -> dict[str, Any]:
             by_horizon[tag.horizon]["eligible"] += 1
     with session_scope() as session:
         pending = session.execute(select(CanonicalForecastRow.horizon).where(
-            CanonicalForecastRow.producer == "tagalysis", CanonicalForecastRow.deadline > utc_now(),
+            CanonicalForecastRow.producer == FORECAST_PRODUCER, CanonicalForecastRow.deadline > utc_now(),
         )).all()
     for (horizon,) in pending:
         if horizon in by_horizon:

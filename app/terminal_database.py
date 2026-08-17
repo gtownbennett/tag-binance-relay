@@ -878,7 +878,7 @@ class CanonicalForecastRow(Base):
     __tablename__ = "canonical_forecasts"
     __table_args__ = (
         CheckConstraint(
-            "producer IN ('tagalysis','chad','final_call','baseline','champion','challenger')",
+            "producer IN ('tagalysis','chad','final_call','baseline','champion','challenger','tagnext')",
             name="ck_canonical_forecast_producer",
         ),
         CheckConstraint(
@@ -1010,7 +1010,7 @@ class CanonicalForecastGradeRow(Base):
             name="uq_canonical_grade_subject_version",
         ),
         CheckConstraint(
-            "producer IN ('tagalysis','chad','final_call','baseline','champion','challenger','social_call')",
+            "producer IN ('tagalysis','chad','final_call','baseline','champion','challenger','tagnext','social_call')",
             name="ck_canonical_grade_producer",
         ),
         CheckConstraint(

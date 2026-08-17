@@ -233,7 +233,7 @@ def test_evidence_feature_adapter_preserves_spot_futures_and_missingness() -> No
     assert "cexDexAgreement12h" not in features
 
 
-def test_all_six_producers_are_separate_and_deterministic_builder_cannot_impersonate_chad() -> None:
+def test_all_producers_are_separate_and_deterministic_builder_cannot_impersonate_chad() -> None:
     tagalysis = _forecast("4h")
     records = []
     for producer in PRODUCERS:
@@ -243,6 +243,8 @@ def test_all_six_producers_are_separate_and_deterministic_builder_cannot_imperso
         if producer == "chad":
             record["promptVersion"] = "chad-independent-prompt-v1"
             record["forecastMethod"]["producerMethod"] = "independent-chad"
+        elif producer == "tagnext":
+            record["forecastMethod"]["producerMethod"] = "tagnext-challenger"
         elif producer == "final_call":
             record["forecastMethod"]["producerMethod"] = "deterministic-final-call"
         elif producer == "baseline":

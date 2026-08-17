@@ -45,6 +45,7 @@ EXACT_DEADLINE_CAPTURE_MAX_LAG_SECONDS = 45
 
 GRADE_PRODUCERS = (
     "tagalysis",
+    "tagnext",
     "chad",
     "final_call",
     "baseline",

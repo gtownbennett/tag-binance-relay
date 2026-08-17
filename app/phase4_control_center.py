@@ -12,6 +12,7 @@ from app.phase1_reliability import latest_evidence_packet
 from app.phase3_learning import HORIZON_MINIMUM_SAMPLES, active_alerts, current_user_levels
 from app.historical_memory import historical_production_summary
 from app.prospective_learning import prospective_population
+from app.terminal_config import FORECAST_PRODUCER
 from app.terminal_database import (
     AssetTruthSnapshotRow,
     CanonicalForecastGradeRow,
@@ -21,10 +22,10 @@ from app.terminal_database import (
 )
 
 
-CONTROL_CENTER_PRODUCERS = ("tagalysis", "chad", "final_call")
+CONTROL_CENTER_PRODUCERS = (FORECAST_PRODUCER, "chad", "final_call")
 CONTROL_CENTER_HORIZONS = ("1h", "4h", "12h", "24h", "3d", "7d", "30d", "3m", "6m", "1y", "3y", "5y")
 GRADE_PENDING_MESSAGE = "Grade pending — verified deadline price unavailable."
-CHAD_PENDING_MESSAGE = "TAGalysis forecast is current. Chad has not reviewed today’s evidence."
+CHAD_PENDING_MESSAGE = "The deterministic system forecast is current. Chad has not reviewed today’s evidence."
 
 
 def _aware(value: datetime) -> datetime:
@@ -186,7 +187,15 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
         grade_rows = session.scalars(
             select(CanonicalForecastGradeRow).where(
                 CanonicalForecastGradeRow.producer.in_(
-                    ("tagalysis", "chad", "final_call", "baseline", "champion", "challenger", "social_call")
+                    (
+                        FORECAST_PRODUCER,
+                        "chad",
+                        "final_call",
+                        "baseline",
+                        "champion",
+                        "challenger",
+                        "social_call",
+                    )
                 )
             )
         ).all()
@@ -236,7 +245,7 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
             ),
         )
 
-    tagalysis = fresh("tagalysis")
+    tagalysis = fresh(FORECAST_PRODUCER)
     active_horizon = tagalysis["record"]["horizon"] if tagalysis else None
     chad = fresh("chad", active_horizon)
     final_call = fresh("final_call", active_horizon)
