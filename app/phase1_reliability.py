@@ -288,19 +288,24 @@ def build_canonical_evidence_packet(
 
     spot = market.get("spot") if isinstance(market.get("spot"), dict) else {}
     pair = str(spot.get("pairAddress") or spot.get("address") or "TAG/WBNB PancakeSwap pair")
+    dex_source_id = str(spot.get("sourceId") or "dex-spot:dexscreener-pancakeswap")
+    dex_source_name = str(spot.get("sourceName") or "DexScreener / PancakeSwap")
+    dex_collector = str(spot.get("collector") or "dexscreener_pair")
+    dex_transport = str(spot.get("transport") or "DexScreener public pair API")
+    dex_directness = str(spot.get("directness") or "aggregated-direct-pair")
     dex_available = bool(spot.get("available")) and _finite(spot.get("priceUsd")) is not None
     items.append(
         _evidence_item(
-            source_id="dex-spot:dexscreener-pancakeswap",
-            source_name="DexScreener / PancakeSwap",
+            source_id=dex_source_id,
+            source_name=dex_source_name,
             source_type="dex_spot",
             category="dex_spot",
             symbol_identity=pair,
             payload={**spot, "available": dex_available},
             required_fields=("priceUsd", "volumeUsd", "transactions"),
-            collector="dexscreener_pair",
-            transport="DexScreener public pair API",
-            directness="aggregated-direct-pair",
+            collector=dex_collector,
+            transport=dex_transport,
+            directness=dex_directness,
             server_now=now,
             failure_reason=None if dex_available else "DEX spot pair was unavailable; no CEX price was substituted.",
         )

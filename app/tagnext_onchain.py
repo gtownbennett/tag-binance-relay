@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from .tagnext_intelligence import PRIMARY_POOL, TAG_CONTRACT, WBNB_CONTRACT
 from .terminal_database import (
+    TagNextChainCursorRow,
     TagNextHolderHistoryRow,
     TagNextEventOutcomeRow,
     TagNextHeatmapRow,
@@ -29,10 +30,18 @@ from .terminal_database import (
 
 CHAIN_ID = 56
 DEFAULT_RPC_URL = "https://bsc-dataseed.bnbchain.org"
+DEFAULT_LOG_RPC_URL = "https://bsc-rpc.publicnode.com"
 TRANSFER_TOPIC = "0x" + keccak(b"Transfer(address,address,uint256)").hex()
-V3_SWAP_TOPIC = "0x" + keccak(b"Swap(address,address,int256,int256,uint160,uint128,int24)").hex()
+# PancakeSwap V3 extends the Uniswap V3 Swap event with token0/token1
+# protocol-fee words. This exact signature is defined by
+# IPancakeV3PoolEvents.sol and hashes to 0x19b47279…; the Uniswap topic
+# 0xc42079f9… does not match Pancake V3 pool logs.
+V3_SWAP_TOPIC = "0x" + keccak(
+    b"Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)"
+).hex()
 V3_MINT_TOPIC = "0x" + keccak(b"Mint(address,address,int24,int24,uint128,uint256,uint256)").hex()
 V3_BURN_TOPIC = "0x" + keccak(b"Burn(address,int24,int24,uint128,uint256,uint256)").hex()
+V3_COLLECT_TOPIC = "0x" + keccak(b"Collect(address,address,int24,int24,uint128,uint128)").hex()
 BALANCE_OF_SELECTOR = "70a08231"
 TOTAL_SUPPLY_SELECTOR = "18160ddd"
 DECIMALS_SELECTOR = "313ce567"
@@ -102,14 +111,18 @@ def decode_v3_pool_log(
     if topic == V3_SWAP_TOPIC.lower():
         amount0, amount1 = _word(str(log.get("data") or "0x"), 0, signed=True), _word(str(log.get("data") or "0x"), 1, signed=True)
         event_type = "large_swap"
-    elif topic in {V3_MINT_TOPIC.lower(), V3_BURN_TOPIC.lower()}:
+    elif topic in {V3_MINT_TOPIC.lower(), V3_BURN_TOPIC.lower(), V3_COLLECT_TOPIC.lower()}:
         # V3 Mint/Burn end with amount0 and amount1. Mint has an extra owner
         # word at the front, so select the final two ABI words.
         raw = str(log.get("data") or "0x").removeprefix("0x")
         word_count = len(raw) // 64
         amount0 = _word(raw, word_count - 2)
         amount1 = _word(raw, word_count - 1)
-        event_type = "lp_mint" if topic == V3_MINT_TOPIC.lower() else "lp_burn"
+        event_type = (
+            "lp_mint" if topic == V3_MINT_TOPIC.lower()
+            else "lp_burn" if topic == V3_BURN_TOPIC.lower()
+            else "lp_collect"
+        )
     else:
         raise ValueError("unsupported PancakeSwap V3 pool event")
     tag_raw = amount0 if tag_is_token0 else amount1
@@ -130,22 +143,45 @@ def decode_v3_pool_log(
 class BnbRpc:
     def __init__(self, url: str | None = None, *, timeout_seconds: int = 20) -> None:
         self.url = (url or os.getenv("BNB_RPC_URL") or DEFAULT_RPC_URL).strip()
+        failovers = [value.strip() for value in os.getenv("BNB_RPC_FAILOVER_URLS", DEFAULT_LOG_RPC_URL).split(",") if value.strip()]
+        self.urls = list(dict.fromkeys([self.url, *failovers]))
         self.client = httpx.Client(timeout=timeout_seconds, headers={"User-Agent": "TAGneXt-BNB-readonly/1.0"})
         self._request_id = 0
+        self.method_endpoints: dict[str, str] = {}
 
     def close(self) -> None:
         self.client.close()
 
     def call(self, method: str, params: Sequence[Any]) -> Any:
         self._request_id += 1
-        response = self.client.post(self.url, json={
-            "jsonrpc": "2.0", "id": self._request_id, "method": method, "params": list(params),
-        })
-        response.raise_for_status()
-        body = response.json()
-        if body.get("error"):
-            raise RuntimeError(f"BNB RPC {method} failed: {body['error'].get('code')}")
-        return body.get("result")
+        last_error: Exception | None = None
+        endpoints = (
+            [DEFAULT_LOG_RPC_URL, *self.urls]
+            if method == "eth_getLogs" and DEFAULT_LOG_RPC_URL in self.urls
+            else self.urls
+        )
+        for endpoint in dict.fromkeys(endpoints):
+            try:
+                response = self.client.post(endpoint, json={
+                    "jsonrpc": "2.0", "id": self._request_id,
+                    "method": method, "params": list(params),
+                })
+                response.raise_for_status()
+                body = response.json()
+                if body.get("error"):
+                    error = body["error"]
+                    raise RuntimeError(
+                        f"BNB RPC {method} failed: {error.get('code')} {error.get('message')}"
+                    )
+                self.url = endpoint
+                self.method_endpoints[method] = endpoint
+                return body.get("result")
+            except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+                last_error = exc
+        raise RuntimeError(
+            f"all configured BNB RPC endpoints failed for {method}: "
+            f"{type(last_error).__name__}: {last_error}"
+        )
 
     def eth_call(self, to: str, data: str, block: str = "latest") -> str:
         return str(self.call("eth_call", [{"to": to, "data": data}, block]))
@@ -178,14 +214,40 @@ def _balance_of(rpc: BnbRpc, contract: str, address: str, *, block: str) -> int:
 def collect_bnb_chain_once(
     *, rpc: BnbRpc | None = None, from_block: int | None = None,
     to_block: int | None = None, max_block_span: int = 1_000,
+    confirmation_depth: int | None = None,
 ) -> dict[str, Any]:
     """Collect transfers, holder balances, large swaps, and LP events."""
     owned_rpc = rpc is None
     client = rpc or BnbRpc()
     try:
         latest = _hex_int(client.call("eth_blockNumber", []))
-        end = min(latest, to_block if to_block is not None else latest)
-        start = from_block if from_block is not None else max(0, end - 299)
+        depth = max(1, int(confirmation_depth or os.getenv("TAGNEXT_BNB_CONFIRMATIONS", "12")))
+        confirmed_head = max(0, latest - depth)
+        cursor_id = "bsc_exact_tagger_primary"
+        provider_id = "bnb_chain_public_rpc"
+        with session_scope() as session:
+            cursor = session.get(TagNextChainCursorRow, cursor_id)
+            cursor_start = (
+                int(cursor.last_confirmed_block) + 1
+                if cursor is not None else max(0, confirmed_head - 299)
+            )
+        end = min(confirmed_head, to_block if to_block is not None else confirmed_head)
+        start = from_block if from_block is not None else cursor_start
+        end = min(end, start + max_block_span - 1)
+        if end < start:
+            with session_scope() as session:
+                cursor = session.get(TagNextChainCursorRow, cursor_id)
+                if cursor is not None:
+                    cursor.last_head_block = latest
+                    cursor.last_run_at = datetime.now(timezone.utc)
+                    cursor.health_state = "caught_up"
+            return {
+                "fromBlock": start, "toBlock": end, "eventsPersisted": 0,
+                "transfers": 0, "largeSwaps": 0, "lpEvents": 0,
+                "holderSnapshots": 0, "completeHolderCensus": False,
+                "confirmationDepth": depth, "confirmedHead": confirmed_head,
+                "cursorState": "caught_up", "paidCalls": 0,
+            }
         if end < start or end - start + 1 > max_block_span:
             raise ValueError("BNB collection range must be positive and bounded")
         tag_decimals = _contract_decimals(client, TAG_CONTRACT)
@@ -199,7 +261,7 @@ def collect_bnb_chain_once(
         }]) or []
         pool_logs = client.call("eth_getLogs", [{
             "fromBlock": hex(start), "toBlock": hex(end), "address": PRIMARY_POOL,
-            "topics": [[V3_SWAP_TOPIC, V3_MINT_TOPIC, V3_BURN_TOPIC]],
+            "topics": [[V3_SWAP_TOPIC, V3_MINT_TOPIC, V3_BURN_TOPIC, V3_COLLECT_TOPIC]],
         }]) or []
         labels = _verified_labels()
         block_times: dict[int, datetime] = {}
@@ -254,7 +316,7 @@ def collect_bnb_chain_once(
                     ))
                     persisted += 1
                     large_swaps += int(event["eventType"] == "large_swap")
-                    lp_events += int(event["eventType"] in {"lp_mint", "lp_burn"})
+                    lp_events += int(event["eventType"] in {"lp_mint", "lp_burn", "lp_collect"})
 
         # Point-in-time holder balances only for addresses directly observed in
         # this bounded range. This is not claimed as a complete holder census.
@@ -289,11 +351,35 @@ def collect_bnb_chain_once(
                         }),
                     ))
                     holders += 1
+        with session_scope() as session:
+            cursor = session.get(TagNextChainCursorRow, cursor_id)
+            now = datetime.now(timezone.utc)
+            health_state = "caught_up" if end >= confirmed_head else "catching_up"
+            if cursor is None:
+                session.add(TagNextChainCursorRow(
+                    cursor_id=cursor_id, chain_id=CHAIN_ID, provider_id=provider_id,
+                    last_confirmed_block=end, confirmation_depth=depth,
+                    batch_size=max_block_span, last_head_block=latest,
+                    last_run_at=now, missed_range_json="[]",
+                    health_state=health_state,
+                ))
+            else:
+                cursor.last_confirmed_block = end
+                cursor.confirmation_depth = depth
+                cursor.batch_size = max_block_span
+                cursor.last_head_block = latest
+                cursor.last_run_at = now
+                cursor.health_state = health_state
+                cursor.updated_at = now
         return {
             "fromBlock": start, "toBlock": end, "eventsPersisted": persisted,
             "transfers": transfers, "largeSwaps": large_swaps, "lpEvents": lp_events,
             "holderSnapshots": holders, "completeHolderCensus": False,
             "exchangeLabels": "verified_only", "paidCalls": 0,
+            "confirmationDepth": depth, "confirmedHead": confirmed_head,
+            "cursorState": "caught_up" if end >= confirmed_head else "catching_up",
+            "rpcEndpoint": getattr(client, "url", "injected_rpc"),
+            "rpcEndpoints": dict(getattr(client, "method_endpoints", {})),
         }
     finally:
         if owned_rpc:

@@ -8,7 +8,7 @@ import json
 import os
 import zipfile
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -17,11 +17,32 @@ from sqlalchemy import select
 from .canonical_forecast import TAGNEXT_BASELINE
 from .terminal_config import APP_VERSION
 from .terminal_database import (
+    AlertCaseRow,
+    AlertEventRow,
+    AlertOutcomeRow,
+    AlertStageEventRow,
+    AlertTimelineRow,
+    AssetTruthSnapshotRow,
     CanonicalForecastGradeRow,
     CanonicalForecastRow,
+    CanonicalEvidenceItemRow,
+    CanonicalEvidenceSnapshotRow,
+    LearningVersionRow,
+    MarketRegimeRow,
+    MarketStructureRegimeVersionRow,
+    PatternSequenceRow,
+    PortfolioPositionSnapshotRow,
+    ProviderUsageSnapshotRow,
     TagNextAblationRow,
+    TagNextChampionImportRow,
     TagNextChampionComparisonRow,
     TagNextConsensusRow,
+    TagNextConsensusGradeRow,
+    TagNextDiscoveryCandidateRow,
+    TagNextEventLedgerRow,
+    TagNextEventOutcomeRow,
+    TagNextExitImpactRow,
+    TagNextExternalOutcomeScheduleRow,
     TagNextExportRunRow,
     TagNextExternalGradeRow,
     TagNextExternalRevisionRow,
@@ -32,13 +53,21 @@ from .terminal_database import (
     TagNextFeatureSnapshotRow,
     TagNextForecastFeatureLinkRow,
     TagNextHeatmapRow,
+    TagNextHistoricalEpisodeRow,
     TagNextHolderHistoryRow,
     TagNextModelRegistryRow,
+    TagNextModelEvaluationRow,
     TagNextOnchainEventRow,
+    TagNextOrderBookRow,
     TagNextPairedOutcomeRow,
+    TagNextPeriodOutcomeRow,
     TagNextProviderRow,
+    TagNextProviderCoverageRow,
+    TagNextSourceHistoryRow,
     TagNextSourceScoreRow,
     TagNextWhaleEntityRow,
+    TagNextWhaleEventRow,
+    TagNextFuturePathRow,
     VerifiedOutcomeRow,
     json_dumps,
     session_scope,
@@ -82,42 +111,41 @@ def build_paired_same_deadline_outcomes(*, cutoff_at: datetime | None = None) ->
             CanonicalForecastRow.deadline <= cutoff,
         )))
         for challenger in challengers:
-            champion = session.scalar(select(CanonicalForecastRow).where(
-                CanonicalForecastRow.producer.in_(CHAMPION_PRODUCERS),
-                CanonicalForecastRow.horizon == challenger.horizon,
-                CanonicalForecastRow.deadline == challenger.deadline,
-            ).order_by(CanonicalForecastRow.issued_at.desc()).limit(1))
+            champion = session.scalar(select(TagNextChampionImportRow).where(
+                TagNextChampionImportRow.producer.in_(CHAMPION_PRODUCERS),
+                TagNextChampionImportRow.horizon == challenger.horizon,
+                TagNextChampionImportRow.deadline == challenger.deadline,
+            ).order_by(TagNextChampionImportRow.issued_at.desc()).limit(1))
             if champion is None:
                 continue
             challenger_grade = session.scalar(select(CanonicalForecastGradeRow).where(
                 CanonicalForecastGradeRow.forecast_id == challenger.forecast_id,
                 CanonicalForecastGradeRow.evaluation_kind == "live",
             ).order_by(CanonicalForecastGradeRow.graded_at.desc()).limit(1))
-            champion_grade = session.scalar(select(CanonicalForecastGradeRow).where(
-                CanonicalForecastGradeRow.forecast_id == champion.forecast_id,
-                CanonicalForecastGradeRow.evaluation_kind == "live",
-            ).order_by(CanonicalForecastGradeRow.graded_at.desc()).limit(1))
+            champion_grade = json.loads(champion.grade_json or "{}")
             outcome_id = None
-            if challenger_grade is not None and champion_grade is not None:
-                if challenger_grade.outcome_id != champion_grade.outcome_id:
+            if challenger_grade is not None and champion.outcome_id is not None:
+                if challenger_grade.outcome_id != champion.outcome_id:
                     continue
                 outcome_id = challenger_grade.outcome_id
                 complete += 1
             else:
                 ungraded += 1
             pair_payload = {
-                "champion": champion.forecast_id, "challenger": challenger.forecast_id,
+                "champion": champion.champion_forecast_id, "challenger": challenger.forecast_id,
                 "horizon": challenger.horizon, "deadline": challenger.deadline.isoformat(),
             }
             pair_id = "tnpo_" + _hash(pair_payload)[:32]
             if session.get(TagNextPairedOutcomeRow, pair_id) is None:
                 session.add(TagNextPairedOutcomeRow(
-                    pair_id=pair_id, champion_forecast_id=champion.forecast_id,
+                    pair_id=pair_id, champion_forecast_id=champion.champion_forecast_id,
                     challenger_forecast_id=challenger.forecast_id,
                     horizon=challenger.horizon, deadline=challenger.deadline,
                     outcome_id=outcome_id,
-                    champion_metrics_json=json_dumps(_metrics(champion_grade)),
+                    champion_metrics_json=json_dumps(champion_grade),
                     challenger_metrics_json=json_dumps(_metrics(challenger_grade)),
+                    champion_import_id=champion.imported_forecast_id,
+                    pair_window="all_time",
                 ))
                 written += 1
     return {
@@ -138,44 +166,48 @@ def rolling_comparison_report(*, cutoff_at: datetime | None = None, minimum_pair
         for pair in pairs:
             by_horizon[pair.horizon].append(pair)
         reports = []
-        for horizon, rows in sorted(by_horizon.items()):
-            champion = [json.loads(row.champion_metrics_json or "{}") for row in rows]
-            challenger = [json.loads(row.challenger_metrics_json or "{}") for row in rows]
+        windows = (("7d", 7), ("30d", 30), ("90d", 90), ("all_time", None))
+        for horizon, all_rows in sorted(by_horizon.items()):
+            for window_label, days in windows:
+                rows = [row for row in all_rows if days is None or row.deadline >= cutoff - timedelta(days=days)]
+                champion = [json.loads(row.champion_metrics_json or "{}") for row in rows]
+                challenger = [json.loads(row.challenger_metrics_json or "{}") for row in rows]
 
-            def mean(items: Sequence[Mapping[str, Any]], key: str) -> float | None:
-                values = [float(item[key]) for item in items if item.get(key) is not None]
-                return sum(values) / len(values) if values else None
+                def mean(items: Sequence[Mapping[str, Any]], key: str) -> float | None:
+                    values = [float(item[key]) for item in items if item.get(key) is not None]
+                    return sum(values) / len(values) if values else None
 
-            metrics = {
-                "championCompositeMean": mean(champion, "compositeScore"),
-                "challengerCompositeMean": mean(challenger, "compositeScore"),
-                "championWisMean": mean(champion, "weightedIntervalScore"),
-                "challengerWisMean": mean(challenger, "weightedIntervalScore"),
-                "championDirectionAccuracy": mean([
-                    {"value": 1.0 if item.get("directionCorrect") else 0.0}
-                    for item in champion if item.get("directionCorrect") is not None
-                ], "value"),
-                "challengerDirectionAccuracy": mean([
-                    {"value": 1.0 if item.get("directionCorrect") else 0.0}
-                    for item in challenger if item.get("directionCorrect") is not None
-                ], "value"),
-            }
-            decision = "insufficient_paired_samples" if len(rows) < minimum_pairs else "review_required"
-            payload = {
-                "version": COMPARISON_VERSION, "horizon": horizon,
-                "cutoffAt": cutoff.isoformat(), "pairedSampleCount": len(rows),
-                "minimumPairs": minimum_pairs, "metrics": metrics, "decision": decision,
-            }
-            comparison_id = "tncc_" + _hash(payload)[:32]
-            if session.get(TagNextChampionComparisonRow, comparison_id) is None:
-                session.add(TagNextChampionComparisonRow(
-                    comparison_id=comparison_id,
-                    champion_build_id=os.getenv("TAGALYSIS_CHAMPION_COMMIT", "unconfigured"),
-                    challenger_build_id=APP_VERSION, frozen_cutoff=cutoff,
-                    horizon=horizon, paired_sample_count=len(rows),
-                    metrics_json=json_dumps(metrics), decision=decision,
-                ))
-            reports.append(payload)
+                metrics = {
+                    "championCompositeMean": mean(champion, "compositeScore"),
+                    "challengerCompositeMean": mean(challenger, "compositeScore"),
+                    "championWisMean": mean(champion, "weightedIntervalScore"),
+                    "challengerWisMean": mean(challenger, "weightedIntervalScore"),
+                    "championDirectionAccuracy": mean([
+                        {"value": 1.0 if item.get("directionCorrect") else 0.0}
+                        for item in champion if item.get("directionCorrect") is not None
+                    ], "value"),
+                    "challengerDirectionAccuracy": mean([
+                        {"value": 1.0 if item.get("directionCorrect") else 0.0}
+                        for item in challenger if item.get("directionCorrect") is not None
+                    ], "value"),
+                }
+                decision = "insufficient_paired_samples" if len(rows) < minimum_pairs else "review_required"
+                payload = {
+                    "version": COMPARISON_VERSION, "horizon": horizon,
+                    "window": window_label,
+                    "cutoffAt": cutoff.isoformat(), "pairedSampleCount": len(rows),
+                    "minimumPairs": minimum_pairs, "metrics": metrics, "decision": decision,
+                }
+                comparison_id = "tncc_" + _hash(payload)[:32]
+                if session.get(TagNextChampionComparisonRow, comparison_id) is None:
+                    session.add(TagNextChampionComparisonRow(
+                        comparison_id=comparison_id,
+                        champion_build_id=os.getenv("TAGALYSIS_CHAMPION_COMMIT", "unconfigured"),
+                        challenger_build_id=APP_VERSION, frozen_cutoff=cutoff,
+                        horizon=horizon, paired_sample_count=len(rows),
+                        metrics_json=json_dumps({**metrics, "window": window_label}), decision=decision,
+                    ))
+                reports.append(payload)
     return {"version": COMPARISON_VERSION, "reports": reports, "automaticPromotion": False}
 
 
@@ -229,6 +261,14 @@ def _jsonl_bytes(rows: Iterable[Mapping[str, Any]]) -> bytes:
     return b"".join((_stable_json(row) + "\n").encode("utf-8") for row in rows)
 
 
+def _safe_model_jsonl(session: Any, model: Any, *, exclude: Sequence[str] = ()) -> bytes:
+    """Serialize an explicitly allow-listed model; never inspect environment/config files."""
+    excluded = set(exclude)
+    columns = [column.name for column in model.__table__.columns if column.name not in excluded]
+    rows = session.execute(select(*(getattr(model, name) for name in columns))).all()
+    return _jsonl_bytes(dict(zip(columns, row)) for row in rows)
+
+
 def _safe_export_payloads() -> dict[str, bytes]:
     """Select explicit safe columns; never serialize environment or connection data."""
     with session_scope() as session:
@@ -252,7 +292,48 @@ def _safe_export_payloads() -> dict[str, bytes]:
         comparisons = list(session.scalars(select(TagNextChampionComparisonRow)))
         ablations = list(session.scalars(select(TagNextAblationRow)))
         promotions = list(session.scalars(select(TagNextFeaturePromotionRow)))
-    return {
+        expanded_exports = {
+            "canonical_forecasts_full.jsonl": _safe_model_jsonl(session, CanonicalForecastRow),
+            "canonical_forecast_grades_full.jsonl": _safe_model_jsonl(session, CanonicalForecastGradeRow),
+            "verified_outcomes.jsonl": _safe_model_jsonl(session, VerifiedOutcomeRow),
+            "asset_truth_snapshots.jsonl": _safe_model_jsonl(session, AssetTruthSnapshotRow),
+            "portfolio_position_snapshots.jsonl": _safe_model_jsonl(session, PortfolioPositionSnapshotRow),
+            "evidence_snapshots.jsonl": _safe_model_jsonl(session, CanonicalEvidenceSnapshotRow),
+            "evidence_items.jsonl": _safe_model_jsonl(session, CanonicalEvidenceItemRow),
+            "forecast_feature_links.jsonl": _safe_model_jsonl(session, TagNextForecastFeatureLinkRow),
+            "feature_snapshots.jsonl": _safe_model_jsonl(session, TagNextFeatureSnapshotRow),
+            "learned_lessons.jsonl": _safe_model_jsonl(session, LearningVersionRow),
+            "patterns.jsonl": _safe_model_jsonl(session, PatternSequenceRow),
+            "market_regimes.jsonl": _safe_model_jsonl(session, MarketRegimeRow),
+            "market_structure_regimes.jsonl": _safe_model_jsonl(session, MarketStructureRegimeVersionRow),
+            "alerts.jsonl": _safe_model_jsonl(session, AlertEventRow),
+            "alert_timeline.jsonl": _safe_model_jsonl(session, AlertTimelineRow),
+            "canonical_alert_cases.jsonl": _safe_model_jsonl(session, AlertCaseRow),
+            "canonical_alert_stages.jsonl": _safe_model_jsonl(session, AlertStageEventRow),
+            "canonical_alert_outcomes.jsonl": _safe_model_jsonl(session, AlertOutcomeRow),
+            "future_paths.jsonl": _safe_model_jsonl(session, TagNextFuturePathRow),
+            "event_ledger.jsonl": _safe_model_jsonl(session, TagNextEventLedgerRow),
+            "discovery_candidates.jsonl": _safe_model_jsonl(session, TagNextDiscoveryCandidateRow),
+            "external_revisions.jsonl": _safe_model_jsonl(session, TagNextExternalRevisionRow),
+            "source_history.jsonl": _safe_model_jsonl(session, TagNextSourceHistoryRow),
+            "source_scores.jsonl": _safe_model_jsonl(session, TagNextSourceScoreRow),
+            "external_outcome_schedules.jsonl": _safe_model_jsonl(session, TagNextExternalOutcomeScheduleRow),
+            "period_outcomes.jsonl": _safe_model_jsonl(session, TagNextPeriodOutcomeRow),
+            "consensus_snapshots.jsonl": _safe_model_jsonl(session, TagNextConsensusRow),
+            "consensus_grades.jsonl": _safe_model_jsonl(session, TagNextConsensusGradeRow),
+            "whale_entities.jsonl": _safe_model_jsonl(session, TagNextWhaleEntityRow),
+            "whale_events.jsonl": _safe_model_jsonl(session, TagNextWhaleEventRow),
+            "event_outcomes.jsonl": _safe_model_jsonl(session, TagNextEventOutcomeRow),
+            "provider_coverage.jsonl": _safe_model_jsonl(session, TagNextProviderCoverageRow),
+            "provider_health.jsonl": _safe_model_jsonl(session, ProviderUsageSnapshotRow),
+            "orderbooks.jsonl": _safe_model_jsonl(session, TagNextOrderBookRow),
+            "exit_impact.jsonl": _safe_model_jsonl(session, TagNextExitImpactRow),
+            "champion_imports.jsonl": _safe_model_jsonl(session, TagNextChampionImportRow),
+            "champion_pairs.jsonl": _safe_model_jsonl(session, TagNextPairedOutcomeRow),
+            "model_evaluations.jsonl": _safe_model_jsonl(session, TagNextModelEvaluationRow),
+            "historical_episodes.jsonl": _safe_model_jsonl(session, TagNextHistoricalEpisodeRow),
+        }
+    files = {
         "forecasts.csv": _csv_bytes(
             ("forecast_id","producer","horizon","issued_at","deadline","model_version","point_forecast","q10","q90","direction","confidence","evidence_snapshot_id"),
             ((r.forecast_id,r.producer,r.horizon,r.issued_at.isoformat(),r.deadline.isoformat(),r.model_version,r.point_forecast,r.q10,r.q90,r.direction,r.confidence,r.evidence_snapshot_id) for r in forecasts),
@@ -303,6 +384,42 @@ def _safe_export_payloads() -> dict[str, bytes]:
             "ablations": [{"id": r.ablation_id,"removedFeature": r.removed_feature_id,"cutoff": r.frozen_cutoff.isoformat(),"sampleCount": r.sample_count} for r in ablations],
         }) + "\n").encode("utf-8"),
     }
+    files.update(expanded_exports)
+    regrader = Path(__file__).resolve().parents[1] / "scripts" / "independent_regrade.py"
+    files["independent_regrade.py"] = regrader.read_bytes()
+    files["regrading_contract.json"] = (_stable_json({
+        "version": "tagnext-independent-regrade-v1",
+        "forecastPopulation": "canonical_forecasts_full.jsonl (producer=tagnext)",
+        "outcomePopulation": "verified_outcomes.jsonl",
+        "storedGrades": "canonical_forecast_grades_full.jsonl",
+        "join": ["forecast_id", "outcome_id", "exact forecast deadline == outcome observed_at"],
+        "gradeVersion": "canonical-grade-v1",
+        "script": "independent_regrade.py",
+        "command": "python independent_regrade.py --brain-zip TAGneXt_FULL_BRAIN.zip",
+        "championBoundary": "Champion rows are exported separately and can be regraded only when the frozen champion export contains row-level forecasts and exact outcomes.",
+        "secretsRequired": False,
+    }) + "\n").encode("utf-8")
+    files["REGRADING.md"] = (
+        "# Independent regrading\n\n"
+        "This archive includes every safe TAGneXt canonical forecast row (including its immutable "
+        "issuance payload), every exact verified outcome, every stored canonical grade, the frozen "
+        "asset-truth and optional portfolio snapshots, and a standard-library-only reference grader.\n\n"
+        "Run `python independent_regrade.py --brain-zip TAGneXt_FULL_BRAIN.zip`. The command verifies "
+        "the ZIP's internal SHA-256 manifest, finds exact-deadline outcomes, recomputes all deterministic "
+        "forecast metrics, and compares recomputed metrics with stored grade payloads. Forecasts whose "
+        "deadlines have not matured remain explicitly pending and are not scored.\n\n"
+        "The separate standardized TAGalysis export contains its own regrading eligibility declaration. "
+        "The frozen champion baseline supplied no row-level forecast/outcome population, so it is preserved "
+        "without inventing rows and is explicitly not regradeable until such an export is provided.\n"
+    ).encode("utf-8")
+    files["README.md"] = (
+        "# TAGneXt complete brain export\n\n"
+        "Server-produced, append-only intelligence state. Forecast populations remain producer-labelled; "
+        "champion imports are one-way and never written back to TAGalysis. Exact raw provider credentials, "
+        "environment files, cookies, tokens, passwords, and connection strings are excluded. See "
+        "REGRADING.md for the independent exact-outcome verification procedure.\n"
+    ).encode("utf-8")
+    return files
 
 
 def create_full_brain_export(destination: str | Path) -> dict[str, Any]:

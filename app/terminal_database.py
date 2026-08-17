@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Iterator
 
 from sqlalchemy import (
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -1538,6 +1540,16 @@ class TagNextExternalSourceRow(Base):
     adapter_id: Mapped[str | None] = mapped_column(Text)
     identity_chain_json: Mapped[str] = mapped_column(Text, default="{}")
     popularity_json: Mapped[str] = mapped_column(Text, default="{}")
+    independent_family_id: Mapped[str | None] = mapped_column(Text, index=True)
+    declared_cadence_seconds: Mapped[int | None] = mapped_column(BigInteger)
+    configured_cadence_seconds: Mapped[int | None] = mapped_column(BigInteger)
+    last_semantic_change_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    event_triggered_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    parser_status: Mapped[str | None] = mapped_column(Text)
+    etag: Mapped[str | None] = mapped_column(Text)
+    last_modified: Mapped[str | None] = mapped_column(Text)
+    source_state_json: Mapped[str] = mapped_column(Text, default="{}")
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -1554,14 +1566,29 @@ class TagNextExternalSnapshotRow(Base):
     deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     horizon: Mapped[str | None] = mapped_column(Text, index=True)
     direction: Mapped[str | None] = mapped_column(Text)
-    target_price: Mapped[float | None] = mapped_column(Float)
-    target_low: Mapped[float | None] = mapped_column(Float)
-    target_high: Mapped[float | None] = mapped_column(Float)
-    move_pct: Mapped[float | None] = mapped_column(Float)
+    target_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    target_low: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    target_high: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    move_pct: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
     captured_text: Mapped[str | None] = mapped_column(Text)
     semantics_json: Mapped[str] = mapped_column(Text, default="{}")
     payload_hash: Mapped[str] = mapped_column(Text, index=True)
     provenance_json: Mapped[str] = mapped_column(Text)
+    original_horizon_label: Mapped[str | None] = mapped_column(Text)
+    normalized_horizon: Mapped[str | None] = mapped_column(Text, index=True)
+    target_semantics: Mapped[str] = mapped_column(Text, default="point_at_deadline", index=True)
+    source_issue_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_update_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    probability: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    scenario_class: Mapped[str | None] = mapped_column(Text)
+    methodology_version: Mapped[str | None] = mapped_column(Text)
+    conditional_trigger: Mapped[str | None] = mapped_column(Text)
+    forecast_family_id: Mapped[str | None] = mapped_column(Text, index=True)
+    independent_family_id: Mapped[str | None] = mapped_column(Text, index=True)
+    gradeability: Mapped[str] = mapped_column(Text, default="point", index=True)
+    observed_live: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class TagNextExternalRevisionRow(Base):
@@ -1572,6 +1599,14 @@ class TagNextExternalRevisionRow(Base):
     previous_snapshot_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"))
     current_snapshot_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"))
     possible_outcome_chasing: Mapped[bool] = mapped_column(Boolean, default=False)
+    price_change_since_prior_pct: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    target_change_pct: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    revision_lag_seconds: Mapped[int | None] = mapped_column(BigInteger)
+    source_update_lag_seconds: Mapped[int | None] = mapped_column(BigInteger)
+    forecast_lead_seconds: Mapped[int | None] = mapped_column(BigInteger)
+    chasing_score: Mapped[Decimal | None] = mapped_column(Numeric(20, 12))
+    stability_score: Mapped[Decimal | None] = mapped_column(Numeric(20, 12))
+    analysis_json: Mapped[str] = mapped_column(Text, default="{}")
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -1582,11 +1617,14 @@ class TagNextExternalGradeRow(Base):
     grade_id: Mapped[str] = mapped_column(Text, primary_key=True)
     snapshot_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"), index=True)
     deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    actual_price: Mapped[float | None] = mapped_column(Float)
+    actual_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
     direction_correct: Mapped[bool | None] = mapped_column(Boolean)
-    absolute_error: Mapped[float | None] = mapped_column(Float)
+    absolute_error: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
     disposition: Mapped[str] = mapped_column(Text, index=True)
     grader_version: Mapped[str] = mapped_column(Text)
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}")
+    outcome_source: Mapped[str | None] = mapped_column(Text)
+    period_outcome_id: Mapped[str | None] = mapped_column(Text)
     graded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -1597,9 +1635,9 @@ class TagNextSourceScoreRow(Base):
     source_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_sources.source_id"), index=True)
     horizon: Mapped[str] = mapped_column(Text, index=True)
     sample_count: Mapped[int] = mapped_column(Integer)
-    direction_accuracy: Mapped[float | None] = mapped_column(Float)
-    mean_absolute_error: Mapped[float | None] = mapped_column(Float)
-    brier_score: Mapped[float | None] = mapped_column(Float)
+    direction_accuracy: Mapped[Decimal | None] = mapped_column(Numeric(20, 12))
+    mean_absolute_error: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    brier_score: Mapped[Decimal | None] = mapped_column(Numeric(20, 12))
     cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     score_json: Mapped[str] = mapped_column(Text)
 
@@ -1613,6 +1651,11 @@ class TagNextConsensusRow(Base):
     component_snapshot_ids_json: Mapped[str] = mapped_column(Text)
     probability_json: Mapped[str] = mapped_column(Text)
     method_version: Mapped[str] = mapped_column(Text)
+    statistics_json: Mapped[str] = mapped_column(Text, default="{}")
+    independent_family_count: Mapped[int] = mapped_column(Integer, default=0)
+    stale_source_count: Mapped[int] = mapped_column(Integer, default=0)
+    calculator_count: Mapped[int] = mapped_column(Integer, default=0)
+    historical_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -1624,11 +1667,12 @@ class TagNextConsensusGradeRow(Base):
     consensus_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_consensus_snapshots.consensus_id"), index=True)
     deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     outcome_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("verified_outcomes.outcome_id"))
-    actual_price: Mapped[float | None] = mapped_column(Float)
+    actual_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
     direction_correct: Mapped[bool | None] = mapped_column(Boolean)
-    absolute_error: Mapped[float | None] = mapped_column(Float)
+    absolute_error: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
     disposition: Mapped[str] = mapped_column(Text, index=True)
     grader_version: Mapped[str] = mapped_column(Text)
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}")
     graded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -1643,6 +1687,56 @@ class TagNextDiscoveryCandidateRow(Base):
     state: Mapped[str] = mapped_column(Text, default="unreviewed", index=True)
     reason: Mapped[str | None] = mapped_column(Text)
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    normalized_url: Mapped[str | None] = mapped_column(Text, index=True)
+    resolved_url: Mapped[str | None] = mapped_column(Text)
+    domain: Mapped[str | None] = mapped_column(Text, index=True)
+    source_label: Mapped[str | None] = mapped_column(Text)
+    search_engine: Mapped[str | None] = mapped_column(Text)
+    language: Mapped[str | None] = mapped_column(Text)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    final_status: Mapped[str | None] = mapped_column(Text, index=True)
+    identity_evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    original_source_url: Mapped[str | None] = mapped_column(Text)
+    forecast_family_id: Mapped[str | None] = mapped_column(Text)
+    independent_family_id: Mapped[str | None] = mapped_column(Text)
+    parser_id: Mapped[str | None] = mapped_column(Text)
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    accessibility: Mapped[str | None] = mapped_column(Text)
+    historical_archive_url: Mapped[str | None] = mapped_column(Text)
+    response_hash: Mapped[str | None] = mapped_column(String(64))
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    retry_status: Mapped[str | None] = mapped_column(Text)
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class TagNextDiscoveryCursorRow(Base):
+    __tablename__ = "tagnext_discovery_cursors"
+
+    cursor_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    plan_version: Mapped[str] = mapped_column(Text)
+    plan_size: Mapped[int] = mapped_column(Integer)
+    next_offset: Mapped[int] = mapped_column(Integer)
+    completed_cycles: Mapped[int] = mapped_column(BigInteger, default=0)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_result_json: Mapped[str] = mapped_column(Text, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextDiscoverySearchAttemptRow(Base):
+    __tablename__ = "tagnext_discovery_search_attempts"
+
+    attempt_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    discovery_version: Mapped[str] = mapped_column(Text)
+    discovery_query: Mapped[str] = mapped_column(Text, index=True)
+    search_engine: Mapped[str] = mapped_column(Text)
+    language: Mapped[str] = mapped_column(Text)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(Text)
+    result_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_type: Mapped[str | None] = mapped_column(Text)
+    retry_status: Mapped[str] = mapped_column(Text, index=True)
+    alternative_engine: Mapped[str | None] = mapped_column(Text)
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
 
 
 class TagNextSourceHistoryRow(Base):
@@ -1656,6 +1750,71 @@ class TagNextSourceHistoryRow(Base):
     response_hash: Mapped[str] = mapped_column(String(64))
     parser_version: Mapped[str] = mapped_column(Text)
     provenance_json: Mapped[str] = mapped_column(Text)
+
+
+class TagNextExternalOutcomeScheduleRow(Base):
+    __tablename__ = "tagnext_external_outcome_schedules"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "target_semantics", name="uq_tagnext_external_outcome_schedule"),
+    )
+
+    schedule_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"), index=True)
+    target_semantics: Mapped[str] = mapped_column(Text)
+    period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_capture_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(Text, default="scheduled", index=True)
+    capture_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_capture_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextPeriodOutcomeRow(Base):
+    __tablename__ = "tagnext_period_outcome_aggregates"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "period_start", "period_end", name="uq_tagnext_period_outcome"),
+    )
+
+    period_outcome_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"), index=True)
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    observation_count: Mapped[int] = mapped_column(BigInteger)
+    minimum_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    maximum_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    average_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    end_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    source_ids_json: Mapped[str] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextProviderCoverageRow(Base):
+    __tablename__ = "tagnext_provider_coverage"
+
+    provider_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    correct_tag_supported: Mapped[bool | None] = mapped_column(Boolean)
+    tagusdt_supported: Mapped[bool | None] = mapped_column(Boolean)
+    unique_value: Mapped[str | None] = mapped_column(Text)
+    api_available: Mapped[bool | None] = mapped_column(Boolean)
+    free_plan: Mapped[bool | None] = mapped_column(Boolean)
+    card_required: Mapped[bool | None] = mapped_column(Boolean)
+    trial_only: Mapped[bool | None] = mapped_column(Boolean)
+    quota_text: Mapped[str | None] = mapped_column(Text)
+    history_available: Mapped[bool | None] = mapped_column(Boolean)
+    snapshot_storage_allowed: Mapped[bool | None] = mapped_column(Boolean)
+    role: Mapped[str] = mapped_column(Text)
+    account_needed: Mapped[bool | None] = mapped_column(Boolean)
+    adapter_state: Mapped[str] = mapped_column(Text)
+    influences_forecast: Mapped[bool] = mapped_column(Boolean, default=False)
+    decision: Mapped[str] = mapped_column(Text)
+    terms_url: Mapped[str | None] = mapped_column(Text)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
 
 
 class TagNextWhaleEntityRow(Base):
@@ -1679,8 +1838,11 @@ class TagNextHolderHistoryRow(Base):
     entity_id: Mapped[str | None] = mapped_column(Text, ForeignKey("tagnext_whale_entities.entity_id"), index=True)
     token_contract: Mapped[str] = mapped_column(Text)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    balance: Mapped[float | None] = mapped_column(Float)
-    share_of_supply: Mapped[float | None] = mapped_column(Float)
+    balance: Mapped[Decimal | None] = mapped_column(Numeric(78, 18))
+    share_of_supply: Mapped[Decimal | None] = mapped_column(Numeric(30, 18))
+    completeness_label: Mapped[str] = mapped_column(Text, default="observed_addresses_only")
+    rank: Mapped[int | None] = mapped_column(Integer)
+    provider_id: Mapped[str | None] = mapped_column(Text)
     provenance_json: Mapped[str] = mapped_column(Text)
 
 
@@ -1693,16 +1855,21 @@ class TagNextWhaleEventRow(Base):
     tx_hash: Mapped[str | None] = mapped_column(Text, index=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     direction: Mapped[str | None] = mapped_column(Text)
-    token_quantity: Mapped[float | None] = mapped_column(Float)
-    quote_value: Mapped[float | None] = mapped_column(Float)
+    token_quantity: Mapped[Decimal | None] = mapped_column(Numeric(78, 18))
+    quote_value: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
     destination_class: Mapped[str | None] = mapped_column(Text)
+    event_class: Mapped[str | None] = mapped_column(Text)
+    price_at_event: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    label_source: Mapped[str | None] = mapped_column(Text)
+    source_url: Mapped[str | None] = mapped_column(Text)
+    confidence_label: Mapped[str | None] = mapped_column(Text)
     provenance_json: Mapped[str] = mapped_column(Text)
 
 
 class TagNextOnchainEventRow(Base):
     __tablename__ = "tagnext_onchain_events"
     __table_args__ = (
-        CheckConstraint("event_type IN ('transfer','large_swap','lp_mint','lp_burn')", name="ck_tagnext_onchain_event_type"),
+        CheckConstraint("event_type IN ('transfer','large_swap','lp_mint','lp_burn','lp_collect')", name="ck_tagnext_onchain_event_type"),
         UniqueConstraint("chain_id", "tx_hash", "log_index", name="uq_tagnext_onchain_log"),
     )
 
@@ -1715,8 +1882,8 @@ class TagNextOnchainEventRow(Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     address_from: Mapped[str | None] = mapped_column(Text, index=True)
     address_to: Mapped[str | None] = mapped_column(Text, index=True)
-    token_quantity: Mapped[float | None] = mapped_column(Float)
-    quote_quantity: Mapped[float | None] = mapped_column(Float)
+    token_quantity: Mapped[Decimal | None] = mapped_column(Numeric(78, 18))
+    quote_quantity: Mapped[Decimal | None] = mapped_column(Numeric(78, 18))
     entity_confidence: Mapped[float | None] = mapped_column(Float)
     label_state: Mapped[str] = mapped_column(Text, default="unverified")
     provenance_json: Mapped[str] = mapped_column(Text)
@@ -1730,8 +1897,8 @@ class TagNextEventOutcomeRow(Base):
     event_id: Mapped[str] = mapped_column(Text, index=True)
     horizon: Mapped[str] = mapped_column(Text)
     deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    outcome_price: Mapped[float | None] = mapped_column(Float)
-    move_pct: Mapped[float | None] = mapped_column(Float)
+    outcome_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    move_pct: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
     disposition: Mapped[str] = mapped_column(Text)
     evidence_id: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -1751,6 +1918,66 @@ class TagNextHeatmapRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class TagNextChainCursorRow(Base):
+    __tablename__ = "tagnext_chain_cursors"
+    __table_args__ = (UniqueConstraint("chain_id", "provider_id", name="uq_tagnext_chain_provider_cursor"),)
+
+    cursor_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(Integer)
+    provider_id: Mapped[str] = mapped_column(Text)
+    last_confirmed_block: Mapped[int] = mapped_column(BigInteger)
+    confirmation_depth: Mapped[int] = mapped_column(Integer)
+    batch_size: Mapped[int] = mapped_column(Integer)
+    last_head_block: Mapped[int | None] = mapped_column(BigInteger)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    missed_range_json: Mapped[str] = mapped_column(Text, default="[]")
+    health_state: Mapped[str] = mapped_column(Text, default="initializing")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextOrderBookRow(Base):
+    __tablename__ = "tagnext_orderbook_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    provider_id: Mapped[str] = mapped_column(Text)
+    venue: Mapped[str] = mapped_column(Text)
+    symbol: Mapped[str] = mapped_column(Text)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    best_bid: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    best_ask: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    spread_bps: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    bid_depth_usd: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    ask_depth_usd: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    imbalance: Mapped[Decimal | None] = mapped_column(Numeric(30, 18))
+    levels_json: Mapped[str] = mapped_column(Text)
+    large_zones_json: Mapped[str] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    provenance_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextExitImpactRow(Base):
+    __tablename__ = "tagnext_exit_impact_snapshots"
+
+    simulation_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    bag_fraction: Mapped[Decimal] = mapped_column(Numeric(12, 8))
+    token_quantity: Mapped[Decimal] = mapped_column(Numeric(78, 18))
+    route_class: Mapped[str] = mapped_column(Text)
+    route_label: Mapped[str] = mapped_column(Text)
+    gross_value_usd: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    estimated_proceeds_usd: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    average_execution_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    slippage_pct: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    price_impact_pct: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    fees_usd: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    confidence: Mapped[str] = mapped_column(Text)
+    source_ids_json: Mapped[str] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    provenance_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class TagNextFuturePathRow(Base):
     __tablename__ = "tagnext_future_paths"
     __table_args__ = (CheckConstraint("probability >= 0 AND probability <= 1", name="ck_tagnext_future_path_probability"),)
@@ -1759,9 +1986,55 @@ class TagNextFuturePathRow(Base):
     path_id: Mapped[str] = mapped_column(Text, primary_key=True)
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     horizon: Mapped[str] = mapped_column(Text, index=True)
-    probability: Mapped[float] = mapped_column(Float)
+    probability: Mapped[Decimal] = mapped_column(Numeric(20, 18))
     scenario_json: Mapped[str] = mapped_column(Text)
     model_version: Mapped[str] = mapped_column(Text)
+    previous_path_set_id: Mapped[str | None] = mapped_column(Text)
+    triggers_json: Mapped[str] = mapped_column(Text, default="[]")
+    invalidations_json: Mapped[str] = mapped_column(Text, default="[]")
+    evidence_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    payload_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    grading_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class TagNextEventLedgerRow(Base):
+    __tablename__ = "tagnext_event_ledger"
+    __table_args__ = (UniqueConstraint("event_type", "event_time", "payload_hash", name="uq_tagnext_event_ledger_semantics"),)
+
+    event_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    event_type: Mapped[str] = mapped_column(Text, index=True)
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    first_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    payload_hash: Mapped[str] = mapped_column(Text)
+    provenance_json: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text)
+    system_id: Mapped[str] = mapped_column(Text, default="tagnext")
+    severity: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text, default="observed")
+    evidence_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    outcome_schedule_json: Mapped[str] = mapped_column(Text, default="{}")
+    model_version: Mapped[str | None] = mapped_column(Text)
+
+
+class TagNextChampionImportRow(Base):
+    __tablename__ = "tagnext_champion_imports"
+
+    imported_forecast_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    champion_forecast_id: Mapped[str] = mapped_column(Text, index=True)
+    producer: Mapped[str] = mapped_column(Text)
+    horizon: Mapped[str] = mapped_column(Text, index=True)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    model_version: Mapped[str] = mapped_column(Text)
+    point_forecast: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    q10: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    q90: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    direction: Mapped[str | None] = mapped_column(Text)
+    outcome_id: Mapped[str | None] = mapped_column(String(64))
+    grade_json: Mapped[str] = mapped_column(Text, default="{}")
+    source_artifact_sha256: Mapped[str] = mapped_column(String(64))
+    source_record_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class TagNextChampionComparisonRow(Base):
@@ -1790,6 +2063,8 @@ class TagNextPairedOutcomeRow(Base):
     outcome_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("verified_outcomes.outcome_id"))
     champion_metrics_json: Mapped[str] = mapped_column(Text, default="{}")
     challenger_metrics_json: Mapped[str] = mapped_column(Text, default="{}")
+    champion_import_id: Mapped[str | None] = mapped_column(Text, ForeignKey("tagnext_champion_imports.imported_forecast_id"))
+    pair_window: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -1802,6 +2077,47 @@ class TagNextAblationRow(Base):
     frozen_cutoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     sample_count: Mapped[int] = mapped_column(Integer)
     metrics_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextModelEvaluationRow(Base):
+    __tablename__ = "tagnext_model_evaluations"
+    __table_args__ = (
+        CheckConstraint(
+            "evaluation_kind IN ('historical_replay','purged_walk_forward','out_of_sample','ablation')",
+            name="ck_tagnext_model_evaluation_kind",
+        ),
+        CheckConstraint(
+            "decision IN ('collection_only','shadow','evaluated','promoted','rejected','insufficient_samples')",
+            name="ck_tagnext_model_evaluation_decision",
+        ),
+    )
+
+    evaluation_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    model_version: Mapped[str] = mapped_column(Text, index=True)
+    baseline_version: Mapped[str] = mapped_column(Text)
+    horizon: Mapped[str] = mapped_column(Text, index=True)
+    regime: Mapped[str] = mapped_column(Text, index=True)
+    evaluation_kind: Mapped[str] = mapped_column(Text)
+    frozen_cutoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    sample_count: Mapped[int] = mapped_column(Integer)
+    metrics_json: Mapped[str] = mapped_column(Text)
+    decision: Mapped[str] = mapped_column(Text, index=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextHistoricalEpisodeRow(Base):
+    __tablename__ = "tagnext_historical_episodes"
+
+    episode_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    label: Mapped[str] = mapped_column(Text)
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(Text, index=True)
+    evidence_ids_json: Mapped[str] = mapped_column(Text)
+    conclusions_json: Mapped[str] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -1988,7 +2304,14 @@ def session_scope() -> Iterator[Session]:
 
 
 def json_dumps(value: Any) -> str:
-    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    def _default(item: Any) -> Any:
+        if isinstance(item, Decimal):
+            return float(item)
+        if isinstance(item, datetime):
+            return item.isoformat()
+        raise TypeError(f"Object of type {item.__class__.__name__} is not JSON serializable")
+
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=_default)
 
 
 def latest_client_snapshot(session: Session) -> ClientSnapshot | None:

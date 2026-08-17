@@ -18,10 +18,17 @@ import httpx
 from sqlalchemy import select
 
 from .tagnext_intelligence import TAG_CONTRACT
-from .terminal_database import TagNextDiscoveryCandidateRow, session_scope
+from .terminal_database import (
+    TagNextDiscoveryCandidateRow,
+    TagNextDiscoveryCursorRow,
+    TagNextDiscoverySearchAttemptRow,
+    json_dumps,
+    session_scope,
+)
 
 
-DISCOVERY_VERSION = "tagnext-public-discovery-v1"
+DISCOVERY_VERSION = "tagnext-public-discovery-v2"
+DISCOVERY_CURSOR_ID = "public_forecast_search"
 SEARCH_ENGINES = {
     "bing_rss": "https://www.bing.com/search?format=rss&q={query}",
     "duckduckgo_html": "https://html.duckduckgo.com/html/?q={query}",
@@ -63,7 +70,8 @@ MULTILINGUAL_QUERIES = (
 # TAGGER forecast page has not yet been found. A seed is not an endorsement.
 SOURCE_SEEDS: tuple[dict[str, str], ...] = (
     {"name": "CoinCodex", "domain": "coincodex.com", "state": "forecast_page_found"},
-    {"name": "CoinMarketCap AI/community", "domain": "coinmarketcap.com", "state": "asset_page_found_gradeable_forecast_unconfirmed"},
+    {"name": "CoinMarketCap AI", "domain": "coinmarketcap.com", "state": "asset_page_found_gradeable_forecast_unconfirmed"},
+    {"name": "CoinMarketCap community/prediction pages", "domain": "coinmarketcap.com", "state": "public_community_search_seed"},
     {"name": "BeInCrypto", "domain": "beincrypto.com", "state": "forecast_page_found"},
     {"name": "MEXC", "domain": "mexc.com", "state": "scenario_calculator_found"},
     {"name": "PricePredictions.com", "domain": "pricepredictions.com", "state": "forecast_page_found"},
@@ -89,6 +97,7 @@ SOURCE_SEEDS: tuple[dict[str, str], ...] = (
     {"name": "Cryptopolitan", "domain": "cryptopolitan.com", "state": "unconfirmed"},
     {"name": "TechNewsLeader", "domain": "technewsleader.com", "state": "unconfirmed"},
     {"name": "CoinArbitrageBot", "domain": "coinarbitragebot.com", "state": "forecast_page_found"},
+    {"name": "Blox", "domain": "blox.com", "state": "unconfirmed"},
     {"name": "AMBCrypto", "domain": "ambcrypto.com", "state": "unconfirmed"},
     {"name": "Bitnation", "domain": "bitnation.co", "state": "unconfirmed"},
     {"name": "CryptoPredictions", "domain": "cryptopredictions.com", "state": "unconfirmed"},
@@ -160,12 +169,30 @@ def public_discovery_worker_run(
 ) -> dict[str, Any]:
     """Run a bounded slice of the repeatable discovery plan.
 
-    The default offset rotates hourly, spreading searches across engines,
-    languages, exact identity, named people, and every supplied source seed.
+    The default offset is a database cursor.  Clock-derived selection is never
+    used, so crashes and sleeping services cannot create permanent plan gaps.
     """
     plan = discovery_query_plan()
     now = datetime.now(timezone.utc)
-    offset = plan_offset if plan_offset is not None else int(now.timestamp() // 3600) % len(plan)
+    plan_version = hashlib.sha256(json_dumps(plan).encode("utf-8")).hexdigest()
+    if plan_offset is None:
+        with session_scope() as session:
+            cursor = session.get(TagNextDiscoveryCursorRow, DISCOVERY_CURSOR_ID)
+            if cursor is None or cursor.plan_version != plan_version or cursor.plan_size != len(plan):
+                if cursor is None:
+                    cursor = TagNextDiscoveryCursorRow(
+                        cursor_id=DISCOVERY_CURSOR_ID, plan_version=plan_version,
+                        plan_size=len(plan), next_offset=0, completed_cycles=0,
+                        last_result_json="{}",
+                    )
+                    session.add(cursor)
+                else:
+                    cursor.plan_version = plan_version
+                    cursor.plan_size = len(plan)
+                    cursor.next_offset = min(int(cursor.next_offset or 0), len(plan) - 1)
+            offset = int(cursor.next_offset or 0)
+    else:
+        offset = int(plan_offset) % len(plan)
     selected = [plan[(offset + index) % len(plan)] for index in range(max(1, min(batch_size, 12)))]
     candidates = failures = 0
     observations: list[dict[str, Any]] = []
@@ -194,17 +221,49 @@ def public_discovery_worker_run(
                         discovered_via=f"{DISCOVERY_VERSION}:{engine}:{item['language']}",
                         discovery_query=query, state="unreviewed",
                         reason="Search result only; identity and forecast semantics not yet verified.",
+                        normalized_url=url, domain=(urlsplit(url).hostname or "").lower(),
+                        search_engine=engine, language=item["language"],
+                        retry_status="not_required", evidence_json="{}",
                     ))
                     candidates += 1
             observations.append({
                 **item, "status": status, "resultCount": len(urls),
                 "checkedAt": now.isoformat(),
             })
-    return {
+            attempt_payload = {
+                **item, "status": status, "resultCount": len(urls),
+                "checkedAt": now.isoformat(),
+            }
+            with session_scope() as session:
+                attempt_id = "tndsa_" + hashlib.sha256(
+                    json_dumps(attempt_payload).encode("utf-8")
+                ).hexdigest()[:32]
+                if session.get(TagNextDiscoverySearchAttemptRow, attempt_id) is None:
+                    session.add(TagNextDiscoverySearchAttemptRow(
+                        attempt_id=attempt_id, discovery_version=DISCOVERY_VERSION,
+                        discovery_query=query, search_engine=engine,
+                        language=item["language"], attempted_at=now,
+                        status=status, result_count=len(urls),
+                        error_type=status.split(":", 1)[1] if status.startswith("error:") else None,
+                        retry_status="successful" if status == "ok" else "pending_retry",
+                        evidence_json=json_dumps({"resultUrls": urls}),
+                    ))
+    result = {
         "version": DISCOVERY_VERSION, "planSize": len(plan), "planOffset": offset,
         "queriesRun": len(selected), "newCandidates": candidates, "failures": failures,
         "observations": observations, "approvalSideEffects": False,
     }
+    if plan_offset is None:
+        next_offset_absolute = offset + len(selected)
+        with session_scope() as session:
+            cursor = session.get(TagNextDiscoveryCursorRow, DISCOVERY_CURSOR_ID)
+            if cursor is not None:
+                cursor.next_offset = next_offset_absolute % len(plan)
+                cursor.completed_cycles = int(cursor.completed_cycles or 0) + (next_offset_absolute // len(plan))
+                cursor.last_run_at = now
+                cursor.last_result_json = json_dumps(result)
+                cursor.updated_at = now
+    return result
 
 
 def source_seed_inventory() -> dict[str, Any]:

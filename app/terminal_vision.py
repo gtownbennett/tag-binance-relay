@@ -586,6 +586,57 @@ async def backfill_metrics_range(
     }
 
 
+async def backfill_metrics_month(month: str) -> dict[str, Any]:
+    """Backfill one completed monthly official metrics archive.
+
+    Monthly archives make multi-episode point-in-time evaluation practical
+    without issuing hundreds of daily public requests.
+    """
+    parsed_month = datetime.strptime(month, "%Y-%m").date().replace(day=1)
+    current_month = datetime.now(timezone.utc).date().replace(day=1)
+    if parsed_month >= current_month:
+        raise ValueError("Monthly metrics archives are limited to completed UTC months")
+    next_month = (parsed_month.replace(day=28) + timedelta(days=4)).replace(day=1)
+    start_at = datetime.combine(parsed_month, datetime.min.time(), tzinfo=timezone.utc)
+    end_at = datetime.combine(next_month, datetime.min.time(), tzinfo=timezone.utc)
+    range_state = begin_backfill_range({
+        "source": "Binance Vision", "dataset": "metrics", "symbol": SYMBOL,
+        "resolution": "5m", "rangeStart": start_at.isoformat(), "rangeEnd": end_at.isoformat(),
+    })
+    if range_state["alreadyComplete"]:
+        return {"month": month, "rows": 0, "checkpoint": range_state}
+    try:
+        url, raw, archive_hash = await _download_archive_csv("metrics", month, period="monthly")
+        parsed = _parse_metrics_rows(raw)
+        if raw and not parsed:
+            raise ValueError("Binance monthly metrics archive schema was not recognized")
+        legacy_rows = _upsert_rows(
+            [{key: value for key, value in row.items() if key != "historical_values"} for row in parsed]
+        )
+        retrieved_at = datetime.now(timezone.utc)
+        warehouse = persist_historical_observations({
+            "source": "Binance Vision", "sourceType": "official_exchange_archive",
+            "exchange": "Binance Futures", "symbol": SYMBOL, "category": "futures",
+            "dataset": "metrics", "resolution": "5m",
+            "observedAt": datetime.fromtimestamp(row["event_time_ms"] / 1000, tz=timezone.utc).isoformat(),
+            "retrievedAt": retrieved_at.isoformat(), "reliabilityStatus": "primary_archive",
+            "validationStatus": "valid", "values": row["historical_values"],
+            "provenance": {"archive": url, "archiveSha256": archive_hash, "immutableArchive": True},
+        } for row in parsed)
+        checkpoint = finish_backfill_range(
+            range_state["rangeId"], status="complete", rows_seen=len(parsed),
+            rows_stored=warehouse["rowsStored"], archive_reference=url, archive_hash=archive_hash,
+        )
+        return {"month": month, "url": url, "rows": legacy_rows, "warehouse": warehouse, "checkpoint": checkpoint}
+    except Exception as exc:
+        status = "unavailable" if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404 else "failed"
+        finish_backfill_range(
+            range_state["rangeId"], status=status, rows_seen=0, rows_stored=0,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return {"month": month, "error": f"{type(exc).__name__}: {exc}", "checkpointStatus": status}
+
+
 async def backfill_candle_month(month: str, interval: str = "5m") -> dict[str, Any]:
     """Backfill completed monthly price archives with durable checkpoints."""
     parsed_month = datetime.strptime(month, "%Y-%m").date().replace(day=1)

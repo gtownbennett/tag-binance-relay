@@ -102,6 +102,7 @@ from app.tagnext_pipeline import (
     grade_due_external_forecasts,
     grade_due_consensus,
     predictions_payload,
+    provider_coverage_payload,
     rebuild_source_scores,
     seed_tagnext_registries,
 )
@@ -120,6 +121,11 @@ from app.tagnext_comparison import (
     create_full_brain_export,
     rolling_comparison_report,
     run_shadow_ablation_report,
+)
+from app.tagnext_future_engine import (
+    build_future_paths as build_server_future_paths,
+    event_ledger_payload as tagnext_event_ledger_payload,
+    future_paths_payload as server_future_paths_payload,
 )
 from app.supply_truth import (
     SupplyTruthError,
@@ -3092,6 +3098,14 @@ async def tagnext_providers(x_relay_key: str | None = Header(default=None)) -> d
     }
 
 
+@app.get("/v1/tagnext/providers/coverage")
+async def tagnext_provider_coverage(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, **await asyncio.to_thread(provider_coverage_payload)}
+
+
 @app.post("/v1/tagnext/precursors")
 async def tagnext_precursors(
     payload: dict[str, Any] = Body(...),
@@ -3188,6 +3202,34 @@ async def tagnext_future_paths(
     except (TypeError, ValueError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return {"ok": True, "paths": normalized, "probabilitiesSumTo": 1.0}
+
+
+@app.get("/v1/tagnext/future-paths")
+async def tagnext_server_future_paths(
+    horizon: str = Query("24h"),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, **await asyncio.to_thread(server_future_paths_payload, horizon=horizon)}
+
+
+@app.post("/v1/tagnext/future-paths/build")
+async def tagnext_build_server_future_paths(
+    horizon: str = Query("24h"),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    require_repair_writes_unlocked("TAGneXt immutable Future Paths")
+    return {"ok": True, **await asyncio.to_thread(build_server_future_paths, horizon=horizon)}
+
+
+@app.get("/v1/tagnext/event-ledger")
+async def tagnext_event_ledger(
+    limit: int = Query(100, ge=1, le=500),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, **await asyncio.to_thread(tagnext_event_ledger_payload, limit=limit)}
 
 
 @app.post("/v1/tagnext/position/exit-simulation")

@@ -1,0 +1,104 @@
+[
+  {
+    "sourceId": "coincodex-tagger",
+    "url": "https://coincodex.com/crypto/tagger/price-prediction/",
+    "html": "<html><title>TAGGER price prediction</title><body><nav>2027 USD 99.99</nav><div class='ad'>Forecast software only $49.99</div><table><tr><th>Year</th><th>Price prediction</th></tr><tr><td>2027</td><td>$0.0012</td></tr><tr><td>2040</td><td>$0.044</td></tr></table></body></html>",
+    "expected": [["2027", "year_end", 0.0012], ["2040", "year_end", 0.044]]
+  },
+  {
+    "sourceId": "pricepredictions-ai-tagger",
+    "url": "https://www.pricepredictions.ai/tagger-price-prediction",
+    "html": "<html><title>TAGGER price prediction</title><body>TAGGER</body><script type='application/json'>{\"forecasts\":[{\"year\":\"2028\",\"min\":\"$0.003\",\"average\":\"$0.004\",\"max\":\"$0.005\",\"dateModified\":\"2026-08-17T10:00:00Z\"}]}</script></html>",
+    "expected": [["2028", "period_minimum", 0.003], ["2028", "period_maximum", 0.005], ["2028", "period_average", 0.004]]
+  },
+  {
+    "sourceId": "pricepredictions-com-tagger",
+    "url": "https://pricepredictions.com/forecast/tagger",
+    "html": "<html><title>TAGGER forecast</title><body><table><tr><th>Period</th><th>Minimum</th><th>Average</th><th>Maximum</th></tr><tr><td>30 days</td><td>$0.0008</td><td>$0.0010</td><td>$0.0013</td></tr></table></body></html>",
+    "expected": [["30d", "possible_low", 0.0008], ["30d", "period_average", 0.001], ["30d", "possible_high", 0.0013]]
+  },
+  {
+    "sourceId": "beincrypto-tagger",
+    "url": "https://beincrypto.com/price/tagger/price-prediction/",
+    "html": "<html><title>TAGGER technical forecast</title><body><table><tr><th>Year</th><th>Minimum</th><th>Average</th><th>Maximum</th></tr><tr><td>2029</td><td>$0.00035</td><td>$0.001</td><td>$0.0021</td></tr></table></body></html>",
+    "expected": [["2029", "period_minimum", 0.00035], ["2029", "period_average", 0.001], ["2029", "period_maximum", 0.0021]]
+  },
+  {
+    "sourceId": "tradersunion-tagger",
+    "url": "https://tradersunion.com/currencies/forecast/tag-usd/",
+    "html": "<html><title>TAGGER price forecast</title><body><table><tr><th>Year</th><th>Year-end price</th></tr><tr><td>2030</td><td>$0.0069608</td></tr></table></body></html>",
+    "expected": [["2030", "year_end", 0.0069608]]
+  },
+  {
+    "sourceId": "coinarbitragebot-tagger",
+    "url": "https://coinarbitragebot.com/price-prediction/tagger.html",
+    "html": "<html><title>TAGGER price prediction</title><body><table><tr><th>Year</th><th>Prediction</th></tr><tr><td>2030</td><td>$0.003251</td></tr></table></body></html>",
+    "expected": [["2030", "year_end", 0.003251]]
+  },
+  {
+    "sourceId": "midforex-tagger",
+    "url": "https://midforex.com/crypto/tagger-forecast",
+    "html": "<html><title>TAGGER AI forecast</title><body><table><tr><th>Year</th><th>Low</th><th>Average</th><th>High</th></tr><tr><td>2027</td><td>$0.001562</td><td>$0.001953</td><td>$0.002343</td></tr></table></body></html>",
+    "expected": [["2027", "period_minimum", 0.001562], ["2027", "period_average", 0.001953], ["2027", "period_maximum", 0.002343]]
+  },
+  {
+    "sourceId": "bitscreener-tagger",
+    "url": "https://bitscreener.com/coins/tagger/price-prediction",
+    "html": "<html><title>TAGGER price prediction</title><body><table><tr><th>Horizon</th><th>Target price</th></tr><tr><td>24H</td><td>$0.0014</td></tr><tr><td>7D</td><td>$0.0018</td></tr></table></body></html>",
+    "expected": [["24h", "point_at_deadline", 0.0014], ["7d", "point_at_deadline", 0.0018]]
+  },
+  {
+    "sourceId": "digitalcoinprice-tagger",
+    "url": "https://digitalcoinprice.com/forecast/tagger",
+    "html": "<html><title>TAGGER forecast</title><body><table><tr><th>Year</th><th>Minimum</th><th>Average</th><th>Maximum</th></tr><tr><td>2050</td><td>$0.04</td><td>$0.06</td><td>$0.08</td></tr></table></body></html>",
+    "expected": [["2050", "period_minimum", 0.04], ["2050", "period_average", 0.06], ["2050", "period_maximum", 0.08]]
+  },
+  {
+    "sourceId": "walletinvestor-tagger",
+    "url": "https://walletinvestor.com/forecast/tagger-prediction",
+    "html": "<html><title>TAGGER (TAG) forecast</title><body><p>1-year target $0.002</p><section>Unrelated TAG token contract 0x1111111111111111111111111111111111111111 is not this page.</section></body></html>",
+    "expected": [["1y", "point_at_deadline", 0.002]]
+  },
+  {
+    "sourceId": "blockspot-tagger",
+    "url": "https://blockspot.io/coin/tagger/price-prediction/",
+    "html": "<html><title>TAGGER price prediction</title><body><p>TAGGER forecast for 6 months: target price USD 0.0025.</p></body></html>",
+    "expected": [["6m", "point_at_deadline", 0.0025]]
+  },
+  {
+    "sourceId": "coinmarketcap-ai-tagger",
+    "url": "https://coinmarketcap.com/cmc-ai/tagger/price-prediction/",
+    "html": "<html><title>Tagger (TAG) Price Prediction</title><body><p>Tagger (TAG) Price Prediction By CMC AI</p><p>16 August 2026 04:08PM (UTC+0)</p><p>TLDR: enterprise adoption is bullish.</p></body></html>",
+    "expected": [["forward outlook", "direction_only", null]]
+  },
+  {
+    "sourceId": "mexc-tagger-calculator",
+    "url": "https://www.mexc.com/price/TAGGER/price-prediction",
+    "html": "<html><title>TAGGER price calculator</title><body><table><tr><th>Year</th><th>Target price</th></tr><tr><td>2030</td><td>$0.01</td></tr></table></body></html>",
+    "expected": [["2030", "scenario_calculator", 0.01]]
+  },
+  {
+    "sourceId": "coinbase-tagger-calculator",
+    "url": "https://www.coinbase.com/price-predictions/tagger",
+    "html": "<html><title>TAGGER price calculator</title><body><table><tr><th>Year</th><th>Target price</th></tr><tr><td>2030</td><td>$0.02</td></tr></table></body></html>",
+    "expected": [["2030", "scenario_calculator", 0.02]]
+  },
+  {
+    "sourceId": "bitget-tagger-calculator",
+    "url": "https://www.bitget.com/price/tagger/price-prediction",
+    "html": "<html><title>TAGGER price calculator</title><body><table><tr><th>Year</th><th>Target price</th></tr><tr><td>2030</td><td>$0.03</td></tr></table></body></html>",
+    "expected": [["2030", "scenario_calculator", 0.03]]
+  },
+  {
+    "sourceId": "gate-tagger-calculator",
+    "url": "https://www.gate.com/price-prediction/tagger-tag",
+    "html": "<html><title>TAGGER price calculator</title><body><table><tr><th>Year</th><th>Target price</th></tr><tr><td>2030</td><td>$0.04</td></tr></table></body></html>",
+    "expected": [["2030", "scenario_calculator", 0.04]]
+  },
+  {
+    "sourceId": "tapbit-tagger-calculator",
+    "url": "https://www.tapbit.com/price-prediction/tagger",
+    "html": "<html><title>TAGGER price calculator</title><body><table><tr><th>Year</th><th>Target price</th></tr><tr><td>2030</td><td>$0.05</td></tr></table></body></html>",
+    "expected": [["2030", "scenario_calculator", 0.05]]
+  }
+]

@@ -30,6 +30,7 @@ from app.tagnext_onchain import (
 from app.tagnext_pipeline import seed_tagnext_registries
 from app.terminal_database import (
     TagNextExportRunRow,
+    TagNextChainCursorRow,
     TagNextHolderHistoryRow,
     TagNextOnchainEventRow,
     TagNextWhaleEntityRow,
@@ -51,7 +52,7 @@ def _address_topic(address: str) -> str:
 class FakeRpc:
     def call(self, method: str, params: list[object]):
         if method == "eth_blockNumber":
-            return hex(100)
+            return hex(112)
         if method == "eth_getBlockByNumber":
             return {"timestamp": hex(1_775_000_000)}
         if method == "eth_getLogs":
@@ -89,11 +90,12 @@ class FakeRpc:
 def setup_function() -> None:
     init_db()
     with session_scope() as session:
-        for model in (TagNextHolderHistoryRow, TagNextOnchainEventRow, TagNextWhaleEntityRow):
+        for model in (TagNextHolderHistoryRow, TagNextOnchainEventRow, TagNextWhaleEntityRow, TagNextChainCursorRow):
             session.execute(delete(model))
 
 
 def test_transfer_decoder_and_bounded_direct_worker_persist_real_event_types() -> None:
+    assert V3_SWAP_TOPIC == "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83"
     log = {
         "topics": [TRANSFER_TOPIC, _address_topic("0x" + "11" * 20), _address_topic("0x" + "22" * 20)],
         "data": "0x" + _word(5 * 10**18), "transactionHash": "0x1",
@@ -107,10 +109,21 @@ def test_transfer_decoder_and_bounded_direct_worker_persist_real_event_types() -
         "transfers": 1, "largeSwaps": 1, "lpEvents": 0,
         "holderSnapshots": 2, "completeHolderCensus": False,
         "exchangeLabels": "verified_only", "paidCalls": 0,
+        "confirmationDepth": 12, "confirmedHead": 100,
+        "cursorState": "caught_up", "rpcEndpoint": "injected_rpc",
+        "rpcEndpoints": {},
     }
     with session_scope() as session:
         assert set(session.scalars(select(TagNextOnchainEventRow.event_type))) == {"transfer", "large_swap"}
         assert all(row.verification_state == "unverified" for row in session.scalars(select(TagNextWhaleEntityRow)))
+
+
+def test_postgres_constraint_migration_replaces_the_legacy_automatic_name() -> None:
+    sql = (Path(__file__).parents[1] / "migrations" / "20260820_tagnext_onchain_event_constraint.sql").read_text(
+        encoding="utf-8"
+    ).lower()
+    assert "drop constraint if exists tagnext_onchain_events_event_type_check" in sql
+    assert "'lp_collect'" in sql
 
 
 def test_heatmap_api_hides_illustrative_bands_and_never_implies_forecast_weight() -> None:
@@ -146,7 +159,13 @@ def test_full_brain_export_has_manifest_internal_checksums_and_no_secret_files(t
     assert result["sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
     with zipfile.ZipFile(target) as archive:
         names = set(archive.namelist())
-        assert {"manifest.json", "SHA256SUMS.txt", "forecasts.csv", "external_forecasts.jsonl", "onchain_events.jsonl", "heatmaps.jsonl"} <= names
+        assert {
+            "manifest.json", "SHA256SUMS.txt", "forecasts.csv", "external_forecasts.jsonl",
+            "onchain_events.jsonl", "heatmaps.jsonl", "canonical_forecasts_full.jsonl",
+            "canonical_forecast_grades_full.jsonl", "verified_outcomes.jsonl",
+            "asset_truth_snapshots.jsonl", "portfolio_position_snapshots.jsonl",
+            "independent_regrade.py", "REGRADING.md", "regrading_contract.json",
+        } <= names
         manifest = json.loads(archive.read("manifest.json"))
         assert manifest["secretMaterialIncluded"] is False
         assert not any(name.lower().endswith(".env") for name in names)

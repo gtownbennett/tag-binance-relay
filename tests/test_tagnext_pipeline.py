@@ -81,19 +81,10 @@ def test_external_fingerprint_hashes_semantics_not_ads_layout_or_scrape_time() -
     assert external_semantic_fingerprint(first) == external_semantic_fingerprint(second)
 
 
-def test_versioned_annual_table_adapters_extract_ranges_and_exclude_calculators() -> None:
-    claims = parse_external_forecast_text(
-        source_id="table-source",
-        adapter_id="annual_min_avg_max_v1",
-        current_price=0.001,
-        text="2027 $0.0007 $0.0012 $0.0018 2028 $0.002 $0.003 $0.004",
-    )
-    assert claims[0]["targetLow"] == 0.0007
-    assert claims[0]["targetPrice"] == 0.0012
-    assert claims[0]["targetHigh"] == 0.0018
+def test_unknown_raw_text_is_not_parsed_by_the_removed_dollar_after_year_heuristic() -> None:
     assert parse_external_forecast_text(
-        source_id="calculator", adapter_id="scenario_calculator_v1",
-        text="2027 $0.01", current_price=0.001,
+        source_id="unregistered", adapter_id="annual_min_avg_max_v1",
+        text="2027 $0.0007 $0.0012 $0.0018", current_price=0.001,
     ) == []
 
 
@@ -129,6 +120,7 @@ def test_external_snapshots_are_immutable_revisions_and_consensus_is_separate() 
             "sourceId": source_id, "label": source_id,
             "canonicalUrl": f"https://example.test/{source_id}",
             "identityChain": IDENTITY_CHAIN, "popularity": {"score": score},
+            "independentFamilyId": source_id,
         })
         assert registered["accessState"] == "verified_identity"
         store_external_snapshot({
