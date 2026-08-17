@@ -95,7 +95,7 @@ def test_position_ladder_uses_required_position_and_six_exit_fractions() -> None
 
 def test_provider_registry_preserves_unavailable_state() -> None:
     bscscan = next(row for row in provider_registry() if row["provider_id"] == "bscscan")
-    assert bscscan["status"] == "unavailable"
+    assert bscscan["status"] == "waiting_for_credentials"
     assert bscscan["influences_forecast"] is False
 
 
