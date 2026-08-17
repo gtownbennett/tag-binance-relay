@@ -68,9 +68,10 @@ DEFAULT_PROVIDERS: tuple[Provider, ...] = (
     Provider("bingx", "BingX", "corroborating", "derivatives", True, "configured", True),
     Provider("geckoterminal", "GeckoTerminal", "primary-dex", "pool+liquidity", True, "configured", True),
     Provider("pancakeswap_v3", "PancakeSwap V3", "primary-dex", "pool identity", True, "configured", True),
-    Provider("bscscan", "BscScan", "on-chain", "transfers+holders", True, "unavailable", False, "No authenticated free feed configured."),
+    Provider("bnb_json_rpc", "BNB Chain JSON-RPC", "on-chain", "transfers+holders+swaps+lp-events", True, "configured_shadow", False, "Direct bounded RPC collection; observed-address holder snapshots are not a complete census."),
+    Provider("bscscan", "BscScan", "on-chain-adapter", "labels+historical lookup", True, "waiting_for_credentials", False, "Optional adapter only; no credential was requested or stored."),
     Provider("cmc", "CoinMarketCap", "reference", "supply+market", True, "configured", True),
-    Provider("external_forecasts", "External forecast sites", "discovery", "forecast claims", True, "unavailable", False, "No verified snapshots ingested."),
+    Provider("external_forecasts", "External forecast sites", "discovery", "forecast claims", True, "configured_collection_only", False, "Six identity-verified sources are snapshotted and graded separately; they never influence TAGNEXT_BASELINE."),
 )
 
 

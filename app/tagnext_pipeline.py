@@ -96,14 +96,24 @@ def seed_tagnext_registries() -> dict[str, int]:
     )
     with session_scope() as session:
         for item in provider_registry():
-            if session.get(TagNextProviderRow, item["provider_id"]) is None:
-                session.add(TagNextProviderRow(
+            provider = session.get(TagNextProviderRow, item["provider_id"])
+            if provider is None:
+                provider = TagNextProviderRow(
                     provider_id=item["provider_id"], label=item["label"], tier=item["tier"],
                     evidence_class=item["evidence_class"], free_access=item["free_access"],
                     status=item["status"], influences_forecast=item["influences_forecast"],
                     limitation=item.get("limitation"), config_json="{}",
-                ))
+                )
+                session.add(provider)
                 providers_added += 1
+            else:
+                provider.label = item["label"]
+                provider.tier = item["tier"]
+                provider.evidence_class = item["evidence_class"]
+                provider.free_access = item["free_access"]
+                provider.status = item["status"]
+                provider.influences_forecast = item["influences_forecast"]
+                provider.limitation = item.get("limitation")
         for feature_id, label, evidence_class, units in feature_definitions:
             if session.get(TagNextFeatureRegistryRow, feature_id) is None:
                 session.add(TagNextFeatureRegistryRow(
