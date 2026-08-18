@@ -27,7 +27,7 @@ HORIZON_HOURS: dict[str, int] = {
 FEATURE_SCALES: dict[str, float] = {
     "oiChange1hPct": 5.0,
     "oiChange4hPct": 15.0,
-    "fundingRate": 0.0002,
+    "fundingRateDecimal": 0.0002,
     "takerBuySellRatio": 0.50,
     "globalLongShortRatio": 0.50,
     "topPositionRatio": 0.50,
@@ -1123,7 +1123,7 @@ class PredictionLedger:
             "priceUsd": "price",
             "oiChange1hPct": "1h open interest change",
             "oiChange4hPct": "4h open interest change",
-            "fundingRate": "funding",
+            "fundingRateDecimal": "funding",
             "takerBuySellRatio": "taker buy/sell ratio",
             "basisBps": "futures basis",
             "spotPriceChange1hPct": "1h spot change",

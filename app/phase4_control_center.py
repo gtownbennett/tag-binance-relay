@@ -148,22 +148,33 @@ def _canonical_market_truth() -> dict[str, Any]:
             "evidenceSnapshotId": packet.get("snapshotId"),
             "dataAsOf": packet.get("dataAsOf"),
         }
+    if (supply.source_count or 0) < 2:
+        return {
+            "available": False,
+            "status": "UNAVAILABLE",
+            "reason": "The newest TAG supply snapshot lacks two independent source observations.",
+            "evidenceSnapshotId": packet.get("snapshotId"),
+            "supplySnapshotId": supply.snapshot_id,
+        }
     circulating = float(supply.circulating_supply)
-    fully_diluted = float(supply.fully_diluted_supply or 0) or None
+    total_supply = float(supply.total_supply or supply.fully_diluted_supply or 0) or None
     return {
         "available": True,
         "status": "VERIFIED",
         "priceUsd": price,
-        "circulatingSupplyTokens": circulating,
-        "fullyDilutedSupplyTokens": fully_diluted,
+        "verifiedCirculatingSupplyTokens": circulating,
+        "totalSupplyTokens": total_supply,
         "circulatingMarketCapUsd": price * circulating,
-        "fdvUsd": price * fully_diluted if fully_diluted is not None else None,
+        "fdvUsd": price * total_supply if total_supply is not None else None,
         "dataAsOf": packet.get("dataAsOf"),
         "evidenceSnapshotId": packet.get("snapshotId"),
         "supplySnapshotId": supply.snapshot_id,
         "priceSourceId": dex_item.get("sourceId"),
         "priceSourceName": dex_item.get("source"),
         "supplySourceName": supply.source_name,
+        "supplySourceCount": supply.source_count,
+        "supplyDiscrepancyPct": supply.discrepancy_pct,
+        "supplyConfidence": supply.confidence,
     }
 
 

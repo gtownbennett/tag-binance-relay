@@ -914,13 +914,13 @@ def _manual_chad(market: dict[str, Any], compact: dict[str, Any]) -> dict[str, A
     spot = market.get("spot") if isinstance(market.get("spot"), dict) else {}
     futures = market.get("futures") if isinstance(market.get("futures"), dict) else {}
     price = _num(spot.get("priceUsd"))
-    market_cap = _num(spot.get("marketCap"))
+    market_cap = _num(spot.get("circulatingMarketCapUsd"))
     price_1h = _num(spot.get("priceChangeH1"))
     buys = int(_num(spot.get("buysH1")) or 0)
     sells = int(_num(spot.get("sellsH1")) or 0)
     oi = _num(futures.get("openInterestUsd"))
     oi_1h = _num(futures.get("oiChange1h"))
-    funding = _num(futures.get("fundingRate"))
+    funding = _num(futures.get("fundingRatePct"))
     taker = _num(futures.get("takerBuySellRatio"))
     book = _num(futures.get("orderBookImbalancePct"))
     active = int(_num(futures.get("activeExchangeCount")) or 0)

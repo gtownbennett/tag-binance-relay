@@ -76,6 +76,7 @@ from app.terminal_database import (
     PortfolioPositionSnapshotRow,
     ServerJobRow,
     SpotSnapshotRow,
+    TagNextDataQualityQuarantineRow,
     UserMarketCapLevelVersionRow,
     VerifiedOutcomeRow,
     init_db,
@@ -93,6 +94,7 @@ def setup_module() -> None:
 def setup_function() -> None:
     with session_scope() as session:
         for model in (
+            TagNextDataQualityQuarantineRow,
             AlertOutcomeRow,
             AlertStageEventRow,
             AlertCaseRow,
@@ -180,6 +182,21 @@ def _truth(evidence_time: datetime = NOW) -> tuple[dict, dict, str]:
         "fullyDilutedSupplyTokens": 120_000_000_000.0,
         "sourceName": "verified supply fixture",
         "sourceReference": f"fixture:supply:{evidence_time.isoformat()}",
+        "sourceCount": 2,
+        "sourceObservations": [
+            {
+                "source": "fixture-primary",
+                "verifiedCirculatingSupplyTokens": 108_000_000_000.0,
+                "observedAt": evidence_time.isoformat(),
+                "url": "fixture:supply:primary",
+            },
+            {
+                "source": "fixture-independent",
+                "verifiedCirculatingSupplyTokens": 108_000_000_000.0,
+                "observedAt": evidence_time.isoformat(),
+                "url": "fixture:supply:independent",
+            },
+        ],
         "verificationStatus": "verified",
         "verifiedAt": evidence_time.isoformat(),
     }
@@ -285,6 +302,32 @@ def test_exact_deadline_grading_has_all_metrics_and_penalizes_width() -> None:
     assert wide_grade["metrics"]["weightedIntervalScore"] > narrow_grade["metrics"]["weightedIntervalScore"]
     assert wide_grade["metrics"]["compositeScore"] < narrow_grade["metrics"]["compositeScore"]
     assert narrow_grade["gradeLabel"] == "STILL LEARNING"
+
+
+def test_ambiguous_funding_forecast_is_preserved_but_cannot_be_graded() -> None:
+    forecast = _forecast(point=0.0011)
+    persist_canonical_forecast(forecast)
+    with session_scope() as session:
+        session.add(TagNextDataQualityQuarantineRow(
+            quarantine_id="test-ambiguous-funding-forecast",
+            entity_type="canonical_forecast",
+            entity_id=forecast["forecastId"],
+            reason_code="INVALID_DATA_QUALITY_AMBIGUOUS_FUNDING_UNIT",
+            detected_at=NOW,
+            original_payload_json="{}",
+            excluded_domains_json='["grading","learning","alerts","comparison"]',
+            evidence_json='{"legacyFundingRate":0.005}',
+            payload_hash="c" * 64,
+        ))
+    outcome_id = _outcome(
+        datetime.fromisoformat(forecast["deadline"]),
+        suffix="ambiguous-funding",
+    )
+    with pytest.raises(Phase3ValidationError, match="invalid data quality quarantine"):
+        grade_canonical_forecast(forecast["forecastId"], outcome_id)
+    with session_scope() as session:
+        assert session.scalar(select(func.count()).select_from(CanonicalForecastRow)) == 1
+        assert session.scalar(select(func.count()).select_from(CanonicalForecastGradeRow)) == 0
 
 
 def test_producer_live_backtest_baseline_and_overlap_samples_stay_separate() -> None:
@@ -1070,6 +1113,21 @@ def test_phase4_control_center_market_truth_uses_verified_supply_not_provider_fd
         "fullyDilutedSupplyTokens": 405_380_800_000.0,
         "sourceName": "verified supply fixture",
         "sourceReference": "fixture:supply:control-center",
+        "sourceCount": 2,
+        "sourceObservations": [
+            {
+                "source": "fixture-primary",
+                "verifiedCirculatingSupplyTokens": 108_000_000_000.0,
+                "observedAt": NOW.isoformat(),
+                "url": "fixture:supply:control-center:primary",
+            },
+            {
+                "source": "fixture-independent",
+                "verifiedCirculatingSupplyTokens": 108_000_000_000.0,
+                "observedAt": NOW.isoformat(),
+                "url": "fixture:supply:control-center:independent",
+            },
+        ],
         "verificationStatus": "verified",
         "verifiedAt": NOW.isoformat(),
     }
@@ -1079,7 +1137,8 @@ def test_phase4_control_center_market_truth_uses_verified_supply_not_provider_fd
 
     assert truth["available"] is True
     assert truth["priceUsd"] == pytest.approx(0.001)
-    assert truth["circulatingSupplyTokens"] == supply["circulatingSupplyTokens"]
+    assert truth["verifiedCirculatingSupplyTokens"] == supply["circulatingSupplyTokens"]
+    assert truth["totalSupplyTokens"] == supply["fullyDilutedSupplyTokens"]
     assert truth["circulatingMarketCapUsd"] == pytest.approx(108_000_000.0)
     assert truth["fdvUsd"] == pytest.approx(405_380_800.0)
     assert truth["circulatingMarketCapUsd"] != truth["fdvUsd"]

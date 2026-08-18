@@ -228,6 +228,21 @@ def _persist_forecast_inputs() -> tuple[dict, str]:
         "fullyDilutedSupplyTokens": 410_000_000_000.0,
         "sourceName": "verified fixture",
         "sourceReference": "fixture:supply",
+        "sourceCount": 2,
+        "sourceObservations": [
+            {
+                "source": "fixture-primary",
+                "verifiedCirculatingSupplyTokens": 110_000_000_000.0,
+                "observedAt": NOW.isoformat(),
+                "url": "fixture:supply:primary",
+            },
+            {
+                "source": "fixture-independent",
+                "verifiedCirculatingSupplyTokens": 110_000_000_000.0,
+                "observedAt": NOW.isoformat(),
+                "url": "fixture:supply:independent",
+            },
+        ],
         "verificationStatus": "verified",
         "verifiedAt": NOW.isoformat(),
     }

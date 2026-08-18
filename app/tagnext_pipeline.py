@@ -45,6 +45,7 @@ from .terminal_database import (
     TagNextChampionImportRow,
     TagNextDiscoveryCandidateRow,
     TagNextExternalMetadataRevisionRow,
+    TagNextExternalOutcomeCaptureCursorRow,
     TagNextExternalOutcomeScheduleRow,
     TagNextExternalGradeRow,
     TagNextExternalRevisionRow,
@@ -53,6 +54,8 @@ from .terminal_database import (
     TagNextFeaturePromotionRow,
     TagNextFeatureRegistryRow,
     TagNextFeatureSnapshotRow,
+    TagNextForecastSemanticIdentityRow,
+    TagNextForecastClassificationCorrectionRow,
     TagNextForecastFeatureLinkRow,
     TagNextMarketObservationRow,
     TagNextModelRegistryRow,
@@ -73,6 +76,7 @@ PARSER_VERSION = "tagnext-semantic-parser-v1"
 CONSENSUS_VERSION = "tagnext-consensus-v2"
 EXTERNAL_GRADER_VERSION = "tagnext-external-semantic-v2"
 OUTCOME_ALIGNMENT_TOLERANCE_SECONDS = 60
+EXTERNAL_OUTCOME_CAPTURE_JOB = "capture_tagnext_external_outcomes"
 TAGGER_CG_ID = "tagger"
 TAGGER_CMC_ID = 34958
 CONSENSUS_ELIGIBLE_CLAIM_CLASSES = {
@@ -722,12 +726,228 @@ def record_external_metadata_correction(
         }
 
 
+def record_external_classification_correction(
+    *,
+    snapshot_id: str,
+    corrected_classification: str,
+    reason: str,
+    corrected_at: datetime | str | None = None,
+    evidence_package_id: str | None = None,
+) -> dict[str, Any]:
+    corrected = corrected_classification.strip().upper()
+    if corrected not in {"LIVE_OBSERVED", "HISTORICAL_DISCOVERED"}:
+        raise ValueError("corrected classification must be LIVE_OBSERVED or HISTORICAL_DISCOVERED")
+    corrected_time = _time(corrected_at)
+    with session_scope() as session:
+        snapshot = session.get(TagNextExternalSnapshotRow, snapshot_id)
+        if snapshot is None:
+            raise ValueError("snapshot does not exist")
+        previous = "LIVE_OBSERVED" if _effective_observed_live(session, snapshot) else "HISTORICAL_DISCOVERED"
+        payload = {
+            "snapshotId": snapshot_id,
+            "previousClassification": previous,
+            "correctedClassification": corrected,
+            "reason": reason,
+            "evidencePackageId": evidence_package_id,
+        }
+        payload_hash = _hash(payload)
+        existing = session.scalar(select(TagNextForecastClassificationCorrectionRow).where(
+            TagNextForecastClassificationCorrectionRow.payload_hash == payload_hash
+        ))
+        if existing is not None:
+            return {"stored": False, "correctionId": existing.correction_id}
+        row = TagNextForecastClassificationCorrectionRow(
+            correction_id=_id("tnfcc", payload),
+            snapshot_id=snapshot_id,
+            previous_classification=previous,
+            corrected_classification=corrected,
+            reason=reason,
+            evidence_package_id=evidence_package_id,
+            corrected_at=corrected_time,
+            payload_hash=payload_hash,
+        )
+        session.add(row)
+        return {"stored": True, "correctionId": row.correction_id}
+
+
 def _effective_observed_live(session: Any, snapshot: TagNextExternalSnapshotRow) -> bool:
+    classification = session.scalar(select(TagNextForecastClassificationCorrectionRow).where(
+        TagNextForecastClassificationCorrectionRow.snapshot_id == snapshot.snapshot_id
+    ).order_by(TagNextForecastClassificationCorrectionRow.corrected_at.desc()).limit(1))
+    if classification is not None:
+        return classification.corrected_classification == "LIVE_OBSERVED"
     latest = session.scalar(select(TagNextExternalMetadataRevisionRow).where(
         TagNextExternalMetadataRevisionRow.snapshot_id == snapshot.snapshot_id,
         TagNextExternalMetadataRevisionRow.field_name == "observed_live",
     ).order_by(TagNextExternalMetadataRevisionRow.corrected_at.desc()).limit(1))
     return bool(json.loads(latest.corrected_value_json)) if latest is not None else bool(snapshot.observed_live)
+
+
+def resolved_external_observation_classification(
+    session: Any, snapshot: TagNextExternalSnapshotRow,
+) -> dict[str, Any]:
+    correction = session.scalar(select(TagNextForecastClassificationCorrectionRow).where(
+        TagNextForecastClassificationCorrectionRow.snapshot_id == snapshot.snapshot_id
+    ).order_by(TagNextForecastClassificationCorrectionRow.corrected_at.desc()).limit(1))
+    observed_live = _effective_observed_live(session, snapshot)
+    classification = "LIVE_OBSERVED" if observed_live else "HISTORICAL_DISCOVERED"
+    return {
+        "effectiveClassification": classification,
+        "originalSourceIssueAt": _time(snapshot.source_issue_at).isoformat() if snapshot.source_issue_at else None,
+        "tagnextFirstSeenAt": _time(snapshot.captured_at).isoformat(),
+        "observedLive": observed_live,
+        "historicalDiscovered": not observed_live,
+        "evidenceConfidence": (
+            "HIGH" if correction and correction.evidence_package_id
+            else "MEDIUM" if correction or snapshot.source_issue_at
+            else "LOW"
+        ),
+        "classificationReason": (
+            correction.reason if correction is not None
+            else "Source evidence was first observed before its outcome deadline."
+            if observed_live
+            else "Source was discovered retrospectively and is excluded from live statistics."
+        ),
+        "correctionId": correction.correction_id if correction else None,
+    }
+
+
+def reconcile_external_observation_classifications() -> dict[str, Any]:
+    """Append corrections for rows first seen only after their forecast outcome."""
+
+    corrected = already_resolved = 0
+    with session_scope() as session:
+        snapshots = list(session.scalars(select(TagNextExternalSnapshotRow)))
+        candidates = [
+            row.snapshot_id for row in snapshots
+            if row.deadline is not None
+            and _time(row.captured_at) > _time(row.deadline)
+            and _effective_observed_live(session, row)
+        ]
+    for snapshot_id in candidates:
+        result = record_external_classification_correction(
+            snapshot_id=snapshot_id,
+            corrected_classification="HISTORICAL_DISCOVERED",
+            reason="TAGneXt first saw this forecast after its outcome deadline; immutable source evidence is preserved.",
+        )
+        if result["stored"]:
+            corrected += 1
+        else:
+            already_resolved += 1
+    return {"corrected": corrected, "alreadyResolved": already_resolved, "examined": len(candidates)}
+
+
+def _ensure_semantic_identity(
+    session: Any,
+    *,
+    snapshot: TagNextExternalSnapshotRow,
+    semantic_hash: str,
+    evidence_metadata_hash: str,
+    status: str = "active",
+    superseded_by_snapshot_id: str | None = None,
+    duplicate_schedules_cancelled: int = 0,
+) -> TagNextForecastSemanticIdentityRow:
+    existing = session.scalar(select(TagNextForecastSemanticIdentityRow).where(
+        TagNextForecastSemanticIdentityRow.snapshot_id == snapshot.snapshot_id
+    ))
+    if existing is not None:
+        return existing
+    payload = {
+        "snapshotId": snapshot.snapshot_id,
+        "sourceId": snapshot.source_id,
+        "forecastSemanticHash": semantic_hash,
+        "evidenceMetadataHash": evidence_metadata_hash,
+        "semanticStatus": status,
+        "supersededBySnapshotId": superseded_by_snapshot_id,
+        "duplicateSchedulesCancelled": duplicate_schedules_cancelled,
+    }
+    row = TagNextForecastSemanticIdentityRow(
+        identity_id=_id("tnfsi", payload),
+        snapshot_id=snapshot.snapshot_id,
+        source_id=snapshot.source_id,
+        forecast_semantic_hash=semantic_hash,
+        evidence_metadata_hash=evidence_metadata_hash,
+        semantic_status=status,
+        superseded_by_snapshot_id=superseded_by_snapshot_id,
+        duplicate_schedules_cancelled=duplicate_schedules_cancelled,
+        payload_hash=_hash(payload),
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def _semantic_snapshot_is_active(session: Any, snapshot_id: str) -> bool:
+    identity = session.scalar(select(TagNextForecastSemanticIdentityRow).where(
+        TagNextForecastSemanticIdentityRow.snapshot_id == snapshot_id
+    ))
+    return identity is None or identity.semantic_status == "active"
+
+
+def reconcile_external_semantic_duplicates() -> dict[str, Any]:
+    """Map every immutable snapshot to one semantic identity and quarantine duplicates."""
+
+    canonical_count = superseded_count = cancelled_count = 0
+    with session_scope() as session:
+        snapshots = list(session.scalars(select(TagNextExternalSnapshotRow).order_by(
+            TagNextExternalSnapshotRow.captured_at.asc(),
+            TagNextExternalSnapshotRow.snapshot_id.asc(),
+        )))
+        groups: dict[tuple[str, str], list[tuple[TagNextExternalSnapshotRow, str]]] = {}
+        for snapshot in snapshots:
+            semantics = json.loads(snapshot.semantics_json or "{}")
+            semantic_hash = external_semantic_fingerprint({
+                **semantics,
+                "sourceId": snapshot.source_id,
+                "horizon": snapshot.horizon,
+                "deadline": snapshot.deadline,
+                "periodStart": snapshot.period_start,
+                "periodEnd": snapshot.period_end,
+                "targetPrice": snapshot.target_price,
+                "targetLow": snapshot.target_low,
+                "targetHigh": snapshot.target_high,
+                "direction": snapshot.direction,
+                "probability": snapshot.probability,
+                "scenarioClass": snapshot.scenario_class,
+            })
+            groups.setdefault((snapshot.source_id, semantic_hash), []).append((snapshot, semantic_hash))
+
+        for grouped in groups.values():
+            canonical = grouped[0][0]
+            for index, (snapshot, semantic_hash) in enumerate(grouped):
+                schedule_rows = list(session.scalars(select(TagNextExternalOutcomeScheduleRow).where(
+                    TagNextExternalOutcomeScheduleRow.snapshot_id == snapshot.snapshot_id
+                )))
+                cancelled = 0
+                if index > 0:
+                    for schedule in schedule_rows:
+                        if schedule.status not in {"complete", "superseded_duplicate_cancelled"}:
+                            schedule.status = "superseded_duplicate_cancelled"
+                            schedule.last_error = "SUPERSEDED_DUPLICATE: canonical semantic snapshot already scheduled"
+                            schedule.updated_at = utc_now()
+                            cancelled += 1
+                    superseded_count += 1
+                    cancelled_count += cancelled
+                else:
+                    canonical_count += 1
+                provenance = json.loads(snapshot.provenance_json or "{}")
+                metadata_hash = str(provenance.get("evidenceMetadataHash") or _hash(provenance))
+                identity = _ensure_semantic_identity(
+                    session,
+                    snapshot=snapshot,
+                    semantic_hash=semantic_hash,
+                    evidence_metadata_hash=metadata_hash,
+                    status="active" if index == 0 else "SUPERSEDED_DUPLICATE",
+                    superseded_by_snapshot_id=None if index == 0 else canonical.snapshot_id,
+                    duplicate_schedules_cancelled=cancelled,
+                )
+                for schedule in schedule_rows:
+                    schedule.semantic_identity_id = identity.identity_id
+    return {
+        "canonicalSemanticSnapshots": canonical_count,
+        "supersededDuplicates": superseded_count,
+        "duplicateSchedulesCancelled": cancelled_count,
+    }
 
 
 def parse_external_forecast_text(
@@ -779,6 +999,12 @@ def store_external_snapshot(
             TagNextExternalSnapshotRow.payload_hash == payload_hash,
         ))
         if existing is not None:
+            identity = _ensure_semantic_identity(
+                session,
+                snapshot=existing,
+                semantic_hash=payload_hash,
+                evidence_metadata_hash=evidence_metadata_hash,
+            )
             incoming_metadata = {
                 "source_issue_at": semantics["sourceIssueAt"],
                 "source_update_at": semantics["sourceUpdateAt"],
@@ -795,11 +1021,29 @@ def store_external_snapshot(
                         reason="Repeated fetch preserved forecast meaning but clarified evidence metadata.",
                         corrected_at=captured,
                     )
+            existing_provenance = json.loads(existing.provenance_json or "{}")
+            for field_name, previous_value, corrected_value in (
+                ("forecast_family_id", existing.forecast_family_id, semantics["forecastFamilyId"]),
+                ("independent_family_id", existing.independent_family_id, semantics["independentFamilyId"]),
+                ("evidence_url", existing_provenance.get("evidenceUrl"), (provenance or {}).get("evidenceUrl")),
+                ("parser_version", existing_provenance.get("parserVersion"), (provenance or {}).get("parserVersion")),
+            ):
+                if corrected_value is not None and previous_value != corrected_value:
+                    _append_metadata_correction(
+                        session,
+                        snapshot=existing,
+                        field_name=field_name,
+                        previous_value=previous_value,
+                        corrected_value=corrected_value,
+                        reason="Metadata/provenance changed without forecast meaning changing.",
+                        corrected_at=captured,
+                    )
             return {
                 "stored": False, "snapshotId": existing.snapshot_id,
                 "payloadHash": payload_hash,
                 "forecastSemanticHash": payload_hash,
                 "evidenceMetadataHash": evidence_metadata_hash,
+                "semanticIdentityId": identity.identity_id,
             }
         previous = session.scalar(select(TagNextExternalSnapshotRow).where(
             TagNextExternalSnapshotRow.source_id == source_id,
@@ -810,7 +1054,7 @@ def store_external_snapshot(
         deadline = _time(semantics["deadline"]) if semantics["deadline"] else None
         source_as_of_value = payload.get("sourceAsOf")
         source_as_of = _time(source_as_of_value) if source_as_of_value else None
-        session.add(TagNextExternalSnapshotRow(
+        snapshot_row = TagNextExternalSnapshotRow(
             snapshot_id=snapshot_id, source_id=source_id, asset_contract=TAG_CONTRACT,
             captured_at=captured, source_as_of=source_as_of, deadline=deadline,
             horizon=semantics["horizon"] or None, direction=semantics["direction"],
@@ -845,10 +1089,17 @@ def store_external_snapshot(
             }),
             independent_family_id=semantics["independentFamilyId"] or source.independent_family_id,
             gradeability=semantics["gradeability"], observed_live=semantics["observedLive"],
-        ))
+        )
+        session.add(snapshot_row)
         # The schedule FK is inserted in the same transaction; an explicit
         # flush guarantees PostgreSQL sees its immutable parent first.
         session.flush()
+        identity = _ensure_semantic_identity(
+            session,
+            snapshot=snapshot_row,
+            semantic_hash=payload_hash,
+            evidence_metadata_hash=evidence_metadata_hash,
+        )
         is_period_semantics = (
             semantics["targetSemantics"].startswith("period_")
             or semantics["targetSemantics"] == "range_for_period"
@@ -868,7 +1119,7 @@ def store_external_snapshot(
                 capture_count=0, config_json=json_dumps({
                     "captureMode": "period_aggregate" if semantics["targetSemantics"].startswith("period_") else "exact_deadline",
                     "outcomeAsset": "TAGGER", "assetContract": TAG_CONTRACT,
-                }),
+                }), semantic_identity_id=identity.identity_id,
             ))
         revision_id = None
         if previous is not None:
@@ -932,6 +1183,7 @@ def store_external_snapshot(
         "stored": True, "snapshotId": snapshot_id, "payloadHash": payload_hash,
         "forecastSemanticHash": payload_hash,
         "evidenceMetadataHash": evidence_metadata_hash,
+        "semanticIdentityId": identity.identity_id,
         "revisionId": revision_id, "semantics": semantics,
     }
 
@@ -1095,6 +1347,67 @@ def _aligned_outcome(
     return selected, int((_time(selected.observed_at) - deadline).total_seconds())
 
 
+def _update_outcome_capture_cursor(
+    *,
+    attempted_at: datetime,
+    success: bool,
+    schedule_ids: Sequence[str],
+    due_at: datetime | None,
+    metrics: Mapping[str, Any],
+    provider_failures: Sequence[str] = (),
+) -> None:
+    with session_scope() as session:
+        cursor = session.scalar(select(TagNextExternalOutcomeCaptureCursorRow).where(
+            TagNextExternalOutcomeCaptureCursorRow.job_name == EXTERNAL_OUTCOME_CAPTURE_JOB
+        ))
+        if cursor is None:
+            cursor = TagNextExternalOutcomeCaptureCursorRow(
+                cursor_id=_id("tneocc", {"jobName": EXTERNAL_OUTCOME_CAPTURE_JOB}),
+                job_name=EXTERNAL_OUTCOME_CAPTURE_JOB,
+            )
+            session.add(cursor)
+        cursor.last_attempt_at = attempted_at
+        cursor.last_schedule_id = schedule_ids[-1] if schedule_ids else cursor.last_schedule_id
+        cursor.last_due_at = due_at or cursor.last_due_at
+        cursor.metrics_json = json_dumps(dict(metrics))
+        cursor.fallback_state_json = json_dumps({
+            "providerFailures": list(provider_failures),
+            "policy": "CoinGecko, then DEX Screener exact server observation; verified candle injection supported",
+        })
+        if success:
+            cursor.last_success_at = attempted_at
+            cursor.retry_count = 0
+            cursor.health_state = "HEALTHY"
+        else:
+            cursor.retry_count = int(cursor.retry_count or 0) + 1
+            cursor.health_state = "DEGRADED_RETRY_PENDING"
+        cursor.updated_at = attempted_at
+
+
+def external_outcome_capture_health() -> dict[str, Any]:
+    with session_scope() as session:
+        cursor = session.scalar(select(TagNextExternalOutcomeCaptureCursorRow).where(
+            TagNextExternalOutcomeCaptureCursorRow.job_name == EXTERNAL_OUTCOME_CAPTURE_JOB
+        ))
+        status_rows = session.execute(select(
+            TagNextExternalOutcomeScheduleRow.status,
+            func.count(TagNextExternalOutcomeScheduleRow.schedule_id),
+        ).group_by(TagNextExternalOutcomeScheduleRow.status)).all()
+    return {
+        "jobName": EXTERNAL_OUTCOME_CAPTURE_JOB,
+        "healthState": cursor.health_state if cursor else "INITIALIZING",
+        "lastAttemptAt": _time(cursor.last_attempt_at).isoformat() if cursor and cursor.last_attempt_at else None,
+        "lastSuccessAt": _time(cursor.last_success_at).isoformat() if cursor and cursor.last_success_at else None,
+        "lastScheduleId": cursor.last_schedule_id if cursor else None,
+        "retryCount": int(cursor.retry_count or 0) if cursor else 0,
+        "missedRanges": json.loads(cursor.missed_ranges_json or "[]") if cursor else [],
+        "fallbackState": json.loads(cursor.fallback_state_json or "{}") if cursor else {},
+        "metrics": json.loads(cursor.metrics_json or "{}") if cursor else {},
+        "scheduleStatusCounts": {str(status): int(count) for status, count in status_rows},
+        "durableCursor": cursor is not None,
+    }
+
+
 def capture_due_external_outcomes(
     *, now: datetime | str | None = None,
     price_observation: Mapping[str, Any] | None = None,
@@ -1109,36 +1422,91 @@ def capture_due_external_outcomes(
     current = _time(now)
     with session_scope() as session:
         due = list(session.scalars(select(TagNextExternalOutcomeScheduleRow).where(
-            TagNextExternalOutcomeScheduleRow.status.in_(("scheduled", "capturing")),
+            TagNextExternalOutcomeScheduleRow.status.in_(("scheduled", "capturing", "retry_pending")),
             TagNextExternalOutcomeScheduleRow.next_capture_at <= current,
         ).order_by(TagNextExternalOutcomeScheduleRow.next_capture_at.asc())))
         schedule_ids = [row.schedule_id for row in due]
     if not schedule_ids:
-        return {"due": 0, "captured": 0, "completed": 0, "missedExact": 0}
+        result = {"due": 0, "captured": 0, "completed": 0, "missedExact": 0, "retryPending": 0}
+        _update_outcome_capture_cursor(
+            attempted_at=current, success=True, schedule_ids=(), due_at=None, metrics=result
+        )
+        return result
 
     observation = dict(price_observation or {})
+    provider_failures: list[str] = []
     if not observation:
-        endpoint = "https://api.coingecko.com/api/v3/simple/price"
-        response = httpx.get(
-            endpoint,
-            params={"ids": "tagger", "vs_currencies": "usd", "include_last_updated_at": "true"},
-            timeout=timeout_seconds,
-            headers={"User-Agent": "TAGneXt-outcome-capture/2.0"},
-        )
-        response.raise_for_status()
-        payload = response.json().get("tagger") or {}
-        provider_timestamp = payload.get("last_updated_at")
-        observation = {
-            "priceUsd": payload.get("usd"),
-            "observedAt": (
-                datetime.fromtimestamp(int(provider_timestamp), tz=timezone.utc).isoformat()
-                if provider_timestamp else current.isoformat()
-            ),
-            "retrievedAt": current.isoformat(),
-            "sourceName": "CoinGecko public simple price",
-            "sourceReference": str(response.url),
-            "raw": payload,
-        }
+        try:
+            endpoint = "https://api.coingecko.com/api/v3/simple/price"
+            response = httpx.get(
+                endpoint,
+                params={"ids": "tagger", "vs_currencies": "usd", "include_last_updated_at": "true"},
+                timeout=timeout_seconds,
+                headers={"User-Agent": "TAGneXt-outcome-capture/3.0"},
+            )
+            response.raise_for_status()
+            payload = response.json().get("tagger") or {}
+            if _positive_value(payload.get("usd")) is None:
+                raise ValueError("CoinGecko returned no positive TAGGER price")
+            observation = {
+                "priceUsd": payload.get("usd"),
+                "observedAt": current.isoformat(),
+                "providerReportedAt": (
+                    datetime.fromtimestamp(int(payload["last_updated_at"]), tz=timezone.utc).isoformat()
+                    if payload.get("last_updated_at") else None
+                ),
+                "retrievedAt": current.isoformat(),
+                "sourceName": "CoinGecko public simple price",
+                "sourceReference": str(response.url),
+                "raw": payload,
+            }
+        except Exception as exc:
+            provider_failures.append(f"CoinGecko: {type(exc).__name__}: {exc}")
+            try:
+                endpoint = f"https://api.dexscreener.com/latest/dex/tokens/{TAG_CONTRACT}"
+                response = httpx.get(
+                    endpoint,
+                    timeout=timeout_seconds,
+                    headers={"User-Agent": "TAGneXt-outcome-capture/3.0"},
+                )
+                response.raise_for_status()
+                pairs = response.json().get("pairs") or []
+                pair = next((row for row in pairs if _positive_value(row.get("priceUsd")) is not None), None)
+                if pair is None:
+                    raise ValueError("DEX Screener returned no positive TAG price")
+                observation = {
+                    "priceUsd": pair.get("priceUsd"),
+                    "observedAt": current.isoformat(),
+                    "retrievedAt": current.isoformat(),
+                    "sourceName": "DEX Screener exact server observation fallback",
+                    "sourceReference": str(pair.get("url") or response.url),
+                    "raw": pair,
+                }
+            except Exception as fallback_exc:
+                provider_failures.append(f"DEX Screener: {type(fallback_exc).__name__}: {fallback_exc}")
+                retry_at = current + timedelta(minutes=5)
+                with session_scope() as session:
+                    for schedule_id in schedule_ids:
+                        schedule = session.get(TagNextExternalOutcomeScheduleRow, schedule_id)
+                        if schedule is None:
+                            continue
+                        schedule.status = "retry_pending"
+                        schedule.retry_count = int(schedule.retry_count or 0) + 1
+                        schedule.next_retry_at = retry_at
+                        schedule.next_capture_at = retry_at
+                        schedule.last_error = "; ".join(provider_failures)[:2000]
+                        schedule.updated_at = current
+                result = {
+                    "due": len(schedule_ids), "captured": 0, "completed": 0,
+                    "missedExact": 0, "retryPending": len(schedule_ids),
+                    "providerFailures": provider_failures,
+                }
+                _update_outcome_capture_cursor(
+                    attempted_at=current, success=False, schedule_ids=schedule_ids,
+                    due_at=due[0].next_capture_at if due else None,
+                    metrics=result, provider_failures=provider_failures,
+                )
+                return result
     candle_result = None
     if observation.get("periodStart") and observation.get("periodEnd"):
         candle_result = record_market_candle(observation)
@@ -1157,11 +1525,12 @@ def capture_due_external_outcomes(
         "priceUsd": price, "sourceName": source_name,
         "sourceReference": source_reference,
         "marketObservationId": candle_result["observationId"] if candle_result else None,
-        "deadlineSelectionPolicy": "exact_then_nearest_verified_within_60s_v1",
+        "providerReportedAt": observation.get("providerReportedAt"),
+        "deadlineSelectionPolicy": "exact_server_observation_or_verified_candle_then_nearest_within_60s_v2",
     }
     outcome_hash = _hash(outcome_payload)
     outcome_id = _id("outcome", outcome_payload)
-    captured = completed = missed = 0
+    captured = completed = missed = retry_pending = 0
     with session_scope() as session:
         schedules = [
             row for schedule_id in schedule_ids
@@ -1205,8 +1574,20 @@ def capture_due_external_outcomes(
                     schedule.last_capture_at = observed_at
                     completed += 1
                 elif schedule.deadline and current > _time(schedule.deadline) + timedelta(seconds=60):
-                    schedule.status = "missed_exact_capture"
+                    schedule.retry_count = int(schedule.retry_count or 0) + 1
                     schedule.last_capture_at = observed_at
+                    schedule.last_error = (
+                        "No exact or verified nearest observation within 60 seconds; "
+                        "retry/fallback required and the late quote was not backdated."
+                    )
+                    if schedule.retry_count <= 5:
+                        delay_minutes = min(60, 5 * (2 ** (schedule.retry_count - 1)))
+                        schedule.status = "retry_pending"
+                        schedule.next_retry_at = current + timedelta(minutes=delay_minutes)
+                        schedule.next_capture_at = schedule.next_retry_at
+                        retry_pending += 1
+                    else:
+                        schedule.status = "missed_deadline"
                     missed += 1
                 else:
                     schedule.status = "capturing"
@@ -1226,12 +1607,27 @@ def capture_due_external_outcomes(
                     ).order_by(VerifiedOutcomeRow.observed_at.asc())))
                     if observations:
                         prices = [float(row.price_usd) for row in observations]
+                        candles = list(session.scalars(select(TagNextMarketObservationRow).where(
+                            TagNextMarketObservationRow.verification_status == "verified",
+                            TagNextMarketObservationRow.period_end >= period_start,
+                            TagNextMarketObservationRow.period_start <= period_end,
+                        )))
+                        minimum_candidates = [
+                            *prices,
+                            *(float(row.low_price) for row in candles if row.low_price is not None),
+                        ]
+                        maximum_candidates = [
+                            *prices,
+                            *(float(row.high_price) for row in candles if row.high_price is not None),
+                        ]
+                        period_minimum = min(minimum_candidates)
+                        period_maximum = max(maximum_candidates)
                         aggregate_payload = {
                             "snapshotId": schedule.snapshot_id,
                             "periodStart": period_start.isoformat(),
                             "periodEnd": period_end.isoformat(),
                             "observationIds": [row.outcome_id for row in observations],
-                            "minimumPrice": min(prices), "maximumPrice": max(prices),
+                            "minimumPrice": period_minimum, "maximumPrice": period_maximum,
                             "averagePrice": statistics.fmean(prices), "endPrice": prices[-1],
                         }
                         aggregate_hash = _hash(aggregate_payload)
@@ -1242,11 +1638,14 @@ def capture_due_external_outcomes(
                                 period_outcome_id=_id("tnpo", aggregate_payload),
                                 snapshot_id=schedule.snapshot_id,
                                 period_start=period_start, period_end=period_end,
-                                observation_count=len(prices), minimum_price=_decimal_value(min(prices)),
-                                maximum_price=_decimal_value(max(prices)),
+                                observation_count=len(prices), minimum_price=_decimal_value(period_minimum),
+                                maximum_price=_decimal_value(period_maximum),
                                 average_price=_decimal_value(statistics.fmean(prices)),
                                 end_price=_decimal_value(prices[-1]),
-                                source_ids_json=json_dumps(sorted({row.source_name for row in observations})),
+                                source_ids_json=json_dumps(sorted({
+                                    *(row.source_name for row in observations),
+                                    *(row.provider_id for row in candles),
+                                })),
                                 payload_hash=aggregate_hash,
                             ))
                         schedule.status = "complete"
@@ -1257,11 +1656,22 @@ def capture_due_external_outcomes(
                     schedule.status = "capturing"
                     schedule.next_capture_at = min(current + timedelta(hours=1), period_end)
             schedule.updated_at = current
-    return {
+    result = {
         "due": len(schedule_ids), "captured": captured,
         "completed": completed, "missedExact": missed,
+        "retryPending": retry_pending,
         "providerObservedAt": observed_at.isoformat(), "outcomeId": outcome_id,
+        "providerFailures": provider_failures,
     }
+    _update_outcome_capture_cursor(
+        attempted_at=current,
+        success=True,
+        schedule_ids=schedule_ids,
+        due_at=due[0].next_capture_at if due else None,
+        metrics=result,
+        provider_failures=provider_failures,
+    )
+    return result
 
 
 def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[str, Any]:
@@ -1274,6 +1684,11 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
             TagNextExternalSnapshotRow.deadline <= current,
         )))
         for snapshot in due:
+            semantic_identity = session.scalar(select(TagNextForecastSemanticIdentityRow).where(
+                TagNextForecastSemanticIdentityRow.snapshot_id == snapshot.snapshot_id
+            ))
+            if semantic_identity is not None and semantic_identity.semantic_status == "SUPERSEDED_DUPLICATE":
+                continue
             existing = session.scalar(select(TagNextExternalGradeRow).where(
                 TagNextExternalGradeRow.snapshot_id == snapshot.snapshot_id,
                 TagNextExternalGradeRow.grader_version == EXTERNAL_GRADER_VERSION,
@@ -1307,14 +1722,14 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                 outcome_source = outcome.source_name if outcome else None
             if actual is None:
                 disposition = (
-                    "period_outcome_unavailable" if target_semantics.startswith("period_")
+                    "period_outcome_unavailable" if target_semantics.startswith("period_") or target_semantics == "range_for_period"
                     else "exact_deadline_outcome_unavailable"
                 )
                 direction_correct = absolute_error = None
                 metrics: dict[str, Any] = {
                     "targetSemantics": target_semantics,
-                    "requiredOutcome": "period_aggregate" if target_semantics.startswith("period_") else "exact_deadline",
-                    "outcomeAlignmentPolicy": "exact_then_nearest_verified_within_60s_v1",
+                    "requiredOutcome": "period_aggregate" if target_semantics.startswith("period_") or target_semantics == "range_for_period" else "exact_deadline",
+                    "outcomeAlignmentPolicy": "exact_server_observation_or_verified_candle_then_nearest_within_60s_v2",
                 }
                 unavailable += 1
             else:
@@ -1339,17 +1754,38 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                     snapshot.direction == actual_direction
                     if snapshot.direction in {"HIGHER", "LOWER"} and actual_direction else None
                 )
-                range_coverage = low <= actual_value <= high if low is not None and high is not None else None
+                actual_period_minimum = (
+                    float(period_outcome.minimum_price)
+                    if period_outcome is not None and period_outcome.minimum_price is not None else None
+                )
+                actual_period_maximum = (
+                    float(period_outcome.maximum_price)
+                    if period_outcome is not None and period_outcome.maximum_price is not None else None
+                )
+                range_coverage = (
+                    low <= actual_period_minimum and actual_period_maximum <= high
+                    if target_semantics == "range_for_period"
+                    and low is not None and high is not None
+                    and actual_period_minimum is not None and actual_period_maximum is not None
+                    else low <= actual_value <= high if low is not None and high is not None else None
+                )
                 width = high - low if low is not None and high is not None else None
                 width_penalty = width / actual_value if width is not None and actual_value > 0 else None
                 interval_score = None
                 if low is not None and high is not None:
                     alpha = 0.2
                     interval_score = width
-                    if actual_value < low:
-                        interval_score += (2.0 / alpha) * (low - actual_value)
-                    elif actual_value > high:
-                        interval_score += (2.0 / alpha) * (actual_value - high)
+                    evaluation_values = (
+                        [actual_period_minimum, actual_period_maximum]
+                        if target_semantics == "range_for_period"
+                        and actual_period_minimum is not None and actual_period_maximum is not None
+                        else [actual_value]
+                    )
+                    for evaluation_value in evaluation_values:
+                        if evaluation_value < low:
+                            interval_score += (2.0 / alpha) * (low - evaluation_value)
+                        elif evaluation_value > high:
+                            interval_score += (2.0 / alpha) * (evaluation_value - high)
                 probability = float(snapshot.probability) if snapshot.probability is not None else None
                 binary_outcome = 1.0 if actual_direction == "HIGHER" else 0.0 if actual_direction == "LOWER" else None
                 brier = (probability - binary_outcome) ** 2 if probability is not None and binary_outcome is not None else None
@@ -1372,6 +1808,8 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                     "pointError": point_error,
                     "absolutePercentageError": absolute_percentage_error,
                     "rangeCoverage": range_coverage,
+                    "actualPeriodMinimum": actual_period_minimum,
+                    "actualPeriodMaximum": actual_period_maximum,
                     "widthPenalty": width_penalty,
                     "intervalScore": interval_score,
                     "multiIntervalWIS": None,
@@ -1388,7 +1826,7 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                     "skillVersusTAGalysis": None,
                     "skillVersusTAGneXt": None,
                     "decisionUsefulness": decision_usefulness,
-                    "outcomeAlignmentPolicy": "exact_then_nearest_verified_within_60s_v1",
+                    "outcomeAlignmentPolicy": "exact_server_observation_or_verified_candle_then_nearest_within_60s_v2",
                     "outcomeOffsetSeconds": outcome_offset_seconds,
                 }
                 disposition = "scenario_graded" if target_semantics == "scenario_calculator" else "graded"
@@ -1423,6 +1861,7 @@ def rebuild_source_scores(*, cutoff_at: datetime | str | None = None) -> dict[st
                     TagNextExternalSnapshotRow.horizon == horizon,
                     TagNextExternalGradeRow.disposition == "graded",
                 )))
+                grades = [row for row in grades if _semantic_snapshot_is_active(session, row.snapshot_id)]
                 sample_count = len(grades)
                 accuracy = (
                     sum(1 for row in grades if row.direction_correct is True) / sample_count
@@ -1476,6 +1915,7 @@ def build_external_consensus(*, horizon: str, issued_at: datetime | str | None =
             TagNextExternalSnapshotRow.target_semantics,
             TagNextExternalSnapshotRow.captured_at.desc(),
         )))
+        rows = [row for row in rows if _semantic_snapshot_is_active(session, row.snapshot_id)]
         sources = {
             row.source_id: session.get(TagNextExternalSourceRow, row.source_id) for row in rows
         }
@@ -1485,7 +1925,7 @@ def build_external_consensus(*, horizon: str, issued_at: datetime | str | None =
         latest_rows = list(latest.values())
         comparable_semantics = {
             "point_at_deadline", "year_end", "mid_year", "period_average",
-            "central_scenario", "direction_only", "probability",
+            "range_for_period", "central_scenario", "direction_only", "probability",
         }
         eligible_rows = [
             row for row in latest_rows
@@ -1701,15 +2141,21 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
         ).where(TagNextExternalSnapshotRow.horizon == selected).order_by(
             TagNextExternalSnapshotRow.captured_at.desc()
         )))
+        external_rows = [
+            row for row in external_rows if _semantic_snapshot_is_active(session, row.snapshot_id)
+        ]
         sources = {row.source_id: session.get(TagNextExternalSourceRow, row.source_id) for row in external_rows}
         grade_counts = {
-            row.source_id: int(session.scalar(select(func.count(TagNextExternalGradeRow.grade_id)).join(
-                TagNextExternalSnapshotRow,
-                TagNextExternalSnapshotRow.snapshot_id == TagNextExternalGradeRow.snapshot_id,
-            ).where(
-                TagNextExternalSnapshotRow.source_id == row.source_id,
-                TagNextExternalGradeRow.disposition == "graded",
-            )) or 0)
+            row.source_id: sum(
+                1 for grade in session.scalars(select(TagNextExternalGradeRow).join(
+                    TagNextExternalSnapshotRow,
+                    TagNextExternalSnapshotRow.snapshot_id == TagNextExternalGradeRow.snapshot_id,
+                ).where(
+                    TagNextExternalSnapshotRow.source_id == row.source_id,
+                    TagNextExternalGradeRow.disposition == "graded",
+                ))
+                if _semantic_snapshot_is_active(session, grade.snapshot_id)
+            )
             for row in external_rows
         }
         latest_scores = {
@@ -1798,7 +2244,8 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
             metadata_revisions = list(session.scalars(select(TagNextExternalMetadataRevisionRow).where(
                 TagNextExternalMetadataRevisionRow.snapshot_id == row.snapshot_id
             ).order_by(TagNextExternalMetadataRevisionRow.corrected_at.asc())))
-            effective_observed_live = _effective_observed_live(session, row)
+            observation_classification = resolved_external_observation_classification(session, row)
+            effective_observed_live = observation_classification["observedLive"]
             is_stale = bool(
                 source is not None
                 and source.next_check_at is not None
@@ -1833,7 +2280,8 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
                 "targetSemantics": row.target_semantics,
                 "gradeability": row.gradeability,
                 "observedLive": effective_observed_live,
-                "observationClass": "LIVE_OBSERVED" if effective_observed_live else "HISTORICAL_DISCOVERED",
+                "observationClass": observation_classification["effectiveClassification"],
+                "resolvedObservationClassification": observation_classification,
                 "stale": is_stale,
                 "influenceState": "eligible" if consensus_eligible else "zero_influence",
                 "methodology": row.methodology_version or source_state.get("methodology"),

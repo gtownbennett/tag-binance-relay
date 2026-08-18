@@ -21,6 +21,7 @@ from sqlalchemy import (
     create_engine,
     event,
     func,
+    inspect,
     select,
     text,
 )
@@ -58,6 +59,8 @@ class BinanceSnapshot(Base):
     price: Mapped[float | None] = mapped_column(Float)
     open_interest_usd: Mapped[float | None] = mapped_column(Float)
     funding_rate: Mapped[float | None] = mapped_column(Float)
+    funding_rate_decimal: Mapped[float | None] = mapped_column(Float)
+    funding_rate_pct: Mapped[float | None] = mapped_column(Float)
     global_long_short: Mapped[float | None] = mapped_column(Float)
     top_account_ratio: Mapped[float | None] = mapped_column(Float)
     top_position_ratio: Mapped[float | None] = mapped_column(Float)
@@ -82,7 +85,11 @@ class ExchangeSnapshotRow(Base):
     open_interest_usd: Mapped[float | None] = mapped_column(Float)
     open_interest_tokens: Mapped[float | None] = mapped_column(Float)
     volume_usd_24h: Mapped[float | None] = mapped_column(Float)
+    # Legacy funding_rate is retained only for forensic compatibility. RC3
+    # writes explicit decimal and percent columns and leaves this one null.
     funding_rate: Mapped[float | None] = mapped_column(Float)
+    funding_rate_decimal: Mapped[float | None] = mapped_column(Float)
+    funding_rate_pct: Mapped[float | None] = mapped_column(Float)
     price_change_24h: Mapped[float | None] = mapped_column(Float)
     bid_depth_1pct: Mapped[float | None] = mapped_column(Float)
     ask_depth_1pct: Mapped[float | None] = mapped_column(Float)
@@ -835,6 +842,11 @@ class AssetTruthSnapshotRow(Base):
     contract_address: Mapped[str] = mapped_column(String(100), index=True)
     circulating_supply: Mapped[float] = mapped_column(Float)
     fully_diluted_supply: Mapped[float | None] = mapped_column(Float)
+    total_supply: Mapped[float | None] = mapped_column(Float)
+    source_count: Mapped[int | None] = mapped_column(Integer)
+    source_observations_json: Mapped[str] = mapped_column(Text, default="[]")
+    discrepancy_pct: Mapped[float | None] = mapped_column(Float)
+    confidence: Mapped[str | None] = mapped_column(Text)
     source_name: Mapped[str] = mapped_column(String(160))
     source_reference: Mapped[str] = mapped_column(Text)
     verification_status: Mapped[str] = mapped_column(String(24), index=True)
@@ -1899,8 +1911,83 @@ class TagNextExternalOutcomeScheduleRow(Base):
     status: Mapped[str] = mapped_column(Text, default="scheduled", index=True)
     capture_count: Mapped[int] = mapped_column(Integer, default=0)
     last_capture_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    semantic_identity_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("tagnext_forecast_semantic_identities.identity_id")
+    )
     config_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TagNextDataQualityQuarantineRow(Base):
+    __tablename__ = "tagnext_data_quality_quarantine"
+    __table_args__ = (
+        UniqueConstraint("entity_type", "entity_id", "reason_code", name="uq_tagnext_quarantine_entity_reason"),
+    )
+
+    quarantine_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    entity_type: Mapped[str] = mapped_column(Text, index=True)
+    entity_id: Mapped[str] = mapped_column(Text, index=True)
+    reason_code: Mapped[str] = mapped_column(Text, index=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    original_payload_json: Mapped[str] = mapped_column(Text)
+    excluded_domains_json: Mapped[str] = mapped_column(Text)
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class TagNextForecastSemanticIdentityRow(Base):
+    __tablename__ = "tagnext_forecast_semantic_identities"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", name="uq_tagnext_semantic_snapshot"),
+    )
+
+    identity_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"))
+    source_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_sources.source_id"), index=True)
+    forecast_semantic_hash: Mapped[str] = mapped_column(String(64), index=True)
+    evidence_metadata_hash: Mapped[str] = mapped_column(String(64))
+    semantic_status: Mapped[str] = mapped_column(Text, default="active", index=True)
+    superseded_by_snapshot_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id")
+    )
+    duplicate_schedules_cancelled: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class TagNextForecastClassificationCorrectionRow(Base):
+    __tablename__ = "tagnext_forecast_classification_corrections"
+
+    correction_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(Text, ForeignKey("tagnext_external_forecast_snapshots.snapshot_id"), index=True)
+    previous_classification: Mapped[str] = mapped_column(Text)
+    corrected_classification: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text)
+    evidence_package_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("tagnext_external_evidence_packages.evidence_package_id")
+    )
+    corrected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class TagNextExternalOutcomeCaptureCursorRow(Base):
+    __tablename__ = "tagnext_external_outcome_capture_cursors"
+
+    cursor_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    job_name: Mapped[str] = mapped_column(Text, unique=True)
+    last_schedule_id: Mapped[str | None] = mapped_column(Text)
+    last_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    missed_ranges_json: Mapped[str] = mapped_column(Text, default="[]")
+    fallback_state_json: Mapped[str] = mapped_column(Text, default="{}")
+    health_state: Mapped[str] = mapped_column(Text, default="INITIALIZING")
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -2403,6 +2490,7 @@ def _migrate_canonical_horizon_constraints() -> None:
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
+    _migrate_rc3_columns()
     _migrate_postgres_timestamp_columns()
     _migrate_canonical_horizon_constraints()
     # Existing PostgreSQL tables predate these composite indexes. create_all()
@@ -2419,6 +2507,140 @@ def init_db() -> None:
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+
+
+def _migrate_rc3_columns() -> None:
+    """Add RC3 columns to pre-existing local/production tables."""
+
+    schema = inspect(engine)
+    with engine.begin() as connection:
+        definitions = {
+            "binance_snapshots": {
+                "funding_rate_decimal": "DOUBLE PRECISION",
+                "funding_rate_pct": "DOUBLE PRECISION",
+            },
+            "exchange_snapshots": {
+                "funding_rate_decimal": "DOUBLE PRECISION",
+                "funding_rate_pct": "DOUBLE PRECISION",
+            },
+            "asset_truth_snapshots": {
+                "total_supply": "DOUBLE PRECISION",
+                "source_count": "INTEGER",
+                "source_observations_json": "TEXT NOT NULL DEFAULT '[]'",
+                "discrepancy_pct": "DOUBLE PRECISION",
+                "confidence": "TEXT",
+            },
+            "tagnext_external_forecast_sources": {
+                "independent_family_id": "TEXT",
+                "declared_cadence_seconds": "BIGINT",
+                "configured_cadence_seconds": "BIGINT",
+                "last_semantic_change_at": "TIMESTAMP",
+                "next_check_at": "TIMESTAMP",
+                "event_triggered_check_at": "TIMESTAMP",
+                "parser_status": "TEXT",
+                "etag": "TEXT",
+                "last_modified": "TEXT",
+                "source_state_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+            "tagnext_external_forecast_snapshots": {
+                "target_currency": "TEXT NOT NULL DEFAULT 'USD'",
+                "target_native_price": "NUMERIC(38,18)",
+                "target_native_low": "NUMERIC(38,18)",
+                "target_native_high": "NUMERIC(38,18)",
+                "original_horizon_label": "TEXT",
+                "normalized_horizon": "TEXT",
+                "target_semantics": "TEXT NOT NULL DEFAULT 'point_at_deadline'",
+                "source_issue_at": "TIMESTAMP",
+                "source_update_at": "TIMESTAMP",
+                "period_start": "TIMESTAMP",
+                "period_end": "TIMESTAMP",
+                "probability": "NUMERIC(20,18)",
+                "scenario_class": "TEXT",
+                "methodology_version": "TEXT",
+                "conditional_trigger": "TEXT",
+                "forecast_family_id": "TEXT",
+                "independent_family_id": "TEXT",
+                "gradeability": "TEXT NOT NULL DEFAULT 'point'",
+                "observed_live": "BOOLEAN NOT NULL DEFAULT TRUE",
+            },
+            "tagnext_external_forecast_revisions": {
+                "price_change_since_prior_pct": "NUMERIC(30,12)",
+                "target_change_pct": "NUMERIC(30,12)",
+                "revision_lag_seconds": "BIGINT",
+                "source_update_lag_seconds": "BIGINT",
+                "forecast_lead_seconds": "BIGINT",
+                "chasing_score": "NUMERIC(20,12)",
+                "stability_score": "NUMERIC(20,12)",
+                "analysis_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+            "tagnext_external_forecast_grades": {
+                "metrics_json": "TEXT NOT NULL DEFAULT '{}'",
+                "outcome_source": "TEXT",
+                "period_outcome_id": "TEXT",
+            },
+            "tagnext_consensus_snapshots": {
+                "statistics_json": "TEXT NOT NULL DEFAULT '{}'",
+                "independent_family_count": "INTEGER NOT NULL DEFAULT 0",
+                "stale_source_count": "INTEGER NOT NULL DEFAULT 0",
+                "calculator_count": "INTEGER NOT NULL DEFAULT 0",
+                "historical_count": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "tagnext_consensus_grades": {
+                "metrics_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+            "tagnext_external_outcome_schedules": {
+                "retry_count": "INTEGER NOT NULL DEFAULT 0",
+                "next_retry_at": "TIMESTAMP",
+                "last_error": "TEXT",
+                "semantic_identity_id": "TEXT",
+            },
+            "tagnext_discovery_candidates": {
+                "normalized_url": "TEXT",
+                "resolved_url": "TEXT",
+                "domain": "TEXT",
+                "source_label": "TEXT",
+                "search_engine": "TEXT",
+                "language": "TEXT",
+                "last_checked_at": "TIMESTAMP",
+                "final_status": "TEXT",
+                "identity_evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+                "original_source_url": "TEXT",
+                "forecast_family_id": "TEXT",
+                "independent_family_id": "TEXT",
+                "parser_id": "TEXT",
+                "next_check_at": "TIMESTAMP",
+                "accessibility": "TEXT",
+                "historical_archive_url": "TEXT",
+                "response_hash": "VARCHAR(64)",
+                "http_status": "INTEGER",
+                "retry_status": "TEXT",
+                "evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+            "tagnext_holder_history": {
+                "completeness_label": "TEXT NOT NULL DEFAULT 'observed_addresses_only'",
+                "rank": "INTEGER",
+                "provider_id": "TEXT",
+            },
+            "tagnext_future_paths": {
+                "previous_path_set_id": "TEXT",
+                "triggers_json": "TEXT NOT NULL DEFAULT '[]'",
+                "invalidations_json": "TEXT NOT NULL DEFAULT '[]'",
+                "evidence_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                "payload_hash": "VARCHAR(64)",
+                "grading_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+            "tagnext_paired_outcomes": {
+                "champion_import_id": "TEXT",
+                "pair_window": "TEXT",
+            },
+        }
+        for table_name, columns in definitions.items():
+            existing = {column["name"] for column in schema.get_columns(table_name)}
+            for column_name, data_type in columns.items():
+                if column_name not in existing:
+                    connection.execute(
+                        text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {data_type}")
+                    )
 
 
 @contextmanager

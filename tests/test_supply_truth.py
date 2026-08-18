@@ -55,24 +55,24 @@ def test_cross_checked_current_supply_is_provenance_bearing_and_verified() -> No
     assert payload["verificationStatus"] == "verified"
     assert payload["circulatingSupplyTokens"] == pytest.approx(108_864_805_114.17)
     assert payload["fullyDilutedSupplyTokens"] == TAG_TOTAL_SUPPLY
+    assert payload["verifiedCirculatingSupplyTokens"] == pytest.approx(108_864_805_114.17)
+    assert payload["totalSupplyTokens"] == TAG_TOTAL_SUPPLY
     assert "circulatingDivergencePct" in payload["sourceReference"]
 
 
-def test_explicit_cmc_gecko_fallback_is_verified_and_records_unavailable_coingecko() -> None:
-    payload = verified_tag_supply_payload_from_cmc_and_gecko(
-        coinmarketcap=_coinmarketcap(),
-        geckoterminal=_geckoterminal(),
-        bsc_total_supply_hex=_hex_supply(),
-        retrieved_at=NOW,
-        unavailable_sources=("CoinGecko HTTP 429",),
-    )
-    assert payload["verificationStatus"] == "verified"
-    assert payload["circulatingSupplyTokens"] == pytest.approx(108_404_572_594.0)
-    assert "CoinGecko HTTP 429" in payload["sourceReference"]
+def test_cmc_gecko_market_cap_price_fallback_is_forbidden() -> None:
+    with pytest.raises(SupplyTruthError, match="marketCap/price inference is forbidden"):
+        verified_tag_supply_payload_from_cmc_and_gecko(
+            coinmarketcap=_coinmarketcap(),
+            geckoterminal=_geckoterminal(),
+            bsc_total_supply_hex=_hex_supply(),
+            retrieved_at=NOW,
+            unavailable_sources=("CoinGecko HTTP 429",),
+        )
 
 
-def test_explicit_cmc_gecko_fallback_rejects_conflicting_implied_supply() -> None:
-    with pytest.raises(SupplyTruthError, match="materially conflict"):
+def test_cmc_gecko_fallback_rejects_even_a_conflicting_implied_supply() -> None:
+    with pytest.raises(SupplyTruthError, match="marketCap/price inference is forbidden"):
         verified_tag_supply_payload_from_cmc_and_gecko(
             coinmarketcap=_coinmarketcap(circulating=90_000_000_000),
             geckoterminal=_geckoterminal(circulating=130_000_000_000),

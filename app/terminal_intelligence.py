@@ -868,7 +868,7 @@ def build_chad_report(store: bool = True) -> dict[str, Any]:
     price24h = _num(spot.get("priceChangeH24"))
     oi1h = _num(history.get("change1hPct"))
     oi4h = _num(history.get("change4hPct"))
-    funding = _num(futures.get("fundingRate"))
+    funding = _num(futures.get("fundingRatePct"))
     taker = _num(binance.get("takerBuySellRatio1h") or futures.get("takerBuySellRatio"))
     taker_quality = str(
         binance.get("takerWindowQuality")
@@ -1337,10 +1337,10 @@ def evaluate_alerts(report: dict[str, Any] | None = None) -> int:
     spot, futures, _ = _latest_market()
     history = server_oi_history()
     price = _num(spot.get("priceUsd"))
-    market_cap = _num(spot.get("marketCap"))
+    market_cap = _num(spot.get("circulatingMarketCapUsd"))
     price1h = _num(spot.get("priceChangeH1"))
     price24h = _num(spot.get("priceChangeH24"))
-    funding = _num(futures.get("fundingRate"))
+    funding = _num(futures.get("fundingRatePct"))
     oi1h = _num(history.get("change1hPct"))
     taker = _num(futures.get("takerBuySellRatio"))
     buys, sells = int(spot.get("buysH1") or 0), int(spot.get("sellsH1") or 0)
@@ -1461,7 +1461,7 @@ def insert_test_alert() -> dict[str, Any]:
     report = build_chad_report(store=False)
     spot, _, _ = _latest_market()
     price = _num(spot.get("priceUsd"))
-    market_cap = _num(spot.get("marketCap"))
+    market_cap = _num(spot.get("circulatingMarketCapUsd"))
     confidence = _num(report.get("confidence"))
     payload = {"test": True, "generatedAt": utc_now().isoformat(), "reportState": report.get("regime")}
     _insert_alert(

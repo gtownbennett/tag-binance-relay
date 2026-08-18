@@ -110,8 +110,29 @@ def verified_tag_supply_payload(
         "assetSymbol": "TAG",
         "network": "BNB Smart Chain",
         "contractAddress": TAG_CONTRACT,
+        # RC3 canonical names. These are supply facts, never values inferred
+        # from a DEX provider's market-cap or FDV field.
+        "verifiedCirculatingSupplyTokens": cg_circulating,
+        "totalSupplyTokens": on_chain_total,
         "circulatingSupplyTokens": cg_circulating,
         "fullyDilutedSupplyTokens": on_chain_total,
+        "sourceCount": 2,
+        "sourceObservations": [
+            {
+                "source": "CoinGecko",
+                "verifiedCirculatingSupplyTokens": cg_circulating,
+                "observedAt": cg_timestamp.isoformat(),
+                "url": "https://api.coingecko.com/api/v3/coins/tagger",
+            },
+            {
+                "source": "CoinMarketCap",
+                "verifiedCirculatingSupplyTokens": cmc_circulating,
+                "observedAt": cmc_timestamp.isoformat(),
+                "url": "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger",
+            },
+        ],
+        "circulatingSupplyDiscrepancyPct": round(divergence * 100, 6),
+        "supplyConfidence": "HIGH",
         "sourceName": "CoinGecko supply truth cross-checked by CoinMarketCap and BSC totalSupply",
         "sourceReference": source_reference,
         "verificationStatus": "verified",
@@ -127,77 +148,16 @@ def verified_tag_supply_payload_from_cmc_and_gecko(
     retrieved_at: datetime | str,
     unavailable_sources: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Verify supply when CoinGecko is explicitly unavailable, never by a hidden substitute.
+    """Compatibility gate retained to make the removed RC2 fallback explicit.
 
-    GeckoTerminal's market-cap field is provider-labelled rather than treated as
-    an on-chain supply fact. Dividing it by that same response's current price is
-    therefore only accepted as an independent *cross-check* of CMC's stated
-    circulating supply, alongside the BSC totalSupply truth.
+    A DEX provider's ``market_cap_usd / base_token_price_usd`` is not an
+    authoritative circulating-supply source. RC3 fails closed even if the
+    implied value happens to resemble a value reported by CoinMarketCap.
     """
 
-    retrieved = _time(retrieved_at, "retrievedAt")
-    cmc_statistics = coinmarketcap.get("statistics") if isinstance(coinmarketcap.get("statistics"), Mapping) else {}
-    cmc_timestamp = _time(coinmarketcap.get("latestUpdateTime"), "CoinMarketCap latestUpdateTime")
-    if retrieved - cmc_timestamp > SUPPLY_SOURCE_MAX_AGE:
-        raise SupplyTruthError("circulating-supply source is stale")
-
-    on_chain_total = _total_from_rpc(bsc_total_supply_hex)
-    cmc_total = _number(cmc_statistics.get("totalSupply"), "CoinMarketCap totalSupply")
-    if abs(cmc_total - on_chain_total) > 0.5:
-        raise SupplyTruthError("provider total supply does not match BSC totalSupply")
-    if abs(on_chain_total - TAG_TOTAL_SUPPLY) > 0.5:
-        raise SupplyTruthError("unexpected TAG on-chain total supply")
-
-    data = geckoterminal.get("data") if isinstance(geckoterminal.get("data"), Mapping) else {}
-    attributes = data.get("attributes") if isinstance(data.get("attributes"), Mapping) else {}
-    relationships = data.get("relationships") if isinstance(data.get("relationships"), Mapping) else {}
-    base_token = relationships.get("base_token") if isinstance(relationships.get("base_token"), Mapping) else {}
-    base_data = base_token.get("data") if isinstance(base_token.get("data"), Mapping) else {}
-    if (
-        str(data.get("id") or "").lower() != "bsc_0xf0750c373ebbb3baeef7e03d8300caad1983d67c"
-        or str(base_data.get("id") or "").lower() != f"bsc_{TAG_CONTRACT}"
-    ):
-        raise SupplyTruthError("canonical TAG GeckoTerminal pool is unavailable")
-    gecko_price = _number(attributes.get("base_token_price_usd"), "GeckoTerminal base_token_price_usd")
-    gecko_market_cap = _number(attributes.get("market_cap_usd"), "GeckoTerminal market_cap_usd")
-    gecko_implied_circulating = gecko_market_cap / gecko_price
-    cmc_circulating = _number(cmc_statistics.get("circulatingSupply"), "CoinMarketCap circulatingSupply")
-    if cmc_circulating > on_chain_total or gecko_implied_circulating > on_chain_total:
-        raise SupplyTruthError("circulating supply cannot exceed total supply")
-    divergence = abs(cmc_circulating - gecko_implied_circulating) / max(cmc_circulating, gecko_implied_circulating)
-    if divergence > MAX_CIRCULATING_SOURCE_DIVERGENCE:
-        raise SupplyTruthError("circulating-supply sources materially conflict")
-
-    source_reference = json.dumps(
-        {
-            "method": "CoinMarketCap circulating estimate cross-checked against GeckoTerminal provider-labelled marketCap/price and BSC totalSupply",
-            "contractAddress": TAG_CONTRACT,
-            "coinMarketCapCirculating": cmc_circulating,
-            "geckoTerminalMarketCapUsd": gecko_market_cap,
-            "geckoTerminalPriceUsd": gecko_price,
-            "geckoTerminalImpliedCirculating": gecko_implied_circulating,
-            "circulatingDivergencePct": round(divergence * 100, 6),
-            "bscTotalSupply": on_chain_total,
-            "coinMarketCapUpdatedAt": cmc_timestamp.isoformat(),
-            "retrievedAt": retrieved.isoformat(),
-            "unavailableSources": list(unavailable_sources),
-            "sources": [
-                "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger",
-                "https://api.geckoterminal.com/api/v2/networks/bsc/pools/0xf0750c373EbBB3BaEEF7e03D8300cAaD1983d67c",
-                "https://bsc-dataseed.binance.org/ eth_call totalSupply",
-            ],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+    del coinmarketcap, geckoterminal, bsc_total_supply_hex, retrieved_at
+    missing = ", ".join(unavailable_sources) or "a second authoritative circulating-supply source"
+    raise SupplyTruthError(
+        "verified circulating supply unavailable: provider marketCap/price inference is forbidden; "
+        f"unavailable: {missing}"
     )
-    return {
-        "assetSymbol": "TAG",
-        "network": "BNB Smart Chain",
-        "contractAddress": TAG_CONTRACT,
-        "circulatingSupplyTokens": cmc_circulating,
-        "fullyDilutedSupplyTokens": on_chain_total,
-        "sourceName": "CoinMarketCap supply truth cross-checked by GeckoTerminal market-cap/price and BSC totalSupply (CoinGecko unavailable)",
-        "sourceReference": source_reference,
-        "verificationStatus": "verified",
-        "verifiedAt": retrieved.isoformat(),
-    }

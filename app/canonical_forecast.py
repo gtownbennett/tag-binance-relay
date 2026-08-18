@@ -354,23 +354,76 @@ def _truth_hash(payload: Mapping[str, Any]) -> str:
 
 
 def persist_asset_truth_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
-    supply = _finite_positive(payload.get("circulatingSupplyTokens"), "circulatingSupplyTokens")
-    fully_diluted = payload.get("fullyDilutedSupplyTokens")
-    if fully_diluted is not None:
-        fully_diluted = _finite_positive(fully_diluted, "fullyDilutedSupplyTokens")
-        if fully_diluted < supply:
-            raise ForecastValidationError("fully diluted supply cannot be below circulating supply")
+    supply = _finite_positive(
+        payload.get("verifiedCirculatingSupplyTokens")
+        if payload.get("verifiedCirculatingSupplyTokens") is not None
+        else payload.get("circulatingSupplyTokens"),
+        "verifiedCirculatingSupplyTokens",
+    )
+    total_supply = (
+        payload.get("totalSupplyTokens")
+        if payload.get("totalSupplyTokens") is not None
+        else payload.get("fullyDilutedSupplyTokens")
+    )
+    if total_supply is not None:
+        total_supply = _finite_positive(total_supply, "totalSupplyTokens")
+        if total_supply < supply:
+            raise ForecastValidationError("total supply cannot be below circulating supply")
     source_name = str(payload.get("sourceName") or "").strip()
     source_reference = str(payload.get("sourceReference") or "").strip()
     if not source_name or not source_reference:
         raise ForecastValidationError("verified supply requires sourceName and sourceReference")
+    source_observations = payload.get("sourceObservations")
+    if not isinstance(source_observations, list):
+        source_observations = []
+        try:
+            reference_payload = json.loads(source_reference)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            reference_payload = {}
+        for source, value_key, time_key, url in (
+            ("CoinGecko", "coinGeckoCirculating", "coinGeckoUpdatedAt", "https://api.coingecko.com/api/v3/coins/tagger"),
+            ("CoinMarketCap", "coinMarketCapCirculating", "coinMarketCapUpdatedAt", "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger"),
+        ):
+            if reference_payload.get(value_key) is not None:
+                source_observations.append(
+                    {
+                        "source": source,
+                        "verifiedCirculatingSupplyTokens": reference_payload[value_key],
+                        "observedAt": reference_payload.get(time_key),
+                        "url": url,
+                    }
+                )
+    source_count = int(payload.get("sourceCount") or len(source_observations))
+    if source_count < 2 or len(source_observations) < 2:
+        raise ForecastValidationError("verified circulating supply requires at least two source observations")
+    discrepancy_pct = payload.get("circulatingSupplyDiscrepancyPct")
+    if discrepancy_pct is None:
+        observed_values = [
+            float(row["verifiedCirculatingSupplyTokens"])
+            for row in source_observations
+            if isinstance(row, Mapping) and row.get("verifiedCirculatingSupplyTokens") is not None
+        ]
+        discrepancy_pct = (
+            (max(observed_values) - min(observed_values)) / max(observed_values) * 100.0
+            if len(observed_values) >= 2
+            else None
+        )
+    if discrepancy_pct is not None:
+        discrepancy_pct = _finite_nonnegative(discrepancy_pct, "circulatingSupplyDiscrepancyPct")
+        if discrepancy_pct > 0.5:
+            raise ForecastValidationError("circulating-supply source discrepancy exceeds 0.5%")
+    confidence = str(payload.get("supplyConfidence") or "HIGH").strip().upper()
     verified_at = _parse_time(payload.get("verifiedAt"), "verifiedAt")
     normalized = {
         "assetSymbol": str(payload.get("assetSymbol") or "TAG").upper(),
         "network": str(payload.get("network") or "BNB Smart Chain"),
         "contractAddress": str(payload.get("contractAddress") or "").lower(),
-        "circulatingSupplyTokens": supply,
-        "fullyDilutedSupplyTokens": fully_diluted,
+        "verifiedCirculatingSupplyTokens": supply,
+        "totalSupplyTokens": total_supply,
+        "sourceCount": source_count,
+        "sourceObservations": source_observations,
+        "circulatingSupplyDiscrepancyPct": discrepancy_pct,
+        "supplyConfidence": confidence,
         "sourceName": source_name,
         "sourceReference": source_reference,
         "verificationStatus": "verified",
@@ -394,7 +447,12 @@ def persist_asset_truth_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
                 network=normalized["network"],
                 contract_address=normalized["contractAddress"],
                 circulating_supply=supply,
-                fully_diluted_supply=fully_diluted,
+                fully_diluted_supply=total_supply,
+                total_supply=total_supply,
+                source_count=source_count,
+                source_observations_json=json_dumps(source_observations),
+                discrepancy_pct=discrepancy_pct,
+                confidence=confidence,
                 source_name=source_name,
                 source_reference=source_reference,
                 verification_status="verified",
@@ -424,7 +482,7 @@ def _current_dex_price(packet: Mapping[str, Any]) -> tuple[float, str] | None:
     return None
 
 
-def _latest_verified_supply_snapshot() -> dict[str, Any] | None:
+def latest_verified_supply_snapshot() -> dict[str, Any] | None:
     with session_scope() as session:
         row = session.scalar(
             select(AssetTruthSnapshotRow)
@@ -439,10 +497,67 @@ def _latest_verified_supply_snapshot() -> dict[str, Any] | None:
             return None
         return {
             "snapshotId": row.snapshot_id,
+            "verifiedCirculatingSupplyTokens": row.circulating_supply,
+            "totalSupplyTokens": row.total_supply or row.fully_diluted_supply,
             "circulatingSupplyTokens": row.circulating_supply,
-            "fullyDilutedSupplyTokens": row.fully_diluted_supply,
+            "fullyDilutedSupplyTokens": row.total_supply or row.fully_diluted_supply,
+            "sourceCount": row.source_count,
+            "sourceObservations": json.loads(row.source_observations_json or "[]"),
+            "circulatingSupplyDiscrepancyPct": row.discrepancy_pct,
+            "supplyConfidence": row.confidence,
             "verificationStatus": row.verification_status,
+            "verifiedAt": _iso(row.verified_at),
         }
+
+
+def canonical_spot_market_truth(spot: Mapping[str, Any]) -> dict[str, Any]:
+    """Join a DEX price to verified supply without trusting provider market cap."""
+
+    result = dict(spot)
+    # RC2 aliases were ambiguous and must not survive as canonical fields.
+    for key in ("marketCapUsd", "marketCap", "fdv", "dexScreenerMarketCapUsd"):
+        result.pop(key, None)
+    result.setdefault("providerReportedMarketCapUsd", spot.get("providerReportedMarketCapUsd"))
+    result.setdefault("providerReportedFdvUsd", spot.get("providerReportedFdvUsd"))
+    result.update(
+        {
+            "verifiedCirculatingSupplyTokens": None,
+            "totalSupplyTokens": None,
+            "circulatingMarketCapUsd": None,
+            "fdvUsd": None,
+            "supplySnapshotId": None,
+            "supplyVerifiedAt": None,
+            "supplySourceCount": 0,
+            "supplyConfidence": None,
+        }
+    )
+    supply = latest_verified_supply_snapshot()
+    if supply is None or (supply.get("sourceCount") or 0) < 2:
+        return result
+    try:
+        price = _finite_positive(result.get("priceUsd"), "priceUsd")
+        circulating = _finite_positive(
+            supply.get("verifiedCirculatingSupplyTokens"),
+            "verifiedCirculatingSupplyTokens",
+        )
+        total = _finite_positive(supply.get("totalSupplyTokens"), "totalSupplyTokens")
+    except ForecastValidationError:
+        return result
+    if circulating > total:
+        return result
+    result.update(
+        {
+            "verifiedCirculatingSupplyTokens": circulating,
+            "totalSupplyTokens": total,
+            "circulatingMarketCapUsd": price * circulating,
+            "fdvUsd": price * total,
+            "supplySnapshotId": supply.get("snapshotId"),
+            "supplyVerifiedAt": supply.get("verifiedAt"),
+            "supplySourceCount": supply.get("sourceCount"),
+            "supplyConfidence": supply.get("supplyConfidence"),
+        }
+    )
+    return result
 
 
 def _bounded_unit(value: Any, *, scale: float) -> float | None:
@@ -502,7 +617,7 @@ def canonical_features_from_evidence_packet(packet: Mapping[str, Any]) -> dict[s
             features["featureAvailability"][name] = "observed_dex_spot"
 
     futures = payload("futures:binance")
-    for raw, name, scale in ((futures.get("oiChange1hPct"), "oiChange1h", 15.0), (futures.get("oiChange4hPct"), "oiChange4h", 30.0), (futures.get("oiChange24hPct"), "oiChange24h", 60.0), (futures.get("fundingRate"), "fundingTrend4h", 0.30), (futures.get("orderBookImbalancePct"), "orderBookDepth4h", 100.0)):
+    for raw, name, scale in ((futures.get("oiChange1hPct"), "oiChange1h", 15.0), (futures.get("oiChange4hPct"), "oiChange4h", 30.0), (futures.get("oiChange24hPct"), "oiChange24h", 60.0), (futures.get("fundingRatePct"), "fundingTrend4h", 0.30), (futures.get("orderBookImbalancePct"), "orderBookDepth4h", 100.0)):
         value = _bounded_unit(raw, scale=scale)
         if value is not None:
             features[name] = value
@@ -511,13 +626,11 @@ def canonical_features_from_evidence_packet(packet: Mapping[str, Any]) -> dict[s
     if raw_oi_change_24h is not None:
         analog["openInterestChange"] = raw_oi_change_24h
     try:
-        raw_funding = float(futures.get("fundingRate"))
+        raw_funding = float(futures.get("fundingRateDecimal"))
     except (TypeError, ValueError):
         raw_funding = math.nan
     if math.isfinite(raw_funding):
-        # Multi-exchange snapshots expose funding in percentage points while
-        # imported historical rows retain the exchange fractional rate.
-        analog["funding"] = raw_funding / 100.0
+        analog["funding"] = raw_funding
     for source_name, target_name in (
         ("longShortRatio", "longShortPositioning"),
         ("takerBuySellRatio", "takerImbalance"),
@@ -573,7 +686,7 @@ def canonical_features_from_evidence_packet(packet: Mapping[str, Any]) -> dict[s
             features["featureAvailability"]["cexDexAgreement24h"] = "observed_cross_venue_spot"
             analog["spotConfirmation"] = 1.0 - abs(value)
     for raw, name in (
-        (dex.get("marketCapUsd") or dex.get("marketCap"), "marketCap"),
+        (dex.get("circulatingMarketCapUsd"), "marketCap"),
         (dex.get("liquidityUsd"), "liquidity"),
     ):
         try:
@@ -602,7 +715,7 @@ def _issue_due_deterministic_forecasts(
     packet = latest_evidence_packet()
     if packet is None:
         return {"issued": 0, "skipped": len(HORIZON_SPECS), "reason": "no canonical evidence"}
-    supply = _latest_verified_supply_snapshot()
+    supply = latest_verified_supply_snapshot()
     if supply is None:
         return {
             "issued": 0,
@@ -948,7 +1061,17 @@ def build_tagalysis_forecast(
     issued = _parse_time(issued_at or utc_now(), "issuedAt")
     as_of = _parse_time(data_as_of, "dataAsOf")
     price = _finite_positive(current_price, "currentPriceUsd")
-    supply = _finite_positive(supply_snapshot.get("circulatingSupplyTokens"), "verifiedSupplyTokens")
+    supply = _finite_positive(
+        supply_snapshot.get("verifiedCirculatingSupplyTokens")
+        if supply_snapshot.get("verifiedCirculatingSupplyTokens") is not None
+        else supply_snapshot.get("circulatingSupplyTokens"),
+        "verifiedCirculatingSupplyTokens",
+    )
+    total_supply = (
+        supply_snapshot.get("totalSupplyTokens")
+        if supply_snapshot.get("totalSupplyTokens") is not None
+        else supply_snapshot.get("fullyDilutedSupplyTokens")
+    )
     supply_id = str(supply_snapshot.get("snapshotId") or "").strip()
     if not supply_id or supply_snapshot.get("verificationStatus") != "verified":
         raise ForecastValidationError("a persisted verified supply snapshot is required")
@@ -1104,8 +1227,11 @@ def build_tagalysis_forecast(
         "horizon": canonical_horizon,
         "horizonMinutes": horizon_minutes,
         "currentPriceUsd": price,
+        "verifiedCirculatingSupplyTokens": supply,
+        "totalSupplyTokens": total_supply,
+        # Read-only compatibility aliases for older RC2 forecast consumers.
         "verifiedSupplyTokens": supply,
-        "fullyDilutedSupplyTokens": supply_snapshot.get("fullyDilutedSupplyTokens"),
+        "fullyDilutedSupplyTokens": total_supply,
         "portfolioQuantityTokens": quantity,
         "portfolioCostBasisUsd": cost_basis,
         "pointForecastUsd": point,
@@ -1176,7 +1302,16 @@ def canonicalize_forecast(value: Mapping[str, Any]) -> dict[str, Any]:
     if abs((deadline - _deadline_for_horizon(horizon, issued, spec)).total_seconds()) > 0.001:
         raise ForecastValidationError("deadline must be calculated from the actual issuedAt and horizon")
     current = _finite_positive(record.get("currentPriceUsd"), "currentPriceUsd")
-    supply = _finite_positive(record.get("verifiedSupplyTokens"), "verifiedSupplyTokens")
+    supply = _finite_positive(
+        record.get("verifiedCirculatingSupplyTokens")
+        if record.get("verifiedCirculatingSupplyTokens") is not None
+        else record.get("verifiedSupplyTokens"),
+        "verifiedCirculatingSupplyTokens",
+    )
+    if record.get("verifiedSupplyTokens") is not None and abs(
+        _finite_positive(record.get("verifiedSupplyTokens"), "verifiedSupplyTokens") - supply
+    ) > max(1e-9, supply * 1e-12):
+        raise ForecastValidationError("legacy and canonical verified supply fields conflict")
     point = _finite_positive(record.get("pointForecastUsd"), "pointForecastUsd")
     p50 = _finite_positive(record.get("p50Usd"), "p50Usd")
     quantiles = record.get("quantilesUsd")
@@ -1269,6 +1404,7 @@ def canonicalize_forecast(value: Mapping[str, Any]) -> dict[str, Any]:
     record["dataAsOf"] = _iso(data_as_of)
     record["deadline"] = _iso(deadline)
     record["currentPriceUsd"] = current
+    record["verifiedCirculatingSupplyTokens"] = supply
     record["verifiedSupplyTokens"] = supply
     record["pointForecastUsd"] = point
     record["p50Usd"] = p50
@@ -1298,7 +1434,7 @@ def persist_canonical_forecast(value: Mapping[str, Any]) -> dict[str, Any]:
             raise ForecastValidationError("evidenceSnapshotId does not reference persisted evidence")
         if supply is None or supply.verification_status != "verified":
             raise ForecastValidationError("supplySnapshotId does not reference verified persisted supply")
-        if abs(supply.circulating_supply - record["verifiedSupplyTokens"]) > max(1e-9, supply.circulating_supply * 1e-12):
+        if abs(supply.circulating_supply - record["verifiedCirculatingSupplyTokens"]) > max(1e-9, supply.circulating_supply * 1e-12):
             raise ForecastValidationError("forecast supply differs from its persisted supply snapshot")
         portfolio = None
         if record.get("portfolioSnapshotId"):
@@ -1330,8 +1466,8 @@ def persist_canonical_forecast(value: Mapping[str, Any]) -> dict[str, Any]:
                 forecast_version=record["forecastVersion"], model_version=record["modelVersion"], prompt_version=record.get("promptVersion"),
                 horizon=record["horizon"], horizon_minutes=record["horizonMinutes"], issued_at=_parse_time(record["issuedAt"], "issuedAt"),
                 data_as_of=_parse_time(record["dataAsOf"], "dataAsOf"), deadline=_parse_time(record["deadline"], "deadline"),
-                current_price=record["currentPriceUsd"], verified_supply=record["verifiedSupplyTokens"],
-                fully_diluted_supply=record.get("fullyDilutedSupplyTokens"), portfolio_quantity=record.get("portfolioQuantityTokens"),
+                current_price=record["currentPriceUsd"], verified_supply=record["verifiedCirculatingSupplyTokens"],
+                fully_diluted_supply=record.get("totalSupplyTokens") or record.get("fullyDilutedSupplyTokens"), portfolio_quantity=record.get("portfolioQuantityTokens"),
                 portfolio_cost_basis_usd=record.get("portfolioCostBasisUsd"), point_forecast=record["pointForecastUsd"], p50=record["p50Usd"],
                 q10=q["p10"], q25=q["p25"], q75=q["p75"], q90=q["p90"], probability_up=p["up"],
                 probability_down=p["down"], probability_sideways=p["sideways"], direction=record["direction"],
@@ -1449,7 +1585,7 @@ def format_canonical_forecast(record: Mapping[str, Any], *, now: datetime | str 
     canonical = canonicalize_forecast(record)
     point = canonical["pointForecastUsd"]
     current = canonical["currentPriceUsd"]
-    supply = canonical["verifiedSupplyTokens"]
+    supply = canonical["verifiedCirculatingSupplyTokens"]
     quantity = canonical.get("portfolioQuantityTokens")
     expected_market_cap = point * supply
     expected_position_value = point * quantity if quantity is not None else None

@@ -24,6 +24,7 @@ from app.terminal_database import (
     MarketRegimeRow,
     PatternSequenceRow,
     SpotSnapshotRow,
+    TagNextDataQualityQuarantineRow,
     UserMarketCapLevelVersionRow,
     VerifiedOutcomeRow,
     json_dumps,
@@ -619,6 +620,16 @@ def grade_canonical_forecast(
         outcome = session.get(VerifiedOutcomeRow, outcome_id)
         if forecast is None or outcome is None:
             raise Phase3ValidationError("forecast and verified outcome must exist")
+        quarantine_reason = session.scalar(select(
+            TagNextDataQualityQuarantineRow.reason_code
+        ).where(
+            TagNextDataQualityQuarantineRow.entity_type == "canonical_forecast",
+            TagNextDataQualityQuarantineRow.entity_id == forecast_id,
+        ).limit(1))
+        if quarantine_reason is not None:
+            raise Phase3ValidationError(
+                f"forecast excluded by invalid data quality quarantine: {quarantine_reason}"
+            )
         if _aware(forecast.deadline) != _aware(outcome.observed_at):
             raise Phase3ValidationError("verified outcome must be observed at the exact forecast deadline")
         disposition = session.scalar(select(ForecastEvaluationDispositionRow).where(
@@ -1845,7 +1856,7 @@ def maintain_pattern_memory_from_latest_evidence() -> dict[str, Any]:
 
     precursors = {
         "openInterestBuildup": futures_average("oiChange1h", "oiChange1hPct", "openInterestChange1h") / 10.0,
-        "fundingChange": futures_average("fundingRate") * 1000.0,
+        "fundingChange": futures_average("fundingRateDecimal") * 1000.0,
         "spotVolumeConfirmation": float((spot.get("priceChangePct") or {}).get("h1") or 0.0) / 10.0,
         "buySellPressure": float(((spot.get("transactions") or {}).get("h1") or {}).get("buySellRatio") or 1.0) - 1.0,
         "liquidityChange": float(spot.get("liquidityChangePct") or 0.0) / 10.0,

@@ -85,7 +85,7 @@ def assess_evidence_packet(packet: Mapping[str, Any], *, has_verified_supply: bo
         "gateSpot": gate["available"], "mexcSpot": mexc["available"], "dexSpot": dex["available"],
         "spotConsensus": consensus, "spotDivergencePct": divergence_pct,
         "oi": _finite(future_payload.get("openInterestUsd")) is not None,
-        "funding": _finite(future_payload.get("fundingRate")) is not None,
+        "funding": _finite(future_payload.get("fundingRateDecimal")) is not None,
         "taker": _finite(future_payload.get("takerBuySellRatio")) is not None,
         "liquidation": (_finite(future_payload.get("longLiquidation1hUsd")) or 0.0) + (_finite(future_payload.get("shortLiquidation1hUsd")) or 0.0) > 0,
         "supplyTruth": bool(has_verified_supply),

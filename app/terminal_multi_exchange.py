@@ -10,6 +10,7 @@ import httpx
 
 from .terminal_common import as_float, as_int
 from .terminal_database import AggregateSnapshotRow, ExchangeSnapshotRow, json_dumps, session_scope, utc_now
+from .funding_units import normalize_funding_rate
 
 BITGET = "https://api.bitget.com"
 MEXC = "https://contract.mexc.com"
@@ -170,7 +171,6 @@ class MultiExchangeService:
         except Exception as exc:
             notes.append(f"OI endpoint: {exc}")
         funding = _finite(ticker.get("fundingRate"))
-        funding = funding * 100 if funding is not None else None
         funding_interval = None
         next_funding = None
         try:
@@ -182,7 +182,7 @@ class MultiExchangeService:
             row = _dig(root, "data", 0)
             if isinstance(row, dict):
                 raw = _finite(row.get("fundingRate"))
-                funding = raw * 100 if raw is not None else funding
+                funding = raw if raw is not None else funding
                 funding_interval = as_int(row.get("fundingRateInterval"))
                 next_funding = as_int(row.get("nextUpdate"))
         except Exception as exc:
@@ -228,7 +228,6 @@ class MultiExchangeService:
             except Exception as exc:
                 notes.append(f"Contract multiplier: {exc}")
         funding = _finite(ticker.get("fundingRate"))
-        funding = funding * 100 if funding is not None else None
         funding_interval = None
         next_funding = None
         try:
@@ -236,7 +235,7 @@ class MultiExchangeService:
             row = _data_row(funding_root, "TAG_USDT")
             if row:
                 raw = _finite(row.get("fundingRate"))
-                funding = raw * 100 if raw is not None else funding
+                funding = raw if raw is not None else funding
                 funding_interval = as_int(row.get("collectCycle"))
                 next_funding = as_int(row.get("nextSettleTime"))
         except Exception as exc:
@@ -269,7 +268,7 @@ class MultiExchangeService:
         change = _finite(ticker.get("change_percentage"))
         contracts = _finite(ticker.get("total_size") or ticker.get("open_interest"))
         raw_funding = _finite(ticker.get("funding_rate") or ticker.get("funding_rate_indicative"))
-        funding = raw_funding * 100 if raw_funding is not None else None
+        funding = raw_funding
         multiplier = None
         funding_interval = None
         next_funding = as_int(ticker.get("funding_next_apply"))
@@ -311,7 +310,7 @@ class MultiExchangeService:
                 mark = _finite(premium.get("markPrice")) or mark
                 index = _finite(premium.get("indexPrice"))
                 raw = _finite(premium.get("lastFundingRate") or premium.get("fundingRate"))
-                funding = raw * 100 if raw is not None else None
+                funding = raw
                 next_funding = as_int(premium.get("nextFundingTime"))
         except Exception as exc:
             notes.append(f"Premium/funding endpoint: {exc}")
@@ -359,7 +358,7 @@ class MultiExchangeService:
             _finite(payload.get("openInterestUsd")),
             _finite(payload.get("openInterestContracts")),
             _finite(payload.get("futuresQuoteVolume24hUsd")),
-            (_finite(payload.get("fundingRate")) * 100 if _finite(payload.get("fundingRate")) is not None else None),
+            _finite(payload.get("fundingRateDecimal") if "fundingRateDecimal" in payload else payload.get("fundingRate")),
             None,
             as_int(payload.get("nextFundingTime")),
             _finite(payload.get("bidDepthUsdWithin1Pct")),
@@ -413,6 +412,11 @@ class MultiExchangeService:
         extras: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         usable = any(value is not None for value in (mark, oi_usd, volume, funding))
+        normalized_funding = (
+            normalize_funding_rate(exchange, funding, input_unit="decimal")
+            if funding is not None
+            else {"fundingRateDecimal": None, "fundingRatePct": None}
+        )
         safe_notes = list(dict.fromkeys(_public_error(note) for note in notes if str(note).strip()))
         core_values = {
             "price": mark,
@@ -446,7 +450,8 @@ class MultiExchangeService:
             "openInterestUsd": oi_usd,
             "openInterestTokens": oi_tokens,
             "volumeUsd24h": volume,
-            "fundingRate": funding,
+            "fundingRateDecimal": normalized_funding["fundingRateDecimal"],
+            "fundingRatePct": normalized_funding["fundingRatePct"],
             "fundingIntervalHours": funding_interval,
             "nextFundingTime": next_funding,
             "bidDepth1PercentUsd": bid_depth,
@@ -529,7 +534,8 @@ class MultiExchangeService:
         aggregate_tokens = sum(_finite(row.get("openInterestTokens")) or 0.0 for row in active) or None
         volume = sum(_finite(row.get("volumeUsd24h")) or 0.0 for row in active) or None
         mark = _weighted(oi_rows)
-        funding = _weighted([(_finite(row.get("fundingRate")), _finite(row.get("openInterestUsd"))) for row in active])
+        funding_decimal = _weighted([(_finite(row.get("fundingRateDecimal")), _finite(row.get("openInterestUsd"))) for row in active])
+        funding_pct = funding_decimal * 100.0 if funding_decimal is not None else None
         change = _weighted([(_finite(row.get("priceChange24h")), _finite(row.get("volumeUsd24h"))) for row in active])
         bid_depth = sum(_finite(row.get("bidDepth1PercentUsd")) or 0.0 for row in active) or None
         ask_depth = sum(_finite(row.get("askDepth1PercentUsd")) or 0.0 for row in active) or None
@@ -551,7 +557,7 @@ class MultiExchangeService:
             "funding": [
                 str(row.get("exchange"))
                 for row in active
-                if _finite(row.get("fundingRate")) is not None
+                if _finite(row.get("fundingRateDecimal")) is not None
             ],
             "volume24h": [
                 str(row.get("exchange"))
@@ -572,7 +578,8 @@ class MultiExchangeService:
             "openInterestUsd": aggregate_oi,
             "openInterestTokens": aggregate_tokens,
             "volumeUsd24h": volume,
-            "fundingRate": funding,
+            "fundingRateDecimal": funding_decimal,
+            "fundingRatePct": funding_pct,
             "fundingIntervalHours": largest.get("fundingIntervalHours") if largest else None,
             "nextFundingTime": largest.get("nextFundingTime") if largest else None,
             "longShortRatio": _finite(binance.get("longShortRatio")),
@@ -618,7 +625,9 @@ class MultiExchangeService:
                         open_interest_usd=_finite(row.get("openInterestUsd")),
                         open_interest_tokens=_finite(row.get("openInterestTokens")),
                         volume_usd_24h=_finite(row.get("volumeUsd24h")),
-                        funding_rate=_finite(row.get("fundingRate")),
+                        funding_rate=None,
+                        funding_rate_decimal=_finite(row.get("fundingRateDecimal")),
+                        funding_rate_pct=_finite(row.get("fundingRatePct")),
                         price_change_24h=_finite(row.get("priceChange24h")),
                         bid_depth_1pct=_finite(row.get("bidDepth1PercentUsd")),
                         ask_depth_1pct=_finite(row.get("askDepth1PercentUsd")),
@@ -633,7 +642,7 @@ class MultiExchangeService:
                     price=_finite(spot.get("priceUsd")),
                     price_change_1h=_finite(spot.get("priceChangeH1")),
                     aggregate_oi_usd=_finite(futures.get("openInterestUsd")),
-                    funding_pct=_finite(futures.get("fundingRate")),
+                    funding_pct=_finite(futures.get("fundingRatePct")),
                     active_exchange_count=int(futures.get("activeExchangeCount") or 0),
                     payload_json=json_dumps({"spot": spot, "futures": futures}),
                 )

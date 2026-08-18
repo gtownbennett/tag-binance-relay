@@ -20,8 +20,11 @@ from .tagnext_discovery import SOURCE_SEEDS
 from .tagnext_external_adapters import TAG_CONTRACT, adapter_for_url, parse_document
 from .tagnext_pipeline import store_external_snapshot
 from .terminal_database import (
+    TagNextCandidateAccessAttemptRow,
     TagNextDiscoveryCandidateRow,
+    TagNextExternalEvidencePackageRow,
     TagNextExternalSourceRow,
+    TagNextSourceHistoryRow,
     json_dumps,
     session_scope,
     utc_now,
@@ -181,6 +184,123 @@ def _write_fallback_required(
         })
 
 
+def _write_parser_required(
+    *, candidate_id: str, checked_at: datetime, normalized_url: str,
+    resolved_url: str, http_status: int, response_hash: str,
+    source_label: str | None, independent_family_id: str | None,
+    identity: Mapping[str, Any], reason: str,
+) -> None:
+    """Keep a forecast-looking page open until a source adapter adjudicates it."""
+    with session_scope() as session:
+        row = session.get(TagNextDiscoveryCandidateRow, candidate_id)
+        if row is None:
+            return
+        row.normalized_url = normalized_url
+        row.resolved_url = resolved_url
+        row.domain = (urlsplit(resolved_url).hostname or "").lower()
+        row.source_label = source_label
+        row.state = "parser_required"
+        row.final_status = None
+        row.reason = reason
+        row.last_checked_at = checked_at
+        row.next_check_at = None
+        row.accessibility = "public"
+        row.parser_id = None
+        row.http_status = http_status
+        row.response_hash = response_hash
+        row.independent_family_id = independent_family_id
+        row.identity_evidence_json = json_dumps(dict(identity))
+        row.retry_status = "adapter_required"
+        row.evidence_json = json_dumps({
+            "validatorVersion": VALIDATOR_VERSION,
+            "decisionReason": reason,
+            "requiredNextWorker": "source_specific_adapter",
+        })
+
+
+def record_candidate_evidence(
+    *, candidate_id: str, method: str, requested_url: str,
+    resolved_url: str | None, status: str, retrieved_at: datetime,
+    raw_content: bytes, raw_text: str | None, http_status: int | None,
+    source_id: str | None = None, parser_version: str | None = None,
+    extraction_map: Mapping[str, Any] | None = None,
+    rendered_title: str | None = None, archive_url: str | None = None,
+) -> dict[str, Any]:
+    """Persist one source-specific raw package plus its access/history row."""
+    raw_sha = hashlib.sha256(raw_content).hexdigest()
+    payload = {
+        "candidateId": candidate_id,
+        "sourceId": source_id,
+        "method": method,
+        "requestedUrl": requested_url,
+        "resolvedUrl": resolved_url,
+        "status": status,
+        "retrievedAt": retrieved_at.isoformat(),
+        "rawSha256": raw_sha,
+        "archiveUrl": archive_url,
+    }
+    payload_hash = hashlib.sha256(json_dumps(payload).encode("utf-8")).hexdigest()
+    evidence_id = "tnep_" + payload_hash[:32]
+    attempt_hash = hashlib.sha256(json_dumps({**payload, "kind": "access"}).encode("utf-8")).hexdigest()
+    attempt_id = "tnca_" + attempt_hash[:32]
+    with session_scope() as session:
+        candidate = session.get(TagNextDiscoveryCandidateRow, candidate_id)
+        if candidate is None:
+            raise ValueError("candidate does not exist")
+        valid_source_id = source_id if source_id and session.get(TagNextExternalSourceRow, source_id) else None
+        if session.scalar(select(TagNextCandidateAccessAttemptRow).where(
+            TagNextCandidateAccessAttemptRow.payload_hash == attempt_hash
+        )) is None:
+            session.add(TagNextCandidateAccessAttemptRow(
+                attempt_id=attempt_id, candidate_id=candidate_id, method=method,
+                attempted_at=retrieved_at, requested_url=requested_url,
+                resolved_url=resolved_url, status=status, http_status=http_status,
+                content_sha256=raw_sha,
+                evidence_json=json_dumps({"evidencePackageId": evidence_id}),
+                payload_hash=attempt_hash,
+            ))
+        if session.scalar(select(TagNextExternalEvidencePackageRow).where(
+            TagNextExternalEvidencePackageRow.payload_hash == payload_hash
+        )) is None:
+            session.add(TagNextExternalEvidencePackageRow(
+                evidence_package_id=evidence_id, source_id=valid_source_id,
+                candidate_id=candidate_id, snapshot_id=None,
+                evidence_kind="rendered_text" if method.startswith("chrome") else "html",
+                retrieval_method=method, retrieved_at=retrieved_at,
+                original_url=requested_url, archive_url=archive_url,
+                mime_type="text/html", raw_sha256=raw_sha,
+                raw_size_bytes=len(raw_content), storage_path=None,
+                extraction_map_json=json_dumps(dict(extraction_map or {})),
+                parser_version=parser_version, legal_state="public_evidence",
+                rendered_title=rendered_title, rendered_url=resolved_url,
+                raw_text=raw_text, payload_hash=payload_hash,
+            ))
+        if valid_source_id:
+            history_payload = {
+                "sourceId": valid_source_id,
+                "checkedAt": retrieved_at.isoformat(),
+                "responseHash": raw_sha,
+                "status": status,
+            }
+            history_id = "tnsh_" + hashlib.sha256(
+                json_dumps(history_payload).encode("utf-8")
+            ).hexdigest()[:32]
+            if session.get(TagNextSourceHistoryRow, history_id) is None:
+                session.add(TagNextSourceHistoryRow(
+                    history_id=history_id, source_id=valid_source_id,
+                    checked_at=retrieved_at, status=status,
+                    response_hash=raw_sha,
+                    parser_version=parser_version or "unassigned",
+                    provenance_json=json_dumps({
+                        "evidencePackageId": evidence_id,
+                        "candidateId": candidate_id,
+                        "method": method,
+                        "url": resolved_url or requested_url,
+                    }),
+                ))
+    return {"evidencePackageId": evidence_id, "rawSha256": raw_sha, "payloadHash": payload_hash}
+
+
 def _wrong_asset(text: str, url: str) -> bool:
     addresses = {value.lower() for value in re.findall(r"0x[a-fA-F0-9]{40}", text)}
     expected = TAG_CONTRACT.lower()
@@ -296,6 +416,28 @@ def validate_candidate_batch(*, limit: int = 12, timeout_seconds: int = 20) -> d
                 response = client.get(normalized)
                 resolved = normalize_candidate_url(str(response.url))
                 response_hash = hashlib.sha256(response.content).hexdigest()
+                source = _source_for_url(resolved)
+                adapter = adapter_for_url(resolved)
+                document = parse_document(
+                    url=resolved, html=response.text, fetched_at=checked_at,
+                    response_hash=response_hash, headers=dict(response.headers),
+                )
+                title_match = re.search(r"<title[^>]*>(.*?)</title>", response.text, re.I | re.S)
+                record_candidate_evidence(
+                    candidate_id=candidate["id"], method="direct_http",
+                    requested_url=normalized, resolved_url=resolved,
+                    status=f"http_{response.status_code}", retrieved_at=checked_at,
+                    raw_content=response.content, raw_text=response.text,
+                    http_status=response.status_code,
+                    source_id=source["sourceId"] if source else None,
+                    parser_version=adapter.adapter_id if adapter else None,
+                    extraction_map={
+                        "visibleTextCharacters": len(document.visible_text),
+                        "tableRows": len(document.table_rows),
+                        "structuredObjects": len(document.structured_data),
+                    },
+                    rendered_title=" ".join(title_match.group(1).split()) if title_match else None,
+                )
                 access = _access_status(response)
                 if access:
                     if access == "FALLBACK_REQUIRED":
@@ -319,7 +461,6 @@ def validate_candidate_batch(*, limit: int = 12, timeout_seconds: int = 20) -> d
                     continue
 
                 page_text = response.text
-                source = _source_for_url(resolved)
                 if _wrong_asset(page_text, resolved) and source is None:
                     status = "WRONG_ASSET"
                     _write_result(
@@ -333,11 +474,6 @@ def validate_candidate_batch(*, limit: int = 12, timeout_seconds: int = 20) -> d
                     counts[status] = counts.get(status, 0) + 1
                     continue
 
-                adapter = adapter_for_url(resolved)
-                document = parse_document(
-                    url=resolved, html=page_text, fetched_at=checked_at,
-                    response_hash=response_hash, headers=dict(response.headers),
-                )
                 claims = adapter.parse(
                     source_id=source["sourceId"] if source else "unverified_candidate",
                     document=document,
@@ -370,15 +506,24 @@ def validate_candidate_batch(*, limit: int = 12, timeout_seconds: int = 20) -> d
                         "decisionReason": "Forecast-like claims were parsed, but exact TAGGER identity was not independently verified.",
                         "claimCount": len(claims),
                     }
+                elif _page_has_forecast_language(document.visible_text) and adapter is None:
+                    status = "PARSER_REQUIRED"
+                    identity = source["identity"] if source else {"verified": False}
+                    reason = "The opened direct page contains forecast language, but no source-specific adapter exists. This is a parser gap, not proof that the page has no forecast."
+                    _write_parser_required(
+                        candidate_id=candidate["id"], checked_at=checked_at,
+                        normalized_url=normalized, resolved_url=resolved,
+                        http_status=response.status_code, response_hash=response_hash,
+                        source_label=source["sourceId"] if source else None,
+                        independent_family_id=source["independentFamilyId"] if source else None,
+                        identity=identity, reason=reason,
+                    )
+                    counts[status] = counts.get(status, 0) + 1
+                    continue
                 elif _page_has_forecast_language(document.visible_text):
                     status = "NO_ACTUAL_FORECAST"
                     identity = source["identity"] if source else {"verified": False}
-                    evidence = {
-                        "decisionReason": (
-                            "Known adapter found no safe semantic claim; identity/claim remains unresolved."
-                            if adapter else "Page used forecast language but exposed no source-adapted TAGGER claim."
-                        )
-                    }
+                    evidence = {"decisionReason": "The source-specific adapter found no safe semantic claim in the current page evidence."}
                 else:
                     status = "NO_ACTUAL_FORECAST"
                     identity = source["identity"] if source else {"verified": False}
@@ -431,7 +576,7 @@ def seed_known_source_candidates() -> int:
         for seed in SOURCE_SEEDS:
             if not seed["domain"]:
                 continue
-            url = f"https://{seed['domain']}/"
+            url = seed.get("url") or f"https://{seed['domain']}/"
             existing = session.scalar(select(TagNextDiscoveryCandidateRow).where(
                 TagNextDiscoveryCandidateRow.url == url
             ))

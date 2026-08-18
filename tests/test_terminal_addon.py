@@ -723,7 +723,8 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(snapshot["markPrice"], 0.001)
         self.assertEqual(snapshot["indexPrice"], 0.000999)
-        self.assertEqual(snapshot["fundingRate"], 0.0001)
+        self.assertEqual(snapshot["fundingRateDecimal"], 0.0001)
+        self.assertEqual(snapshot["fundingRatePct"], 0.01)
         self.assertEqual(snapshot["futuresPriceChange24hPct"], 2.5)
         self.assertGreater(snapshot["bidDepthUsdWithin1Pct"], 0)
         self.assertGreater(snapshot["askDepthUsdWithin1Pct"], 0)
@@ -792,7 +793,8 @@ class TerminalAddonTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertTrue(row["available"])
-        self.assertEqual(row["fundingRate"], 0.03)
+        self.assertEqual(row["fundingRateDecimal"], 0.0003)
+        self.assertEqual(row["fundingRatePct"], 0.03)
         self.assertEqual(row["takerBuySellRatio"], 1.2)
         self.assertEqual(row["takerWindowQuality"], "live-exact")
 

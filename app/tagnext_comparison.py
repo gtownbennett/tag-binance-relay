@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 
 from .canonical_forecast import TAGNEXT_BASELINE
 from .terminal_config import APP_VERSION
@@ -38,11 +38,19 @@ from .terminal_database import (
     TagNextChampionComparisonRow,
     TagNextConsensusRow,
     TagNextConsensusGradeRow,
+    TagNextCandidateAccessAttemptRow,
+    TagNextCanonicalCorpusRunRow,
+    TagNextDataQualityQuarantineRow,
     TagNextDiscoveryCandidateRow,
+    TagNextDiscoveryCursorRow,
+    TagNextDiscoverySearchAttemptRow,
     TagNextEventLedgerRow,
     TagNextEventOutcomeRow,
     TagNextExitImpactRow,
     TagNextExternalOutcomeScheduleRow,
+    TagNextExternalOutcomeCaptureCursorRow,
+    TagNextExternalEvidencePackageRow,
+    TagNextExternalMetadataRevisionRow,
     TagNextExportRunRow,
     TagNextExternalGradeRow,
     TagNextExternalRevisionRow,
@@ -52,6 +60,8 @@ from .terminal_database import (
     TagNextFeatureRegistryRow,
     TagNextFeatureSnapshotRow,
     TagNextForecastFeatureLinkRow,
+    TagNextForecastSemanticIdentityRow,
+    TagNextForecastClassificationCorrectionRow,
     TagNextHeatmapRow,
     TagNextHistoricalEpisodeRow,
     TagNextHolderHistoryRow,
@@ -64,10 +74,12 @@ from .terminal_database import (
     TagNextProviderRow,
     TagNextProviderCoverageRow,
     TagNextSourceHistoryRow,
+    TagNextSourcePopularityComponentRow,
     TagNextSourceScoreRow,
     TagNextWhaleEntityRow,
     TagNextWhaleEventRow,
     TagNextFuturePathRow,
+    TagNextMarketObservationRow,
     VerifiedOutcomeRow,
     json_dumps,
     session_scope,
@@ -264,7 +276,17 @@ def _jsonl_bytes(rows: Iterable[Mapping[str, Any]]) -> bytes:
 def _safe_model_jsonl(session: Any, model: Any, *, exclude: Sequence[str] = ()) -> bytes:
     """Serialize an explicitly allow-listed model; never inspect environment/config files."""
     excluded = set(exclude)
-    columns = [column.name for column in model.__table__.columns if column.name not in excluded]
+    # Restored pre-RC3 SQLite audit fixtures can lack additive columns. Export
+    # every allow-listed physical column that exists; production PostgreSQL
+    # still exports the complete current model.
+    physical = {
+        column["name"]
+        for column in inspect(session.get_bind()).get_columns(model.__tablename__)
+    }
+    columns = [
+        column.name for column in model.__table__.columns
+        if column.name not in excluded and column.name in physical
+    ]
     rows = session.execute(select(*(getattr(model, name) for name in columns))).all()
     return _jsonl_bytes(dict(zip(columns, row)) for row in rows)
 
@@ -292,6 +314,14 @@ def _safe_export_payloads() -> dict[str, bytes]:
         comparisons = list(session.scalars(select(TagNextChampionComparisonRow)))
         ablations = list(session.scalars(select(TagNextAblationRow)))
         promotions = list(session.scalars(select(TagNextFeaturePromotionRow)))
+        from .tagnext_pipeline import resolved_external_observation_classification
+        resolved_classifications = [
+            {
+                "snapshotId": row.snapshot_id,
+                **resolved_external_observation_classification(session, row),
+            }
+            for row in external
+        ]
         expanded_exports = {
             "canonical_forecasts_full.jsonl": _safe_model_jsonl(session, CanonicalForecastRow),
             "canonical_forecast_grades_full.jsonl": _safe_model_jsonl(session, CanonicalForecastGradeRow),
@@ -314,10 +344,26 @@ def _safe_export_payloads() -> dict[str, bytes]:
             "future_paths.jsonl": _safe_model_jsonl(session, TagNextFuturePathRow),
             "event_ledger.jsonl": _safe_model_jsonl(session, TagNextEventLedgerRow),
             "discovery_candidates.jsonl": _safe_model_jsonl(session, TagNextDiscoveryCandidateRow),
+            "discovery_cursors.jsonl": _safe_model_jsonl(session, TagNextDiscoveryCursorRow),
+            "discovery_search_attempts.jsonl": _safe_model_jsonl(session, TagNextDiscoverySearchAttemptRow),
+            "candidate_access_attempts.jsonl": _safe_model_jsonl(session, TagNextCandidateAccessAttemptRow),
+            "canonical_corpus_runs.jsonl": _safe_model_jsonl(session, TagNextCanonicalCorpusRunRow),
+            "external_sources_full.jsonl": _safe_model_jsonl(session, TagNextExternalSourceRow),
+            "external_snapshots_full.jsonl": _safe_model_jsonl(session, TagNextExternalSnapshotRow),
+            "external_grades_full.jsonl": _safe_model_jsonl(session, TagNextExternalGradeRow),
             "external_revisions.jsonl": _safe_model_jsonl(session, TagNextExternalRevisionRow),
+            "external_metadata_corrections.jsonl": _safe_model_jsonl(session, TagNextExternalMetadataRevisionRow),
+            "external_evidence_packages.jsonl": _safe_model_jsonl(session, TagNextExternalEvidencePackageRow),
+            "semantic_duplicate_mappings.jsonl": _safe_model_jsonl(session, TagNextForecastSemanticIdentityRow),
+            "classification_corrections.jsonl": _safe_model_jsonl(session, TagNextForecastClassificationCorrectionRow),
+            "resolved_observation_classifications.jsonl": _jsonl_bytes(resolved_classifications),
+            "invalid_data_quarantines.jsonl": _safe_model_jsonl(session, TagNextDataQualityQuarantineRow),
             "source_history.jsonl": _safe_model_jsonl(session, TagNextSourceHistoryRow),
+            "source_popularity_components.jsonl": _safe_model_jsonl(session, TagNextSourcePopularityComponentRow),
             "source_scores.jsonl": _safe_model_jsonl(session, TagNextSourceScoreRow),
             "external_outcome_schedules.jsonl": _safe_model_jsonl(session, TagNextExternalOutcomeScheduleRow),
+            "external_outcome_capture_cursor.jsonl": _safe_model_jsonl(session, TagNextExternalOutcomeCaptureCursorRow),
+            "market_observations.jsonl": _safe_model_jsonl(session, TagNextMarketObservationRow),
             "period_outcomes.jsonl": _safe_model_jsonl(session, TagNextPeriodOutcomeRow),
             "consensus_snapshots.jsonl": _safe_model_jsonl(session, TagNextConsensusRow),
             "consensus_grades.jsonl": _safe_model_jsonl(session, TagNextConsensusGradeRow),
@@ -325,11 +371,17 @@ def _safe_export_payloads() -> dict[str, bytes]:
             "whale_events.jsonl": _safe_model_jsonl(session, TagNextWhaleEventRow),
             "event_outcomes.jsonl": _safe_model_jsonl(session, TagNextEventOutcomeRow),
             "provider_coverage.jsonl": _safe_model_jsonl(session, TagNextProviderCoverageRow),
+            "provider_registry.jsonl": _safe_model_jsonl(session, TagNextProviderRow),
             "provider_health.jsonl": _safe_model_jsonl(session, ProviderUsageSnapshotRow),
+            "feature_registry.jsonl": _safe_model_jsonl(session, TagNextFeatureRegistryRow),
+            "feature_promotions.jsonl": _safe_model_jsonl(session, TagNextFeaturePromotionRow),
+            "model_registry.jsonl": _safe_model_jsonl(session, TagNextModelRegistryRow),
             "orderbooks.jsonl": _safe_model_jsonl(session, TagNextOrderBookRow),
             "exit_impact.jsonl": _safe_model_jsonl(session, TagNextExitImpactRow),
             "champion_imports.jsonl": _safe_model_jsonl(session, TagNextChampionImportRow),
             "champion_pairs.jsonl": _safe_model_jsonl(session, TagNextPairedOutcomeRow),
+            "champion_comparisons.jsonl": _safe_model_jsonl(session, TagNextChampionComparisonRow),
+            "ablation_rows.jsonl": _safe_model_jsonl(session, TagNextAblationRow),
             "model_evaluations.jsonl": _safe_model_jsonl(session, TagNextModelEvaluationRow),
             "historical_episodes.jsonl": _safe_model_jsonl(session, TagNextHistoricalEpisodeRow),
         }

@@ -14,6 +14,7 @@ from app.canonical_forecast import (
     PRODUCERS,
     ForecastValidationError,
     build_tagalysis_forecast,
+    canonical_spot_market_truth,
     canonical_features_from_evidence_packet,
     canonicalize_forecast,
     forecast_freshness,
@@ -98,8 +99,23 @@ def _supply_payload() -> dict:
         "assetSymbol": "TAG",
         "network": "BNB Smart Chain",
         "contractAddress": "0x208bf3e7da9639f1eaefa2de78c23396b0682025",
-        "circulatingSupplyTokens": 108_000_000_000.0,
-        "fullyDilutedSupplyTokens": 120_000_000_000.0,
+        "verifiedCirculatingSupplyTokens": 108_000_000_000.0,
+        "totalSupplyTokens": 120_000_000_000.0,
+        "sourceCount": 2,
+        "sourceObservations": [
+            {
+                "source": "fixture-a",
+                "verifiedCirculatingSupplyTokens": 108_000_000_000.0,
+                "observedAt": NOW.isoformat(),
+            },
+            {
+                "source": "fixture-b",
+                "verifiedCirculatingSupplyTokens": 108_100_000_000.0,
+                "observedAt": NOW.isoformat(),
+            },
+        ],
+        "circulatingSupplyDiscrepancyPct": 0.092507,
+        "supplyConfidence": "HIGH",
         "sourceName": "verified supply fixture",
         "sourceReference": "fixture:supply:2026-08-10",
         "verificationStatus": "verified",
@@ -398,6 +414,7 @@ def test_long_term_records_are_honest_four_case_scenarios_with_dynamic_triggers(
 def test_forecast_rejects_unpersisted_or_mismatched_supply_and_portfolio_values() -> None:
     forecast = _forecast("3d")
     bad_supply = copy.deepcopy(forecast)
+    bad_supply["verifiedCirculatingSupplyTokens"] += 1.0
     bad_supply["verifiedSupplyTokens"] += 1.0
     bad_supply = _rehash(bad_supply)
     with pytest.raises(ForecastValidationError, match="differs from its persisted supply"):
@@ -420,7 +437,27 @@ def test_live_collector_does_not_infer_supply_or_screenshot_market_cap() -> None
     main_source = (Path(__file__).parents[1] / "app" / "main.py").read_text(encoding="utf-8")
     assert "TAG_CIRCULATING_SUPPLY" not in main_source
     assert "price_usd * TAG_CIRCULATING_SUPPLY" not in main_source
-    assert "provider-labelled; supply not inferred" in main_source
+    assert '"providerReportedMarketCapUsd": api_market_cap' in main_source
+    assert '"circulatingMarketCapUsd": None' in main_source
+    assert '"fdvUsd": None' in main_source
+
+
+def test_provider_market_cap_cannot_become_supply_and_equations_use_verified_truth() -> None:
+    persisted = persist_asset_truth_snapshot(_supply_payload())
+    spot = canonical_spot_market_truth(
+        {
+            "priceUsd": 0.000942,
+            "providerReportedMarketCapUsd": 381_800_000.0,
+            "providerReportedFdvUsd": 381_800_000.0,
+        }
+    )
+    assert spot["supplySnapshotId"] == persisted["snapshotId"]
+    assert spot["verifiedCirculatingSupplyTokens"] == 108_000_000_000.0
+    assert spot["verifiedCirculatingSupplyTokens"] != pytest.approx(405_307_855_626.32697)
+    assert spot["circulatingMarketCapUsd"] == pytest.approx(0.000942 * 108_000_000_000.0)
+    assert spot["fdvUsd"] == pytest.approx(0.000942 * 120_000_000_000.0)
+    assert spot["providerReportedMarketCapUsd"] == 381_800_000.0
+    assert "marketCapUsd" not in spot
 
 
 def test_migration_is_additive_constrained_and_immutable() -> None:

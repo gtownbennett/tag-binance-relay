@@ -146,10 +146,17 @@ def _evidence_item(
     elif not present_fields:
         validation = "invalid"
         degradation = "unusable"
+    elif declared_status in {"stale", "historical"}:
+        # A provider's explicit stale/historical declaration is authoritative.
+        # Required-field completeness is recorded independently below, but it
+        # must never upgrade declared-stale evidence to current/partial.
+        freshness = "stale"
+        validation = "valid" if len(present_fields) == len(required_fields) else "partial"
+        degradation = "stale"
     elif len(present_fields) < len(required_fields) or declared_status == "partial":
         validation = "partial"
         degradation = "partial"
-    elif freshness == "stale" or declared_status in {"stale", "historical"}:
+    elif freshness == "stale":
         freshness = "stale"
         validation = "valid"
         degradation = "stale"
@@ -277,7 +284,7 @@ def build_canonical_evidence_packet(
                 category="futures",
                 symbol_identity=str(row.get("symbol") or "TAG/USDT perpetual"),
                 payload={**row, "available": available},
-                required_fields=("markPrice", "openInterestUsd", "fundingRate", "volumeUsd24h"),
+                required_fields=("markPrice", "openInterestUsd", "fundingRateDecimal", "volumeUsd24h"),
                 collector="terminal_multi_exchange",
                 transport="official-public-api-or-stream",
                 directness="direct",

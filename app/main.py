@@ -97,12 +97,15 @@ from app.tagnext_intelligence import (
     validate_tag_identity,
 )
 from app.tagnext_pipeline import (
+    capture_due_external_outcomes,
     external_discovery_worker_run,
+    external_outcome_capture_health,
     feature_status_payload,
     grade_due_external_forecasts,
     grade_due_consensus,
     predictions_payload,
     provider_coverage_payload,
+    reconcile_external_semantic_duplicates,
     rebuild_source_scores,
     seed_tagnext_registries,
 )
@@ -130,7 +133,6 @@ from app.tagnext_future_engine import (
 from app.supply_truth import (
     SupplyTruthError,
     verified_tag_supply_payload,
-    verified_tag_supply_payload_from_cmc_and_gecko,
 )
 from app.phase3_learning import (
     Phase3ValidationError,
@@ -219,12 +221,12 @@ from app.terminal_usage import (
 
 import httpx
 import websockets
-from fastapi import Body, FastAPI, Header, HTTPException, Query
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "tagnext-1.0.0-rc2"
+SERVICE_VERSION = "tagnext-0.9.0-rc3"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -232,6 +234,7 @@ WS_BASES = [
     os.getenv("BINANCE_WS_BASE", "wss://fstream.binance.com").rstrip("/"),
 ]
 RELAY_TOKEN = os.getenv("RELAY_TOKEN", "").strip()
+TAGNEXT_APP_READ_TOKEN = os.getenv("TAGNEXT_APP_READ_TOKEN", "").strip()
 CACHE_SECONDS = max(5, int(os.getenv("CACHE_SECONDS", "15")))
 TERMINAL_RESPONSE_CACHE_SECONDS = max(
     60,
@@ -562,7 +565,7 @@ stream_state: dict[str, Any] = {
 
     "markPrice": None,
     "indexPrice": None,
-    "fundingRate": None,
+    "fundingRateDecimal": None,
     "nextFundingTime": None,
     "markEventTime": None,
     "priceChange24hPct": None,
@@ -774,13 +777,17 @@ def latest_item(value: Any) -> dict[str, Any] | None:
 
 
 def require_relay_key(x_relay_key: str | None) -> None:
-    if not RELAY_TOKEN:
+    if not RELAY_TOKEN and not TAGNEXT_APP_READ_TOKEN:
         raise HTTPException(
             status_code=503,
-            detail="Authenticated API is unavailable until RELAY_TOKEN is configured server-side.",
+            detail="Authenticated API is unavailable until a server-side access token is configured.",
         )
     supplied = (x_relay_key or "").strip()
-    if not supplied or not hmac.compare_digest(supplied, RELAY_TOKEN):
+    accepted = bool(supplied) and any(
+        configured and hmac.compare_digest(supplied, configured)
+        for configured in (RELAY_TOKEN, TAGNEXT_APP_READ_TOKEN)
+    )
+    if not accepted:
         raise HTTPException(status_code=401, detail="Missing or invalid X-Relay-Key.")
 
 
@@ -795,7 +802,9 @@ def require_chad_access(x_relay_key: str | None) -> None:
                 "This protects the OpenAI API key from public abuse."
             ),
         )
-    require_relay_key(x_relay_key)
+    supplied = (x_relay_key or "").strip()
+    if not supplied or not hmac.compare_digest(supplied, RELAY_TOKEN):
+        raise HTTPException(status_code=401, detail="Full relay authorization is required.")
 
     if not OPENAI_API_KEY:
         raise HTTPException(
@@ -894,11 +903,6 @@ async def collect_spot_data() -> dict[str, Any]:
     price_usd = as_float(pair.get("priceUsd"))
     api_market_cap = as_float(pair.get("marketCap"))
 
-    # The collector cannot infer circulating supply. Preserve the provider's
-    # labelled pair value; canonical forecasts derive their own market-cap and
-    # portfolio values only from an immutable verified supply snapshot.
-    market_cap = api_market_cap
-
     liquidity = pair.get("liquidity") if isinstance(pair.get("liquidity"), dict) else {}
     volume = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
     price_change = (
@@ -941,12 +945,13 @@ async def collect_spot_data() -> dict[str, Any]:
         },
         "priceUsd": price_usd,
         "priceNative": as_float(pair.get("priceNative")),
-        "marketCapUsd": market_cap,
-        "marketCapSource": (
-            "DEX Screener pair.marketCap (provider-labelled; supply not inferred)"
-        ),
-        "dexScreenerMarketCapUsd": api_market_cap,
-        "fdvUsd": as_float(pair.get("fdv")),
+        # DEX Screener cannot authorize either canonical market-cap field.
+        # Canonical values are added only after a verified supply snapshot is
+        # joined with this price.
+        "circulatingMarketCapUsd": None,
+        "fdvUsd": None,
+        "providerReportedMarketCapUsd": api_market_cap,
+        "providerReportedFdvUsd": as_float(pair.get("fdv")),
         "liquidityUsd": as_float(liquidity.get("usd")),
         "volumeUsd": {
             "m5": as_float(volume.get("m5")),
@@ -1104,11 +1109,12 @@ def current_market_features(snapshot: dict[str, Any], spot: dict[str, Any]) -> d
     spot_volume = spot.get("volumeUsd") if isinstance(spot.get("volumeUsd"), dict) else {}
     return {
         "priceUsd": as_float(spot.get("priceUsd")) or as_float(snapshot.get("markPrice")),
-        "marketCapUsd": as_float(spot.get("marketCapUsd")),
+        "circulatingMarketCapUsd": as_float(spot.get("circulatingMarketCapUsd")),
         "openInterestUsd": as_float(snapshot.get("openInterestUsd")),
         "oiChange1hPct": as_float(snapshot.get("oiChange1hPct")),
         "oiChange4hPct": as_float(snapshot.get("oiChange4hPct")),
-        "fundingRate": as_float(snapshot.get("fundingRate")),
+        "fundingRateDecimal": as_float(snapshot.get("fundingRateDecimal")),
+        "fundingRatePct": as_float(snapshot.get("fundingRatePct")),
         "takerBuySellRatio": as_float(snapshot.get("takerBuySellRatio")),
         "globalLongShortRatio": as_float(snapshot.get("globalLongShortRatio")),
         "topPositionRatio": as_float(snapshot.get("topPositionRatio")),
@@ -1682,9 +1688,12 @@ async def collect_snapshot(*, include_rest_state: bool = False) -> dict[str, Any
 
     mark_price = preferred_float(live.get("markPrice"), premium.get("markPrice"))
     index_price = preferred_float(live.get("indexPrice"), premium.get("indexPrice"))
-    funding_rate = as_float(live.get("fundingRate"))
-    if funding_rate is None:
-        funding_rate = as_float(premium.get("lastFundingRate"))
+    funding_rate_decimal = as_float(live.get("fundingRateDecimal"))
+    if funding_rate_decimal is None:
+        funding_rate_decimal = as_float(premium.get("lastFundingRate"))
+    funding_rate_pct = (
+        funding_rate_decimal * 100.0 if funding_rate_decimal is not None else None
+    )
     next_funding_time = preferred_int(
         live.get("nextFundingTime"),
         premium.get("nextFundingTime")
@@ -1776,7 +1785,8 @@ async def collect_snapshot(*, include_rest_state: bool = False) -> dict[str, Any
         "markPrice": mark_price,
         "indexPrice": index_price,
         "basisBps": basis_bps,
-        "fundingRate": funding_rate,
+        "fundingRateDecimal": funding_rate_decimal,
+        "fundingRatePct": funding_rate_pct,
         "nextFundingTime": next_funding_time,
         "openInterestContracts": open_interest_contracts,
         "openInterestUsd": open_interest_usd,
@@ -2045,7 +2055,7 @@ async def market_stream_listener() -> None:
                             async with stream_lock:
                                 stream_state["markPrice"] = as_float(payload.get("p"))
                                 stream_state["indexPrice"] = as_float(payload.get("i"))
-                                stream_state["fundingRate"] = as_float(payload.get("r"))
+                                stream_state["fundingRateDecimal"] = as_float(payload.get("r"))
                                 stream_state["nextFundingTime"] = as_int(payload.get("T"))
                                 stream_state["markEventTime"] = event_time
 
@@ -2295,7 +2305,7 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
         raise RuntimeError("HTTP client is unavailable")
 
     async def collect() -> dict[str, Any]:
-        coin_gecko_response, coin_market_cap_response, bsc_response, gecko_response = await asyncio.gather(
+        coin_gecko_response, coin_market_cap_response, bsc_response = await asyncio.gather(
             http_client.get(
                 "https://api.coingecko.com/api/v3/coins/tagger",
                 params={
@@ -2320,32 +2330,24 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
                     ],
                 },
             ),
-            http_client.get(
-                f"https://api.geckoterminal.com/api/v2/networks/{DEX_CHAIN_ID}/pools/{DEX_PAIR_ADDRESS}",
-                headers={"Accept": "application/json;version=20230302"},
-            ),
         )
-        for response in (coin_market_cap_response, bsc_response, gecko_response):
+        for response in (coin_market_cap_response, bsc_response):
             response.raise_for_status()
         cmc_document = coin_market_cap_response.json()
         cmc_payload = cmc_document.get("data") if isinstance(cmc_document, dict) else {}
         bsc_total = (bsc_response.json() or {}).get("result")
         retrieved_at = terminal_utc_now()
-        if coin_gecko_response.is_success:
-            payload = verified_tag_supply_payload(
-                coingecko=coin_gecko_response.json(),
-                coinmarketcap=cmc_payload,
-                bsc_total_supply_hex=bsc_total,
-                retrieved_at=retrieved_at,
+        if not coin_gecko_response.is_success:
+            raise SupplyTruthError(
+                "verified circulating supply unavailable: two compatible current authoritative "
+                f"sources are required; CoinGecko HTTP {coin_gecko_response.status_code}"
             )
-        else:
-            payload = verified_tag_supply_payload_from_cmc_and_gecko(
-                coinmarketcap=cmc_payload,
-                geckoterminal=gecko_response.json(),
-                bsc_total_supply_hex=bsc_total,
-                retrieved_at=retrieved_at,
-                unavailable_sources=(f"CoinGecko HTTP {coin_gecko_response.status_code}",),
-            )
+        payload = verified_tag_supply_payload(
+            coingecko=coin_gecko_response.json(),
+            coinmarketcap=cmc_payload,
+            bsc_total_supply_hex=bsc_total,
+            retrieved_at=retrieved_at,
+        )
         stored = await asyncio.to_thread(persist_asset_truth_snapshot, payload)
         return {
             **stored,
@@ -2397,7 +2399,7 @@ async def evaluate_event_driven_chad() -> dict[str, Any]:
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
         for source, target in (
             ("oiChange1hPct", "openInterestChange"),
-            ("fundingRate", "funding"),
+            ("fundingRatePct", "funding"),
             ("takerBuySellRatio", "takerImbalance"),
         ):
             if source in payload and target not in compact_features:
@@ -2582,8 +2584,14 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
         discovery = await asyncio.to_thread(public_discovery_worker_run)
         revisit = await asyncio.to_thread(external_discovery_worker_run)
         return {"publicDiscovery": discovery, "verifiedSourceRevisit": revisit}
+    if job_type == "capture_tagnext_external_outcomes":
+        return await asyncio.to_thread(capture_due_external_outcomes)
     if job_type == "grade_tagnext_external_forecasts":
+        # Defensive capture preserves ordering even when an operator invokes
+        # grading directly. The durable capture job is also scheduled alone.
+        capture = await asyncio.to_thread(capture_due_external_outcomes)
         result = await asyncio.to_thread(grade_due_external_forecasts)
+        result["outcomeCapture"] = capture
         result["consensusGrades"] = await asyncio.to_thread(grade_due_consensus)
         result["sourceScores"] = await asyncio.to_thread(rebuild_source_scores)
         return result
@@ -2721,6 +2729,14 @@ async def phase1_job_loop() -> None:
                         max_attempts=2,
                     )
                     grading_bucket = int(time.time()) // 300 * 300
+                    await asyncio.to_thread(
+                        enqueue_job,
+                        job_type="capture_tagnext_external_outcomes",
+                        idempotency_key=f"tagnext-external-outcome-capture:{grading_bucket}",
+                        origin="server-scheduler",
+                        payload={"bucket": grading_bucket, "deadlinePolicy": "exact_or_verified_candle"},
+                        max_attempts=3,
+                    )
                     await asyncio.to_thread(
                         enqueue_job,
                         job_type="grade_tagnext_external_forecasts",
@@ -2927,6 +2943,24 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def enforce_scoped_app_read_token(request: Request, call_next: Any) -> Any:
+    """A phone-scoped token can read authenticated screens, never mutate."""
+
+    supplied = request.headers.get("X-Relay-Key", "").strip()
+    is_scoped_read_token = bool(
+        TAGNEXT_APP_READ_TOKEN
+        and supplied
+        and hmac.compare_digest(supplied, TAGNEXT_APP_READ_TOKEN)
+    )
+    if is_scoped_read_token and request.method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "TAGneXt app token is read-only; mutation endpoints are forbidden."},
+        )
+    return await call_next(request)
+
+
 @app.get("/")
 async def root() -> dict[str, Any]:
     return {
@@ -3104,6 +3138,14 @@ async def tagnext_provider_coverage(
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
     return {"ok": True, **await asyncio.to_thread(provider_coverage_payload)}
+
+
+@app.get("/v1/tagnext/external-outcomes/health")
+async def tagnext_external_outcome_health(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    return {"ok": True, **await asyncio.to_thread(external_outcome_capture_health)}
 
 
 @app.post("/v1/tagnext/precursors")
@@ -4341,7 +4383,7 @@ async def _run_chad_analysis(
                 model=str(raw_response.get("model", OPENAI_MODEL)),
                 question=request.question,
                 start_price_usd=start_price,
-                market_cap_usd=as_float(spot.get("marketCapUsd")),
+                market_cap_usd=as_float(spot.get("circulatingMarketCapUsd")),
                 market_state=str(analysis.get("marketState", "")),
                 confidence=as_int(analysis.get("confidence")),
                 data_quality=(

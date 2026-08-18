@@ -15,7 +15,7 @@ IMAGE_WORKFLOW = (ROOT / ".github/workflows/publish-image.yml").read_text(
 
 class FullForecastContractTests(unittest.TestCase):
     def test_version_and_workflows_cover_current_production_lineage(self):
-        self.assertIn('SERVICE_VERSION = "tagnext-1.0.0-rc2"', MAIN)
+        self.assertIn('SERVICE_VERSION = "tagnext-0.9.0-rc3"', MAIN)
         self.assertIn('TAGneXt-Relay/{SERVICE_VERSION}', MAIN)
         self.assertNotIn('TAG-Terminal-Relay/{SERVICE_VERSION}', MAIN)
         self.assertIn('APP_VERSION = "tagnext-1.0.0-rc2"', CONFIG)

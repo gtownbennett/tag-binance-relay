@@ -56,6 +56,7 @@ from .terminal_paper_social import (
     update_caller_stats,
 )
 from .terminal_usage import LIVE_COLLECTORS_ENABLED, REPAIR_MODE, usage_governor
+from .canonical_forecast import canonical_spot_market_truth
 
 
 def _parse_datetime(value: Any) -> datetime:
@@ -289,14 +290,13 @@ class TerminalAddon:
             if not force and cached is not None and now - self.market_cache["time"] < 15:
                 return cached
 
+            spot = canonical_spot_market_truth(spot)
             spot_change = spot.get("priceChangePct") if isinstance(spot.get("priceChangePct"), dict) else {}
             spot_volume = spot.get("volumeUsd") if isinstance(spot.get("volumeUsd"), dict) else {}
             spot_txns = spot.get("transactions") if isinstance(spot.get("transactions"), dict) else {}
             spot_h1 = spot_txns.get("h1") if isinstance(spot_txns.get("h1"), dict) else {}
             spot_compat = {
                 **spot,
-                "marketCap": as_float(spot.get("marketCapUsd") or spot.get("marketCap")),
-                "fdv": as_float(spot.get("fdvUsd") or spot.get("fdv")),
                 "volumeH1": as_float(spot_volume.get("h1") if spot_volume else spot.get("volumeH1")),
                 "volumeH24": as_float(spot_volume.get("h24") if spot_volume else spot.get("volumeH24")),
                 "priceChangeH1": as_float(spot_change.get("h1") if spot_change else spot.get("priceChangeH1")),
@@ -393,7 +393,7 @@ class TerminalAddon:
                 SpotSnapshotRow(
                     recorded_at=_parse_datetime(spot.get("generatedAt") or spot.get("recordedAt")),
                     price=as_float(spot.get("priceUsd")),
-                    market_cap=as_float(spot.get("marketCapUsd") or spot.get("marketCap")),
+                    market_cap=as_float(spot.get("providerReportedMarketCapUsd")),
                     liquidity_usd=as_float(spot.get("liquidityUsd")),
                     price_change_1h=as_float(
                         (spot.get("priceChangePct") or {}).get("h1")
@@ -414,11 +414,9 @@ class TerminalAddon:
                     recorded_at=now,
                     price=as_float(payload.get("markPrice")),
                     open_interest_usd=as_float(payload.get("openInterestUsd")),
-                    funding_rate=(
-                        as_float(payload.get("fundingRate")) * 100
-                        if as_float(payload.get("fundingRate")) is not None
-                        else None
-                    ),
+                    funding_rate=None,
+                    funding_rate_decimal=as_float(payload.get("fundingRateDecimal")),
+                    funding_rate_pct=as_float(payload.get("fundingRatePct")),
                     global_long_short=as_float(payload.get("globalLongShortRatio")),
                     top_account_ratio=as_float(payload.get("topAccountRatio")),
                     top_position_ratio=as_float(payload.get("topPositionRatio")),
@@ -490,7 +488,7 @@ class TerminalAddon:
                     price=as_float(spot.get("priceUsd")),
                     price_change_1h=as_float(spot.get("priceChangeH1")),
                     aggregate_oi_usd=as_float(futures.get("openInterestUsd")),
-                    funding_pct=as_float(futures.get("fundingRate")),
+                    funding_pct=as_float(futures.get("fundingRatePct")),
                     active_exchange_count=as_int(futures.get("activeExchangeCount")) or len(active_names),
                     payload_json=json_dumps(payload),
                 )
@@ -540,7 +538,7 @@ class TerminalAddon:
                 .order_by(BinanceSnapshot.recorded_at.desc())
                 .limit(1)
             )
-        spot = json.loads(spot_row.payload_json) if spot_row else {}
+        spot = canonical_spot_market_truth(json.loads(spot_row.payload_json) if spot_row else {})
         aggregate = json.loads(aggregate_row.payload_json) if aggregate_row else {}
         futures = (
             aggregate.get("futures")

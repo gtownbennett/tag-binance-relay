@@ -162,9 +162,6 @@ def forecast_snapshot_fingerprint(snapshot: Mapping[str, Any]) -> str:
     stable = {
         "sourceId": snapshot.get("sourceId") or snapshot.get("source"),
         "assetAuthority": snapshot.get("assetAuthority") or snapshot.get("asset"),
-        "forecastFamilyId": snapshot.get("forecastFamilyId"),
-        "independentFamilyId": snapshot.get("independentFamilyId"),
-        "originalHorizonLabel": snapshot.get("originalHorizonLabel"),
         "normalizedHorizon": snapshot.get("normalizedHorizon") or snapshot.get("horizon"),
         "targetSemantics": snapshot.get("targetSemantics") or "point_at_deadline",
         "periodStart": snapshot.get("periodStart"),
@@ -177,15 +174,11 @@ def forecast_snapshot_fingerprint(snapshot: Mapping[str, Any]) -> str:
         "targetNativePrice": snapshot.get("targetNativePrice"),
         "targetNativeLow": snapshot.get("targetNativeLow"),
         "targetNativeHigh": snapshot.get("targetNativeHigh"),
-        "movePct": snapshot.get("movePct"),
-        "referencePrice": snapshot.get("referencePrice"),
         "direction": snapshot.get("direction"),
         "probability": snapshot.get("probability"),
         "scenarioClass": snapshot.get("scenarioClass"),
         "scenarioYear": snapshot.get("scenarioYear"),
         "conditionalTrigger": snapshot.get("conditionalTrigger"),
-        "methodologyVersion": snapshot.get("methodologyVersion"),
-        "gradeability": snapshot.get("gradeability") or "point",
     }
     encoded = json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

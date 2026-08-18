@@ -772,7 +772,10 @@ async def backfill_month(month: str) -> dict[str, Any]:
                 "retrievedAt": retrieved_at.isoformat(),
                 "reliabilityStatus": "primary_archive",
                 "validationStatus": "valid",
-                "values": {"fundingRate": row["value"]},
+                "values": {
+                    "fundingRateDecimal": row["value"],
+                    "fundingRatePct": row["value"] * 100.0,
+                },
                 "provenance": {
                     "archive": url,
                     "archiveSha256": archive_hash,
