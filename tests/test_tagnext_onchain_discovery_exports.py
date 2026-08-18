@@ -168,6 +168,8 @@ def test_full_brain_export_has_manifest_internal_checksums_and_no_secret_files(t
         } <= names
         manifest = json.loads(archive.read("manifest.json"))
         assert manifest["secretMaterialIncluded"] is False
+        assert manifest["serviceVersion"] == "tagnext-0.9.0-rc3"
+        assert manifest["terminalAddonVersion"] == "tagnext-1.0.0-rc2"
         assert not any(name.lower().endswith(".env") for name in names)
         for item in manifest["files"]:
             assert hashlib.sha256(archive.read(item["path"])).hexdigest() == item["sha256"]
