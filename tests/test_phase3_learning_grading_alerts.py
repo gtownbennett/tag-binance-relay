@@ -1051,6 +1051,28 @@ def test_phase4_control_center_never_fakes_chad_or_final_call() -> None:
     assert complete["sideEffects"] == "none"
 
 
+def test_phase4_control_center_excludes_hash_mismatched_forecast_instead_of_500() -> None:
+    forecast = _forecast()
+    persist_canonical_forecast(forecast)
+    with session_scope() as session:
+        row = session.get(CanonicalForecastRow, forecast["forecastId"])
+        assert row is not None
+        payload = json.loads(row.payload_json)
+        payload["pointForecastUsd"] = payload["pointForecastUsd"] * 2
+        row.payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    snapshot = canonical_control_center_snapshot(now=NOW + timedelta(minutes=2))
+
+    assert snapshot["authoritative"] is True
+    assert snapshot["sideEffects"] == "none"
+    assert snapshot["forecasts"] == []
+    assert snapshot["currentCall"]["forecastId"] is None
+    assert snapshot["dataQuality"] == {
+        "invalidForecastsExcluded": 1,
+        "invalidForecastPolicy": "FAIL_CLOSED_IMMUTABLE_CONTENT_VALIDATION",
+    }
+
+
 def test_phase4_control_center_uses_newest_issue_and_same_producer_revision() -> None:
     older = _forecast(issued_at=NOW + timedelta(minutes=1), point=0.00105)
     newer = _forecast(issued_at=NOW + timedelta(minutes=31), point=0.00115)

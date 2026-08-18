@@ -7,7 +7,11 @@ from typing import Any
 
 from sqlalchemy import select
 
-from app.canonical_forecast import format_canonical_forecast, forecast_freshness
+from app.canonical_forecast import (
+    ForecastValidationError,
+    format_canonical_forecast,
+    forecast_freshness,
+)
 from app.phase1_reliability import latest_evidence_packet
 from app.phase3_learning import HORIZON_MINIMUM_SAMPLES, active_alerts, current_user_levels
 from app.historical_memory import historical_production_summary
@@ -213,22 +217,37 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
 
     by_key: dict[tuple[str, str], list[CanonicalForecastRow]] = defaultdict(list)
     for row in forecast_rows:
-        if len(by_key[(row.producer, row.horizon)]) < 2:
-            by_key[(row.producer, row.horizon)].append(row)
+        by_key[(row.producer, row.horizon)].append(row)
     live_grade_by_forecast = {
         row.forecast_id: row
         for row in grade_rows
         if row.evaluation_kind == "live" and row.forecast_id
     }
     forecasts: list[dict[str, Any]] = []
+    invalid_forecast_count = 0
     for key in sorted(by_key):
-        rows = by_key[key]
-        current = _record(rows[0], observed_now)
-        previous = _record(rows[1], observed_now) if len(rows) > 1 else None
+        valid: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for row in by_key[key]:
+            candidate = _record(row, observed_now)
+            try:
+                presentation = format_canonical_forecast(
+                    candidate,
+                    now=observed_now,
+                )
+            except (ForecastValidationError, KeyError, TypeError, ValueError):
+                invalid_forecast_count += 1
+                continue
+            valid.append((candidate, presentation))
+            if len(valid) == 2:
+                break
+        if not valid:
+            continue
+        current, presentation = valid[0]
+        previous = valid[1][0] if len(valid) > 1 else None
         forecasts.append(
             {
                 "record": current,
-                "presentation": format_canonical_forecast(current, now=observed_now),
+                "presentation": presentation,
                 "previousRecord": previous,
                 "grade": _grade_status(current, live_grade_by_forecast.get(current["forecastId"]), observed_now),
             }
@@ -296,4 +315,8 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
         "marketTruth": _canonical_market_truth(),
         "historicalProduction": historical_production_summary(),
         "prospectiveLearning": prospective_population(),
+        "dataQuality": {
+            "invalidForecastsExcluded": invalid_forecast_count,
+            "invalidForecastPolicy": "FAIL_CLOSED_IMMUTABLE_CONTENT_VALIDATION",
+        },
     }
