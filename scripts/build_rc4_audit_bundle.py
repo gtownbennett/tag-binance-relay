@@ -485,10 +485,13 @@ compression driven primarily by price, not a 24.8% token-OI liquidation.
 
 ## Owner/external action still required
 
-- Restore browser control, verify the dedicated `tagalysis_history_importer` has
-  no active production consumer, then request explicit owner approval before
-  rotating only that role. Verify `BEGIN READ ONLY`, harmless reads, rejected
-  write, and `ROLLBACK`; import the row-level champion history without secrets.
+- Read-only Neon inspection confirmed `tagalysis_history_importer` exists with
+  no elevated role flags and zero other active sessions, but `LOGIN` is disabled.
+  Explicit owner approval is still required before re-enabling/rotating only that
+  role. After rotation, verify `BEGIN READ ONLY`, harmless reads, rejected write,
+  and `ROLLBACK`; then set Render service `tagnext-challenger` → Environment →
+  `TAGALYSIS_HISTORY_IMPORT_URL` without displaying the value. Saving must wait
+  while the no-deploy review hold remains in force.
 {device_pending_verification}
 - Complete only free/no-card provider onboarding after exact TAG coverage is
   proven. No account, credential, or paid resource was created in this run.
@@ -529,6 +532,46 @@ Until these checks pass, the release state remains `{gate_state}`.
   {counts['shadow_features']} shadow, {counts['rejected_features']} rejected.
 
 Database-level feature rows are in `intelligence/feature-registry.json`.
+"""
+    champion_role_report = """# TAGalysis champion read-only role audit
+
+This report is sanitized. It contains no connection URL, password, token,
+account identifier, or personal login data.
+
+## Read-only inspection result
+
+A purpose-built Neon connector issued one harmless `SELECT` against the existing
+production branch. No resource was created and no data or role configuration was
+changed.
+
+- Role: `tagalysis_history_importer`.
+- Superuser, create-role, create-database, replication, and bypass-RLS flags: all false.
+- Role inheritance: false.
+- Other active sessions for the role: 0.
+- Role timeouts: statement 60 seconds; lock 5 seconds.
+- Login capability: **false**.
+
+Because `LOGIN` is disabled, a URL using this role cannot currently be a valid
+connection even if the stored password text is otherwise correct. The RC4 gate
+requires explicit owner approval before re-enabling or rotating only this role.
+
+## Exact owner-interaction surfaces
+
+1. Neon Console → project `tag-terminal-rc2-preview-db` → production branch →
+   SQL Editor: re-enable/rotate only `tagalysis_history_importer` after explicit
+   approval, retaining least privilege and enforcing read-only transactions.
+2. Render Dashboard → service `tagnext-challenger` → Environment → Environment
+   Variables → `TAGALYSIS_HISTORY_IMPORT_URL`: replace the secret without showing,
+   logging, exporting, or committing it.
+3. Do not save a Render change while the no-deploy review hold is active if the
+   save would restart or deploy the service.
+4. After approval and configuration, verify `BEGIN READ ONLY`, a harmless read,
+   a rejected write attempt, and `ROLLBACK` without exposing the connection value.
+
+The Chrome-control plugin was installed, but its required runtime was not callable
+in this session. No alternate browser was substituted because the owner explicitly
+required Chrome. The champion import therefore remains blocked and rows/pairs
+remain 0/0.
 """
     device_report = f"""# Device acceptance report
 
@@ -662,6 +705,7 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
             "reports/VERIFICATION_QUEUE.md": verification.encode(),
             "reports/FUNCTIONAL_STATE_INVENTORY.md": features.encode(),
             "reports/DEVICE_ACCEPTANCE.md": device_report.encode(),
+            "reports/CHAMPION_READONLY_ROLE_AUDIT.md": champion_role_report.encode(),
             "reports/DEPLOYMENT_PLAN_AND_COSTS.md": deployment.encode(),
             "providers/RC4_PROVIDER_ACCOUNT_MANIFEST.md": accounts.encode(),
             "inventory/RC4_AUTHORITATIVE_COUNTS.json": _json_bytes(counts),
