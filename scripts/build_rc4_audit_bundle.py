@@ -59,7 +59,8 @@ def _json_bytes(value: Any) -> bytes:
 
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", *args], cwd=repo, check=True, capture_output=True, text=True,
+        ["git", "-c", f"safe.directory={repo.as_posix()}", *args],
+        cwd=repo, check=True, capture_output=True, text=True,
         encoding="utf-8", errors="replace",
     ).stdout
 
