@@ -71,6 +71,80 @@ WHERE snapshot.snapshot_id IN (
 )
 ON CONFLICT (entity_type, entity_id, reason_code) DO NOTHING;
 
+-- A post-checkpoint scheduler revisit emitted one more CoinCodex 2047
+-- structured-data maximum from a value absent from the retained visible page.
+-- Freeze the original, then append the same fail-closed classification.
+INSERT INTO tagnext_data_quality_quarantine (
+    quarantine_id, entity_type, entity_id, reason_code, detected_at,
+    original_payload_json, excluded_domains_json, evidence_json, payload_hash
+)
+SELECT
+    'rc4-invalid-parser-' || snapshot.snapshot_id,
+    'external_forecast_snapshot', snapshot.snapshot_id,
+    'INVALID_PARSER_OUTPUT', NOW(),
+    json_build_object(
+        'snapshotId', snapshot.snapshot_id, 'sourceId', snapshot.source_id,
+        'capturedAt', snapshot.captured_at, 'horizon', snapshot.horizon,
+        'targetSemantics', snapshot.target_semantics, 'targetPrice', snapshot.target_price,
+        'payloadHash', snapshot.payload_hash, 'provenance', snapshot.provenance_json::jsonb
+    )::TEXT,
+    '["outcome_capture","grading","source_scores","consensus","predictions","learning","model_selection","feature_generation","alerts","comparison"]',
+    json_build_object(
+        'basis', 'CoinCodex 2047 period maximum came from structured-data projection content absent from the retained visible forecast evidence.',
+        'rawEvidencePreservedIn', 'tagnext_external_forecast_snapshots.captured_text'
+    )::TEXT,
+    repeat(md5('rc4-invalid-parser-' || snapshot.snapshot_id), 2)
+FROM tagnext_external_forecast_snapshots snapshot
+WHERE snapshot.snapshot_id = 'tnefs_6a1cb9b88e5f20953f50fb8318f035a5'
+ON CONFLICT (entity_type, entity_id, reason_code) DO NOTHING;
+
+UPDATE tagnext_external_outcome_schedules
+SET status = 'invalid_data_quarantined',
+    last_error = 'Snapshot is excluded by RC4 INVALID_PARSER_OUTPUT quarantine.',
+    updated_at = NOW()
+WHERE snapshot_id = 'tnefs_6a1cb9b88e5f20953f50fb8318f035a5'
+  AND status NOT IN ('invalid_data_quarantined', 'superseded_duplicate_cancelled');
+
+-- These post-checkpoint search results are ordinary cleaning calculators,
+-- dictionaries, keyboard-shortcut pages, or unrelated Reddit threads. Their
+-- URLs and discovery provenance remain stored; only the terminal decision is
+-- filled in so they cannot count as unresolved forecast candidates.
+UPDATE tagnext_discovery_candidates
+SET state = 'rejected',
+    final_status = 'WRONG_ASSET',
+    reason = 'RC4 post-scheduler reconciliation: unrelated to the TAGGER token forecast corpus.',
+    retry_status = 'not_required',
+    last_checked_at = NOW(),
+    next_check_at = NULL,
+    evidence_json = json_build_object(
+        'classification', 'WRONG_ASSET',
+        'basis', 'URL/title subject is unrelated to TAGGER cryptocurrency forecasts.',
+        'reconciledBy', 'RC4_POST_SCHEDULER_CORPUS_GATE'
+    )::TEXT
+WHERE candidate_id IN (
+    'tndc_813bc6045319b22884d59dea2b100a19',
+    'tndc_a0a12209eeab8b9da995a595fef27a8e',
+    'tndc_905d251ff7763f06c0d60d85f0f55214',
+    'tndc_a7f23a0bd0d1c18cfc947d94eef524ee',
+    'tndc_1e91ad9704c431aafa21767a1cf496a4',
+    'tndc_d579a820f2565d160a10e8c7c35275d1',
+    'tndc_365b1feabc513d6352aa6740dd679226',
+    'tndc_7324f964a9372ea47e24e1bdba355430',
+    'tndc_345a665b5c2a0a12f07906ec41dc10c4',
+    'tndc_cc8f9cff5567d6dcee53bf0239aa266b',
+    'tndc_a2fce0525f59910c89683b1062d1466b',
+    'tndc_9b0e4eaaa04e2b871bc5388ee2c28f33',
+    'tndc_f9aa7251fb809c8785d83da0539739c0',
+    'tndc_432559482da2b42a269dca398951cd92',
+    'tndc_4f59cc3bcd16d5a49a5f780fc439fea0',
+    'tndc_b6e5ec67827ef9cf9b65b634b4ad25ab',
+    'tndc_79f58255f4c2cbfa34f57ae34da9b9ef',
+    'tndc_e0f9f113d41620c00291ea7ef92305af',
+    'tndc_e8a26e3ce0adf874907c053796b0bdef',
+    'tndc_4b1ea9ee74c31b9b8840fafe73d6051a',
+    'tndc_67cbf05861d613a20185800dba3b001b'
+);
+
 INSERT INTO tagnext_data_quality_quarantine (
     quarantine_id, entity_type, entity_id, reason_code, detected_at,
     original_payload_json, excluded_domains_json, evidence_json, payload_hash

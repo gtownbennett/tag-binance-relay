@@ -342,6 +342,7 @@ def test_complete_period_range_e2e_uses_actual_minimum_and_maximum() -> None:
     assert second_capture["completed"] == 1
     assert grade_due_external_forecasts(now=period_end + timedelta(seconds=1))["graded"] == 1
     assert rebuild_source_scores(cutoff_at=period_end + timedelta(seconds=1))["written"] == 1
+    assert rebuild_source_scores(cutoff_at=period_end + timedelta(seconds=2))["written"] == 0
     assert grade_due_consensus(now=period_end + timedelta(seconds=1))["graded"] == 1
     health = external_outcome_capture_health()
     assert health["durableCursor"] is True

@@ -2589,7 +2589,7 @@ def rebuild_source_scores(*, cutoff_at: datetime | str | None = None) -> dict[st
                     values = [float(row[key]) for row in metric_rows if row.get(key) is not None]
                     return statistics.fmean(values) if values else None
 
-                payload = {
+                score_values = {
                     "sourceId": source.source_id, "horizon": horizon,
                     "sampleCount": sample_count, "directionAccuracy": accuracy,
                     "mae": mae, "meanAbsolutePercentageError": _mean("absolutePercentageError"),
@@ -2600,8 +2600,17 @@ def rebuild_source_scores(*, cutoff_at: datetime | str | None = None) -> dict[st
                     "meanChasingPenalty": _mean("chasingPenalty"),
                     "skillVersusPersistence": _mean("skillVersusPersistence"),
                     "decisionUsefulness": _mean("decisionUsefulness"),
-                    "cutoffAt": cutoff.isoformat(),
                 }
+                latest_score = session.scalar(select(TagNextSourceScoreRow).where(
+                    TagNextSourceScoreRow.source_id == source.source_id,
+                    TagNextSourceScoreRow.horizon == horizon,
+                ).order_by(TagNextSourceScoreRow.cutoff_at.desc()).limit(1))
+                if latest_score is not None:
+                    latest_values = json.loads(latest_score.score_json or "{}")
+                    latest_values.pop("cutoffAt", None)
+                    if latest_values == score_values:
+                        continue
+                payload = {**score_values, "cutoffAt": cutoff.isoformat()}
                 score_id = _id("tnss", payload)
                 if session.get(TagNextSourceScoreRow, score_id) is None:
                     session.add(TagNextSourceScoreRow(
