@@ -553,6 +553,9 @@ def register_external_source(payload: Mapping[str, Any]) -> dict[str, Any]:
         payload.get("independentFamilyId")
         or _id("tnif", {"domain": (urlsplit(url).hostname or "").lower(), "adapter": adapter_id})
     )
+    parser_status = str(
+        payload.get("parserStatus") or ("ready" if adapter else "adapter_required")
+    )
     now = utc_now()
     with session_scope() as session:
         row = session.get(TagNextExternalSourceRow, source_id)
@@ -567,7 +570,7 @@ def register_external_source(payload: Mapping[str, Any]) -> dict[str, Any]:
                 declared_cadence_seconds=int(declared_cadence) if declared_cadence else None,
                 configured_cadence_seconds=configured_cadence,
                 next_check_at=now,
-                parser_status="ready" if adapter else "adapter_required",
+                parser_status=parser_status,
                 source_state_json=json_dumps({"registrationVersion": PARSER_FRAMEWORK_VERSION}),
             )
             session.add(row)
@@ -583,7 +586,7 @@ def register_external_source(payload: Mapping[str, Any]) -> dict[str, Any]:
             row.declared_cadence_seconds = int(declared_cadence) if declared_cadence else None
             row.configured_cadence_seconds = configured_cadence
             row.next_check_at = row.next_check_at or now
-            row.parser_status = "ready" if adapter else "adapter_required"
+            row.parser_status = parser_status
     return {"sourceId": source_id, "accessState": access_state, "identity": identity}
 
 

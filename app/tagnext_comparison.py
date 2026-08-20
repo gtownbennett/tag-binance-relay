@@ -89,7 +89,7 @@ from .terminal_database import (
 
 COMPARISON_VERSION = "tagnext-paired-comparison-v1"
 EXPORT_VERSION = "tagnext-full-brain-export-v1"
-RC3_SERVICE_VERSION = "tagnext-0.9.0-rc3"
+RC4_SERVICE_VERSION = "tagnext-0.9.0-rc4"
 CHAMPION_PRODUCERS = ("tagalysis", "champion")
 
 
@@ -486,7 +486,7 @@ def create_full_brain_export(destination: str | Path) -> dict[str, Any]:
     manifest = {
         "exportVersion": EXPORT_VERSION,
         "systemId": "tagnext",
-        "serviceVersion": RC3_SERVICE_VERSION,
+        "serviceVersion": RC4_SERVICE_VERSION,
         "terminalAddonVersion": APP_VERSION,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "files": [{"path": name,"bytes": len(files[name]),"sha256": checksums[name]} for name in sorted(files)],
