@@ -43,6 +43,36 @@ SECRET_PATTERNS = {
     "google_api_key": re.compile(rb"\bAIza[0-9A-Za-z_-]{30,}\b"),
     "jwt": re.compile(rb"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b"),
 }
+DEVICE_EVIDENCE_STEMS = {
+    "outer": {
+        "backend-restored",
+        "data-sources-phonelink-vd",
+        "event-ledger-phonelink-vd",
+        "export-screen-phonelink-vd",
+        "forecast-history-phonelink-vd",
+        "forecast-phonelink-vd",
+        "future-paths-phonelink-vd",
+        "heatmap-phonelink-vd",
+        "learning-history-phonelink-vd",
+        "leverage-phonelink-vd",
+        "liquidity-supply-detail-phonelink-vd",
+        "market-evidence-phonelink-vd",
+        "market-sources-phonelink-vd",
+        "more-phonelink-vd",
+        "more-scrolled-phonelink-vd",
+        "offline-state",
+        "patterns-phonelink-vd",
+        "position-phonelink-vd",
+        "predictions-phonelink-vd",
+        "restart-persistence",
+        "whales-phonelink-vd",
+    },
+    "inner": {
+        "app-current-1968x2184",
+        "forecast-populated-1968x2184",
+        "position-populated-1968x2184",
+    },
+}
 
 
 def _json_default(value: Any) -> str | float:
@@ -319,6 +349,8 @@ def main() -> int:
     android_git, android_diff, android_status = _git_report(android, CHAMPION_ANDROID_COMMIT)
     backend_diff, backend_diff_redactions = _redact_high_confidence_matches(backend_diff)
     android_diff, android_diff_redactions = _redact_high_confidence_matches(android_diff)
+    apk_sha256 = hashlib.sha256(apk.read_bytes()).hexdigest()
+    device_passed = args.device_state == "passed"
 
     hard_blockers = []
     if counts["champion_export_rows"] == 0 or counts["champion_pairs"] == 0:
@@ -328,6 +360,22 @@ def main() -> int:
     hard_blockers.append("NodeReal/Coinalyze/Moralis account onboarding was not completed; no paid account or unverified TAG adapter was created.")
     gate_state = "RC4_PASSED" if not hard_blockers else "RC4_NOT_PASSED"
     generated = datetime.now(timezone.utc).isoformat()
+    local_functional_state = "LOCAL_RC_FUNCTIONAL" if device_passed else "LOCAL_RC_DEVICE_ACCEPTANCE_PENDING"
+    device_passed_verification = """\
+- Installed-phone LAN acceptance: passed on Samsung SM-F966U1 over the existing
+  trusted Wireless debugging connection.
+- Package coexistence: `com.eric.tagnext`, `com.eric.tagalyst`, and
+  `com.eric.tagterminal` remained installed together.
+- Outer/inner layouts: passed at 1080×2520 and 1968×2184; the unfolded view used
+  the expanded navigation rail without overlap or clipping.
+- Restart persistence, populated forecast/position, honest offline state, local
+  JSON export creation, and local challenger recovery: passed.
+""" if device_passed else ""
+    device_pending_verification = "" if device_passed else """\
+- Pair the Fold over Wireless debugging; install/update `com.eric.tagnext`, verify
+  TAGalysis coexistence, LAN population, restart persistence, outer/inner layout,
+  portfolio 100,812,406 TAG, screen/export/offline states, and no champion calls.
+"""
 
     zero_claim_sources = [
         row["source_id"] for row in inventory["sources"]
@@ -353,7 +401,8 @@ push, paid account/resource creation, trade, or TAGalysis write was performed.
 {chr(10).join('- ' + item for item in hard_blockers)}
 
 The local challenger backend is functional and intentionally separate from the
-champion. `LOCAL_RC_FUNCTIONAL` is not asserted until device acceptance passes.
+champion. Local functional state: **{local_functional_state}**. This does not
+override the independent champion-comparison or provider-onboarding blockers.
 """
     engineering = f"""# Engineering report
 
@@ -370,13 +419,18 @@ warehouse that is an external artifact rather than a Git-tracked CI fixture.
 Android tests: 78 passed, 0 failed, 0 skipped across 15 suites. The validation
 APK has package `com.eric.tagnext`, version 0.9.0-rc4/versionCode 10004, and a
 signed build-time environment gate for the private LAN challenger. The APK SHA-256
-is `{hashlib.sha256(apk.read_bytes()).hexdigest()}`.
+is `{apk_sha256}`. The signing certificate SHA-256 is
+`87c119b3463c20fe32cbeadc42193bca3ba233781bce8da49cdbbaca454cee19`
+(`CN=TAGneXt Stable Release, O=TAGneXt`). The in-place update preserved app data.
 
 The source-score scheduler amplification defect is fixed: unchanged score
 payloads no longer append rows merely because cutoff time changed. Existing
 append-only historical rows were retained rather than destructively rewritten.
 
-Device status: {args.device_state}. Cloud status: not deployed by instruction.
+Device status: {args.device_state}. On-device acceptance covered the outer and
+inner displays, populated decision/intelligence surfaces, portfolio math,
+restart persistence, honest offline behavior, export generation, and recovery.
+Cloud status: not deployed by instruction.
 """
     intelligence = f"""# Intelligence report
 
@@ -427,6 +481,7 @@ compression driven primarily by price, not a 24.8% token-OI liquidation.
 - Backend tests: 294 passed; four deliberate external-artifact skips documented.
 - Android unit tests: 78 passed; validation APK built.
 - RC3 immutability checksum: {actual_rc3_sha}.
+{device_passed_verification}
 
 ## Owner/external action still required
 
@@ -434,9 +489,7 @@ compression driven primarily by price, not a 24.8% token-OI liquidation.
   no active production consumer, then request explicit owner approval before
   rotating only that role. Verify `BEGIN READ ONLY`, harmless reads, rejected
   write, and `ROLLBACK`; import the row-level champion history without secrets.
-- Pair the Fold over Wireless debugging; install/update `com.eric.tagnext`, verify
-  TAGalysis coexistence, LAN population, restart persistence, outer/inner layout,
-  portfolio 100,812,406 TAG, screen/export/offline states, and no champion calls.
+{device_pending_verification}
 - Complete only free/no-card provider onboarding after exact TAG coverage is
   proven. No account, credential, or paid resource was created in this run.
 
@@ -451,10 +504,11 @@ Until these checks pass, the release state remains `{gate_state}`.
   historical deadline outcome capture, complete-period grading, source scoring,
   consensus grading, real scheduler, full-brain export, supply/FDV/funding units,
   and the signed Android backend-environment gate.
+{"- Android installed-phone acceptance: outer/inner adaptive layouts, authenticated local-LAN population, restart persistence, portfolio, intelligence screens, export generation, and honest offline/recovery states." if device_passed else ""}
 
 ## Partially functional
 
-- Android: build and unit-test complete; physical-device RC4 acceptance pending.
+{"- Android: build and unit-test complete; physical-device RC4 acceptance pending." if not device_passed else ""}
 - Historical comparison: importer and pairing code exist; champion row-level data
   is unavailable, leaving imports and pairs at zero.
 - Holder/whale intelligence: 21 holder observations are not a complete census.
@@ -475,6 +529,68 @@ Until these checks pass, the release state remains `{gate_state}`.
   {counts['shadow_features']} shadow, {counts['rejected_features']} rejected.
 
 Database-level feature rows are in `intelligence/feature-registry.json`.
+"""
+    device_report = f"""# Device acceptance report
+
+Status: **{args.device_state.upper()}**
+
+## Installation and isolation
+
+- Device: Samsung Fold SM-F966U1, unlocked and connected through its existing
+  trusted Wireless debugging pairing; no USB debug cable was used.
+- TAGneXt package: `com.eric.tagnext`, versionName `0.9.0-rc4`, versionCode `10004`.
+- Validation APK SHA-256: `{apk_sha256}`.
+- Stable signing certificate SHA-256:
+  `87c119b3463c20fe32cbeadc42193bca3ba233781bce8da49cdbbaca454cee19`.
+- Coexistence verified: `com.eric.tagnext`, `com.eric.tagalyst`, and
+  `com.eric.tagterminal` remained installed. No package was uninstalled.
+- The installed build targets only the private-LAN challenger. Device-runtime
+  logs contain no TAGalysis/champion reference. No champion write was attempted.
+
+## Display acceptance
+
+- Folded outer display: 1080×2520, populated and usable.
+- Unfolded inner display: 1968×2184, populated and usable with the expanded
+  navigation rail, no overlap, no clipped controls, and normal scrolling.
+- The fold transition preserved app state. Inner evidence includes populated
+  Forecast, Position, and read-only export screens.
+
+## Market truth, funding, and portfolio
+
+- Verified price: $0.0009479.
+- Verified circulating supply: 108,864,805,114.16998 TAG.
+- Total supply: 405,380,800,000 TAG.
+- Circulating market cap: $103,192,948.76772173, exactly price × verified
+  circulating supply.
+- FDV: $384,260,460.32, exactly price × total supply.
+- Funding: 0.00005 decimal = 0.0050%, 4-hour interval. The UI did not relabel
+  0.00005 as 0.05%.
+- Portfolio basis: exactly 100,812,406 TAG. The displayed 1%, 5%, and 10% exits
+  are 1,008,124.06, 5,040,620.30, and 10,081,240.60 TAG respectively.
+
+## Screen and behavior coverage
+
+- Forecast, Predictions, Patterns, Position, Future Paths, Event Ledger, Whales
+  / direct BNB-chain evidence, Heatmap, Leverage, Market & Evidence, Data Sources,
+  Learning & History, forecast history, and local audit export were exercised.
+- The forecast was populated and authoritative. Prediction identity remained
+  honestly unavailable where no identity-verified snapshot existed.
+- Whales/on-chain correctly reported observed addresses rather than a complete
+  holder census. Heatmap correctly separated observed order-book depth from the
+  unavailable provider liquidation heatmap.
+- Force-stop/restart preserved the position and populated forecast.
+- With only the challenger backend paused, the app showed price not verified and
+  forecast unavailable rather than inventing a target. Population recovered after
+  the local backend restarted.
+- Local JSON export creation passed: 12,051,954 bytes, device-side SHA-256
+  `3a8f1427ef90485751bcd4bad235fd2d1bf2f488ccf14d64c98b1658664ee77f`.
+  The Android chooser was opened only to prove one attachment existed; no share
+  target was selected and nothing was transmitted. The chooser image is excluded
+  from this archive to avoid including unrelated personal-device suggestions.
+
+The device gate can establish `{local_functional_state}` only. It cannot establish
+the independent champion-comparison or provider-onboarding gates, so the overall
+archive state remains `{gate_state}`.
 """
     deployment = """# Deployment plan and projected monthly cost
 
@@ -545,6 +661,7 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
             "reports/INTELLIGENCE_REPORT.md": intelligence.encode(),
             "reports/VERIFICATION_QUEUE.md": verification.encode(),
             "reports/FUNCTIONAL_STATE_INVENTORY.md": features.encode(),
+            "reports/DEVICE_ACCEPTANCE.md": device_report.encode(),
             "reports/DEPLOYMENT_PLAN_AND_COSTS.md": deployment.encode(),
             "providers/RC4_PROVIDER_ACCOUNT_MANIFEST.md": accounts.encode(),
             "inventory/RC4_AUTHORITATIVE_COUNTS.json": _json_bytes(counts),
@@ -586,13 +703,41 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
         _add_file(archive, "tests/backend/backend-skipped-tests-exact.log", backend / "outputs/rc4/backend-skipped-tests-exact.log", checksums)
         _add_file(archive, "tests/backend/rc4-scheduler-proof-final.json", backend / "outputs/rc4/scheduler-proof-final.json", checksums)
         _add_file(archive, "tests/android/android-gradle-final-rerun.log", android / "outputs/rc4/android-gradle-final-rerun.log", checksums)
+        _add_file(archive, "tests/android/android-gradle-device-lan-final.log", android / "outputs/rc4/android-gradle-device-lan-final.log", checksums)
+        _add_file(archive, "tests/android/android-gradle-stable-signed-final.log", android / "outputs/rc4/android-gradle-stable-signed-final.log", checksums)
         for path in sorted((android / "app/build/test-results/testDebugUnitTest").glob("TEST-*.xml")):
             _add_file(archive, f"tests/android/xml/{path.name}", path, checksums)
+        for runtime_log in (
+            "backend-runtime-device-auth-ready.stdout.log",
+            "backend-runtime-device-auth-ready.stderr.log",
+            "backend-runtime-device-auth-restored.stdout.log",
+            "backend-runtime-device-auth-restored.stderr.log",
+        ):
+            _add_file(archive, f"build-logs/backend/{runtime_log}", backend / "outputs/rc4" / runtime_log, checksums)
+        _add_file(archive, "build-logs/database/rc4-postgres-device.log", workspace / "work/rc4-postgres-device.log", checksums)
+        device_root = workspace / "work" / "device_rc4"
+        for display_name, stems in DEVICE_EVIDENCE_STEMS.items():
+            for stem in sorted(stems):
+                for suffix in (".png", ".xml"):
+                    evidence_path = device_root / display_name / f"{stem}{suffix}"
+                    if evidence_path.exists():
+                        _add_file(
+                            archive,
+                            f"device/{display_name}/{evidence_path.name}",
+                            evidence_path,
+                            checksums,
+                        )
+                    elif device_passed:
+                        raise FileNotFoundError(evidence_path)
         _add_file(archive, "forensics/TAGNEXT_AUGUST15_FORENSIC_CORRECTED.json", workspace / "work/final_validation/forensics/TAGNEXT_AUGUST15_FORENSIC_CORRECTED.json", checksums)
         _add_file(archive, "forensics/TAGUSDT-metrics-2026-08-15.zip", workspace / "work/final_validation/forensics/TAGUSDT-metrics-2026-08-15.zip", checksums)
-        for path in sorted(champion.iterdir()):
-            if path.is_file() and not FORBIDDEN_PATH.search(path.name):
-                _add_file(archive, f"champion-baseline/{path.name}", path, checksums)
+        for path in sorted(champion.rglob("*")):
+            relative = path.relative_to(champion).as_posix()
+            if path.is_file() and not FORBIDDEN_PATH.search(relative):
+                _add_file(archive, f"champion-baseline/{relative}", path, checksums)
+
+        for migration in sorted((backend / "migrations").glob("*.sql")):
+            _add_file(archive, f"database-migrations/{migration.name}", migration, checksums)
 
         manifest = {
             "schemaVersion": "tagnext-rc4-audit-manifest-v1",
