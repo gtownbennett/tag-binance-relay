@@ -196,6 +196,18 @@ def _git_report(repo: Path, champion: str) -> tuple[dict[str, Any], str, str]:
     return report, diff, status
 
 
+def _redact_high_confidence_matches(value: str) -> tuple[str, dict[str, int]]:
+    data = value.encode("utf-8")
+    redactions: dict[str, int] = {}
+    for pattern_name, pattern in SECRET_PATTERNS.items():
+        data, count = pattern.subn(
+            f"<REDACTED_{pattern_name.upper()}_PATTERN>".encode(), data
+        )
+        if count:
+            redactions[pattern_name] = count
+    return data.decode("utf-8", errors="replace"), redactions
+
+
 def _add_bytes(archive: zipfile.ZipFile, name: str, data: bytes, checksums: dict[str, str]) -> None:
     normalized = name.replace("\\", "/")
     archive.writestr(normalized, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
@@ -301,6 +313,8 @@ def main() -> int:
     feature_rows = _rows("SELECT * FROM tagnext_feature_registry ORDER BY feature_id")
     backend_git, backend_diff, backend_status = _git_report(backend, CHAMPION_BACKEND_COMMIT)
     android_git, android_diff, android_status = _git_report(android, CHAMPION_ANDROID_COMMIT)
+    backend_diff, backend_diff_redactions = _redact_high_confidence_matches(backend_diff)
+    android_diff, android_diff_redactions = _redact_high_confidence_matches(android_diff)
 
     hard_blockers = []
     if counts["champion_export_rows"] == 0 or counts["champion_pairs"] == 0:
@@ -544,6 +558,8 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
             "git/android/status.txt": android_status.encode(),
             "git/backend/diff-against-TAGalysis-champion.patch": backend_diff.encode(),
             "git/android/diff-against-TAGalysis-champion.patch": android_diff.encode(),
+            "git/backend/diff-redactions.json": _json_bytes(backend_diff_redactions),
+            "git/android/diff-redactions.json": _json_bytes(android_diff_redactions),
             "legacy-reference/README.md": legacy_readme.encode(),
             "legacy-reference/RC3_PRESERVATION.json": _json_bytes({
                 "expectedSha256": RC3_SHA256, "actualSha256": actual_rc3_sha,
