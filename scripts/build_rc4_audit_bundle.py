@@ -80,9 +80,12 @@ def _scalar(sql: str) -> Any:
         return connection.execute(text(sql)).scalar_one()
 
 
-def _health() -> dict[str, Any]:
-    with urllib.request.urlopen("http://127.0.0.1:8787/health", timeout=15) as response:
-        raw = json.load(response)
+def _health(snapshot_path: Path | None = None) -> dict[str, Any]:
+    if snapshot_path is not None:
+        raw = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    else:
+        with urllib.request.urlopen("http://127.0.0.1:8787/health", timeout=15) as response:
+            raw = json.load(response)
     flags = ((raw.get("operatingStatus") or {}).get("usage") or {}).get("flags") or {}
     jobs = raw.get("phase1ServerJobs") or {}
     return {
@@ -286,6 +289,7 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device-state", choices=("pending", "passed", "failed"), default="pending")
+    parser.add_argument("--health-json", type=Path)
     args = parser.parse_args()
 
     workspace = args.workspace.resolve()
@@ -303,7 +307,7 @@ def main() -> int:
         raise RuntimeError(f"RC3 checksum mismatch: {actual_rc3_sha}")
 
     counts = _counts()
-    health = _health()
+    health = _health(args.health_json.resolve() if args.health_json else None)
     inventory = _inventory()
     provider_registry = _rows("SELECT * FROM tagnext_provider_registry ORDER BY provider_id")
     provider_coverage = _rows("SELECT * FROM tagnext_provider_coverage ORDER BY provider_id")
