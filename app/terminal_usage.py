@@ -34,6 +34,10 @@ SERVER_JOBS_ENABLED = env_bool("SERVER_JOBS_ENABLED", True)
 # A five-second heartbeat is required for direct exact-deadline outcome
 # captures.  Collection itself remains separately bucketed at five minutes.
 SERVER_JOB_POLL_SECONDS = env_int("SERVER_JOB_POLL_SECONDS", 5, minimum=5)
+# External outcome work remains five-minute by default. A shorter bounded
+# interval is supported for local scheduler acceptance so the same production
+# queue/claim path can be proven without waiting for a cloud cadence.
+EXTERNAL_GRADING_SECONDS = env_int("TAGNEXT_EXTERNAL_GRADING_SECONDS", 300, minimum=5)
 DETERMINISTIC_GRADING_ENABLED = env_bool("DETERMINISTIC_GRADING_ENABLED", True)
 # This bounded, database-only research job has no provider, paid-AI, or
 # forecast-write path. It is independently visible in health and can be

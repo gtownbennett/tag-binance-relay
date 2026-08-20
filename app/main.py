@@ -201,6 +201,7 @@ from app.terminal_usage import (
     CHAD_GRADING_ENABLED,
     DB_BOOTSTRAP_ON_START,
     DETERMINISTIC_GRADING_ENABLED,
+    EXTERNAL_GRADING_SECONDS,
     HISTORICAL_RESEARCH_ENABLED,
     LIVE_COLLECTORS_ENABLED,
     OPENAI_DAILY_CALL_LIMIT,
@@ -2728,7 +2729,9 @@ async def phase1_job_loop() -> None:
                         payload={"bucket": comparison_bucket, "pairing": "same_deadline"},
                         max_attempts=2,
                     )
-                    grading_bucket = int(time.time()) // 300 * 300
+                    grading_bucket = (
+                        int(time.time()) // EXTERNAL_GRADING_SECONDS * EXTERNAL_GRADING_SECONDS
+                    )
                     await asyncio.to_thread(
                         enqueue_job,
                         job_type="capture_tagnext_external_outcomes",
