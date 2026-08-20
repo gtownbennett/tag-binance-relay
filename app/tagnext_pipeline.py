@@ -43,12 +43,14 @@ from .terminal_database import (
     TagNextConsensusRow,
     TagNextConsensusGradeRow,
     TagNextChampionImportRow,
+    TagNextDataQualityQuarantineRow,
     TagNextDiscoveryCandidateRow,
     TagNextExternalMetadataRevisionRow,
     TagNextExternalOutcomeCaptureCursorRow,
     TagNextExternalOutcomeScheduleRow,
     TagNextExternalGradeRow,
     TagNextExternalRevisionRow,
+    TagNextExternalRevisionClassificationRow,
     TagNextExternalSnapshotRow,
     TagNextExternalSourceRow,
     TagNextFeaturePromotionRow,
@@ -79,10 +81,18 @@ OUTCOME_ALIGNMENT_TOLERANCE_SECONDS = 60
 EXTERNAL_OUTCOME_CAPTURE_JOB = "capture_tagnext_external_outcomes"
 TAGGER_CG_ID = "tagger"
 TAGGER_CMC_ID = 34958
+TAGGER_CANONICAL_POOL = "0xf0750c373ebbb3baeef7e03d8300caad1983d67c"
+PERIOD_COVERAGE_THRESHOLD = 0.95
+PERIOD_MAX_GAP_INTERVALS = 2
 CONSENSUS_ELIGIBLE_CLAIM_CLASSES = {
     "explicit_forecast", "algorithmic_forecast", "machine_learning_forecast",
     "editorial_forecast", "technical_analysis_article", "ai_summary",
     "analyst_call", "community_call",
+}
+EXTERNAL_SNAPSHOT_QUARANTINE_REASONS = {
+    "INVALID_PARSER_OUTPUT",
+    "INVALID_DATA_QUALITY",
+    "WRONG_ASSET",
 }
 
 
@@ -881,7 +891,41 @@ def _semantic_snapshot_is_active(session: Any, snapshot_id: str) -> bool:
     identity = session.scalar(select(TagNextForecastSemanticIdentityRow).where(
         TagNextForecastSemanticIdentityRow.snapshot_id == snapshot_id
     ))
-    return identity is None or identity.semantic_status == "active"
+    if identity is not None and identity.semantic_status != "active":
+        return False
+    quarantine_reason = session.scalar(select(TagNextDataQualityQuarantineRow.reason_code).where(
+        TagNextDataQualityQuarantineRow.entity_type == "external_forecast_snapshot",
+        TagNextDataQualityQuarantineRow.entity_id == snapshot_id,
+        TagNextDataQualityQuarantineRow.reason_code.in_(EXTERNAL_SNAPSHOT_QUARANTINE_REASONS),
+    ).limit(1))
+    return quarantine_reason is None
+
+
+def _append_revision_classification(
+    session: Any, *, revision_id: str, classification: str, reason: str,
+    classified_at: datetime, evidence_package_id: str | None = None,
+) -> TagNextExternalRevisionClassificationRow:
+    payload = {
+        "revisionId": revision_id,
+        "classification": classification,
+        "reason": reason,
+        "classifiedAt": _time(classified_at).isoformat(),
+        "evidencePackageId": evidence_package_id,
+    }
+    payload_hash = _hash(payload)
+    existing = session.scalar(select(TagNextExternalRevisionClassificationRow).where(
+        TagNextExternalRevisionClassificationRow.payload_hash == payload_hash
+    ))
+    if existing is not None:
+        return existing
+    row = TagNextExternalRevisionClassificationRow(
+        classification_id=_id("tnerc", payload), revision_id=revision_id,
+        classification=classification, reason=reason,
+        evidence_package_id=evidence_package_id,
+        classified_at=_time(classified_at), payload_hash=payload_hash,
+    )
+    session.add(row)
+    return row
 
 
 def reconcile_external_semantic_duplicates() -> dict[str, Any]:
@@ -941,6 +985,18 @@ def reconcile_external_semantic_duplicates() -> dict[str, Any]:
                     superseded_by_snapshot_id=None if index == 0 else canonical.snapshot_id,
                     duplicate_schedules_cancelled=cancelled,
                 )
+                if index > 0:
+                    revision = session.scalar(select(TagNextExternalRevisionRow).where(
+                        TagNextExternalRevisionRow.current_snapshot_id == snapshot.snapshot_id
+                    ).order_by(TagNextExternalRevisionRow.detected_at.desc()).limit(1))
+                    if revision is not None:
+                        _append_revision_classification(
+                            session,
+                            revision_id=revision.revision_id,
+                            classification="SUPERSEDED_FALSE_REVISION",
+                            reason="Current snapshot is a metadata/provenance duplicate of the canonical semantic forecast.",
+                            classified_at=utc_now(),
+                        )
                 for schedule in schedule_rows:
                     schedule.semantic_identity_id = identity.identity_id
     return {
@@ -1045,11 +1101,15 @@ def store_external_snapshot(
                 "evidenceMetadataHash": evidence_metadata_hash,
                 "semanticIdentityId": identity.identity_id,
             }
-        previous = session.scalar(select(TagNextExternalSnapshotRow).where(
+        previous_candidates = list(session.scalars(select(TagNextExternalSnapshotRow).where(
             TagNextExternalSnapshotRow.source_id == source_id,
             TagNextExternalSnapshotRow.horizon == semantics["horizon"],
             TagNextExternalSnapshotRow.target_semantics == semantics["targetSemantics"],
-        ).order_by(TagNextExternalSnapshotRow.captured_at.desc()).limit(1))
+        ).order_by(TagNextExternalSnapshotRow.captured_at.desc())))
+        previous = next((
+            row for row in previous_candidates
+            if _semantic_snapshot_is_active(session, row.snapshot_id)
+        ), None)
         snapshot_id = _id("tnefs", {"semantics": semantics, "capturedAt": captured.isoformat()})
         deadline = _time(semantics["deadline"]) if semantics["deadline"] else None
         source_as_of_value = payload.get("sourceAsOf")
@@ -1172,6 +1232,13 @@ def store_external_snapshot(
                         "movementRatio": movement_ratio, "ruleVersion": "target-following-v2",
                     }),
                 ))
+                _append_revision_classification(
+                    session,
+                    revision_id=revision_id,
+                    classification="SEMANTIC_FORECAST_REVISION",
+                    reason="Normalized forecast semantics changed relative to the previous source/horizon snapshot.",
+                    classified_at=captured,
+                )
                 source.last_semantic_change_at = captured
         if source.last_semantic_change_at is None:
             source.last_semantic_change_at = captured
@@ -1347,6 +1414,282 @@ def _aligned_outcome(
     return selected, int((_time(selected.observed_at) - deadline).total_seconds())
 
 
+def _period_sampling_interval(period_start: datetime, period_end: datetime) -> int:
+    duration_seconds = max(1, int((_time(period_end) - _time(period_start)).total_seconds()))
+    return 3_600 if duration_seconds <= 90 * 86_400 else 86_400
+
+
+def _period_coverage_metrics(
+    timestamps: Sequence[datetime], *, period_start: datetime,
+    period_end: datetime, interval_seconds: int,
+) -> dict[str, Any]:
+    start = _time(period_start)
+    end = _time(period_end)
+    duration_seconds = max(1, int((end - start).total_seconds()) + 1)
+    expected = max(1, math.ceil(duration_seconds / interval_seconds))
+    observed_buckets = sorted({
+        min(expected - 1, max(0, int((_time(item) - start).total_seconds()) // interval_seconds))
+        for item in timestamps
+        if start <= _time(item) <= end
+    })
+    missing: list[dict[str, Any]] = []
+    missing_buckets = [index for index in range(expected) if index not in set(observed_buckets)]
+    if missing_buckets:
+        range_start = previous = missing_buckets[0]
+        for index in missing_buckets[1:] + [None]:
+            if index is not None and index == previous + 1:
+                previous = index
+                continue
+            missing.append({
+                "start": (start + timedelta(seconds=range_start * interval_seconds)).isoformat(),
+                "end": min(
+                    end,
+                    start + timedelta(seconds=(previous + 1) * interval_seconds),
+                ).isoformat(),
+                "missingSamples": previous - range_start + 1,
+            })
+            if index is not None:
+                range_start = previous = index
+    if observed_buckets:
+        boundary_gaps = [
+            (observed_buckets[0] + 1) * interval_seconds,
+            (expected - observed_buckets[-1]) * interval_seconds,
+        ]
+        between_gaps = [
+            (right - left) * interval_seconds
+            for left, right in zip(observed_buckets, observed_buckets[1:])
+        ]
+        largest_gap = max([interval_seconds, *boundary_gaps, *between_gaps])
+    else:
+        largest_gap = duration_seconds
+    actual = len(observed_buckets)
+    coverage = min(1.0, actual / expected)
+    complete = bool(
+        coverage >= PERIOD_COVERAGE_THRESHOLD
+        and largest_gap <= interval_seconds * PERIOD_MAX_GAP_INTERVALS
+    )
+    return {
+        "expectedSampleCount": expected,
+        "actualSampleCount": actual,
+        "coveragePercentage": coverage * 100.0,
+        "coverageRatio": coverage,
+        "largestGapSeconds": largest_gap,
+        "missingIntervals": missing,
+        "coverageThreshold": PERIOD_COVERAGE_THRESHOLD,
+        "samplingIntervalSeconds": interval_seconds,
+        "coverageStatus": "COMPLETE" if complete else "PERIOD_COVERAGE_INCOMPLETE",
+    }
+
+
+def _geckoterminal_ohlcv(
+    *, period_start: datetime, period_end: datetime,
+    interval_seconds: int, timeout_seconds: int,
+) -> tuple[list[dict[str, Any]], str]:
+    interval_label = (
+        "minute" if interval_seconds == 60
+        else "hour" if interval_seconds == 3_600
+        else "day"
+    )
+    endpoint = (
+        "https://api.geckoterminal.com/api/v2/networks/bsc/pools/"
+        f"{TAGGER_CANONICAL_POOL}/ohlcv/{interval_label}"
+    )
+    response = httpx.get(
+        endpoint,
+        params={
+            "aggregate": 1,
+            "before_timestamp": int(_time(period_end).timestamp()) + interval_seconds,
+            "limit": 1_000,
+            "currency": "usd",
+            "token": "base",
+        },
+        timeout=timeout_seconds,
+        headers={"User-Agent": "TAGneXt-historical-outcome/4.0"},
+    )
+    response.raise_for_status()
+    rows = response.json().get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+    result: list[dict[str, Any]] = []
+    start = _time(period_start)
+    end = _time(period_end)
+    for raw in rows:
+        if not isinstance(raw, list) or len(raw) < 6:
+            continue
+        observed_at = datetime.fromtimestamp(int(raw[0]), tz=timezone.utc)
+        if not (start <= observed_at <= end):
+            continue
+        values = [_positive_value(item) for item in raw[1:5]]
+        if any(value is None for value in values):
+            continue
+        result.append({
+            "observedAt": observed_at,
+            "open": values[0], "high": values[1], "low": values[2], "close": values[3],
+            "volume": _positive_value(raw[5]),
+            "providerId": "geckoterminal_pancakeswap_spot",
+            "sourceReference": str(response.url),
+            "raw": raw,
+        })
+    return result, str(response.url)
+
+
+def _coingecko_range(
+    *, period_start: datetime, period_end: datetime,
+    timeout_seconds: int,
+) -> tuple[list[dict[str, Any]], str]:
+    endpoint = f"https://api.coingecko.com/api/v3/coins/{TAGGER_CG_ID}/market_chart/range"
+    response = httpx.get(
+        endpoint,
+        params={
+            "vs_currency": "usd",
+            "from": int(_time(period_start).timestamp()),
+            "to": int(_time(period_end).timestamp()) + 1,
+            "precision": "full",
+        },
+        timeout=timeout_seconds,
+        headers={"User-Agent": "TAGneXt-historical-outcome/4.0"},
+    )
+    response.raise_for_status()
+    result: list[dict[str, Any]] = []
+    for raw in response.json().get("prices", []):
+        if not isinstance(raw, list) or len(raw) < 2:
+            continue
+        price = _positive_value(raw[1])
+        if price is None:
+            continue
+        observed_at = datetime.fromtimestamp(float(raw[0]) / 1_000.0, tz=timezone.utc)
+        result.append({
+            "observedAt": observed_at,
+            "open": price, "high": price, "low": price, "close": price,
+            "volume": None,
+            "providerId": "coingecko_historical_spot",
+            "sourceReference": str(response.url),
+            "raw": raw,
+        })
+    return result, str(response.url)
+
+
+def _historical_period_series(
+    *, period_start: datetime, period_end: datetime,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    start = _time(period_start)
+    end = _time(period_end)
+    interval_seconds = _period_sampling_interval(start, end)
+    failures: list[str] = []
+    providers: list[str] = []
+    selected_by_bucket: dict[int, dict[str, Any]] = {}
+
+    def _merge(rows: Sequence[Mapping[str, Any]]) -> None:
+        expected = max(1, math.ceil((int((end - start).total_seconds()) + 1) / interval_seconds))
+        for raw in rows:
+            observed_at = _time(raw["observedAt"])
+            if not (start <= observed_at <= end):
+                continue
+            bucket = min(
+                expected - 1,
+                max(0, int((observed_at - start).total_seconds()) // interval_seconds),
+            )
+            selected_by_bucket.setdefault(bucket, dict(raw))
+
+    try:
+        rows, _ = _geckoterminal_ohlcv(
+            period_start=start, period_end=end,
+            interval_seconds=interval_seconds, timeout_seconds=timeout_seconds,
+        )
+        if not rows:
+            raise ValueError("GeckoTerminal returned no canonical pool candles")
+        _merge(rows)
+        providers.append("geckoterminal_pancakeswap_spot")
+    except Exception as exc:
+        failures.append(f"GeckoTerminal: {type(exc).__name__}: {exc}")
+
+    coverage = _period_coverage_metrics(
+        [row["observedAt"] for row in selected_by_bucket.values()],
+        period_start=start, period_end=end, interval_seconds=interval_seconds,
+    )
+    if coverage["coverageStatus"] != "COMPLETE":
+        try:
+            rows, _ = _coingecko_range(
+                period_start=start, period_end=end, timeout_seconds=timeout_seconds,
+            )
+            if not rows:
+                raise ValueError("CoinGecko returned no historical prices")
+            _merge(rows)
+            providers.append("coingecko_historical_spot")
+        except Exception as exc:
+            failures.append(f"CoinGecko: {type(exc).__name__}: {exc}")
+        coverage = _period_coverage_metrics(
+            [row["observedAt"] for row in selected_by_bucket.values()],
+            period_start=start, period_end=end, interval_seconds=interval_seconds,
+        )
+    rows = sorted(selected_by_bucket.values(), key=lambda item: _time(item["observedAt"]))
+    return {
+        "rows": rows,
+        "providers": providers,
+        "providerFailures": failures,
+        **coverage,
+    }
+
+
+def _historical_point_observation(
+    *, deadline: datetime, timeout_seconds: int,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    target = _time(deadline)
+    failures: list[str] = []
+    try:
+        rows, source_url = _geckoterminal_ohlcv(
+            period_start=target - timedelta(minutes=10),
+            period_end=target + timedelta(minutes=2),
+            interval_seconds=60,
+            timeout_seconds=timeout_seconds,
+        )
+        candidates = [
+            row for row in rows
+            if _time(row["observedAt"]) <= target < _time(row["observedAt"]) + timedelta(seconds=60)
+        ]
+        if candidates:
+            selected = candidates[-1]
+            candle_start = _time(selected["observedAt"])
+            return {
+                "priceUsd": selected["close"],
+                "observedAt": (candle_start + timedelta(seconds=60)).isoformat(),
+                "retrievedAt": utc_now().isoformat(),
+                "periodStart": candle_start.isoformat(),
+                "periodEnd": (candle_start + timedelta(seconds=60)).isoformat(),
+                "openPrice": selected["open"], "highPrice": selected["high"],
+                "lowPrice": selected["low"], "closePrice": selected["close"],
+                "providerId": "geckoterminal_pancakeswap_spot",
+                "venue": "PancakeSwap canonical TAG/WBNB pool",
+                "interval": "1m", "symbol": "TAG/WBNB spot",
+                "sourceName": "GeckoTerminal PancakeSwap canonical pool 1m candle",
+                "sourceReference": source_url,
+                "raw": selected["raw"],
+            }, failures
+        raise ValueError("no pool minute candle contains the exact deadline")
+    except Exception as exc:
+        failures.append(f"GeckoTerminal: {type(exc).__name__}: {exc}")
+    try:
+        rows, source_url = _coingecko_range(
+            period_start=target - timedelta(minutes=10),
+            period_end=target + timedelta(minutes=10),
+            timeout_seconds=timeout_seconds,
+        )
+        rows.sort(key=lambda row: abs((_time(row["observedAt"]) - target).total_seconds()))
+        selected = rows[0] if rows else None
+        if selected is None or abs((_time(selected["observedAt"]) - target).total_seconds()) > OUTCOME_ALIGNMENT_TOLERANCE_SECONDS:
+            raise ValueError("no CoinGecko historical observation falls within 60 seconds")
+        return {
+            "priceUsd": selected["close"],
+            "observedAt": _time(selected["observedAt"]).isoformat(),
+            "retrievedAt": utc_now().isoformat(),
+            "sourceName": "CoinGecko TAGGER historical range fallback",
+            "sourceReference": source_url,
+            "raw": selected["raw"],
+        }, failures
+    except Exception as exc:
+        failures.append(f"CoinGecko: {type(exc).__name__}: {exc}")
+    return None, failures
+
+
 def _update_outcome_capture_cursor(
     *,
     attempted_at: datetime,
@@ -1372,7 +1715,11 @@ def _update_outcome_capture_cursor(
         cursor.metrics_json = json_dumps(dict(metrics))
         cursor.fallback_state_json = json_dumps({
             "providerFailures": list(provider_failures),
-            "policy": "CoinGecko, then DEX Screener exact server observation; verified candle injection supported",
+            "policy": (
+                "Completed historical periods/deadlines: GeckoTerminal canonical PancakeSwap "
+                "candles, then CoinGecko historical range gap-fill; live deadlines: CoinGecko, "
+                "then DEX Screener exact server observation. A current quote is never backdated."
+            ),
         })
         if success:
             cursor.last_success_at = attempted_at
@@ -1408,6 +1755,262 @@ def external_outcome_capture_health() -> dict[str, Any]:
     }
 
 
+def _schedule_historical_retry(
+    schedule: TagNextExternalOutcomeScheduleRow, *, current: datetime, error: str,
+) -> str:
+    schedule.retry_count = int(schedule.retry_count or 0) + 1
+    schedule.last_error = error[:2000]
+    schedule.updated_at = current
+    if schedule.retry_count <= 5:
+        delay_minutes = min(60, 5 * (2 ** (schedule.retry_count - 1)))
+        schedule.status = "retry_pending"
+        schedule.next_retry_at = current + timedelta(minutes=delay_minutes)
+        schedule.next_capture_at = schedule.next_retry_at
+    else:
+        schedule.status = "historical_outcome_unavailable"
+    return schedule.status
+
+
+def _capture_historical_due_schedules(
+    *, schedule_ids: Sequence[str], current: datetime, timeout_seconds: int,
+) -> dict[str, Any]:
+    """Capture ended periods and late point deadlines without backdating a live quote."""
+    with session_scope() as session:
+        candidates = []
+        for schedule_id in schedule_ids:
+            row = session.get(TagNextExternalOutcomeScheduleRow, schedule_id)
+            if row is None:
+                continue
+            is_period = (
+                row.target_semantics.startswith("period_")
+                or row.target_semantics == "range_for_period"
+            )
+            if is_period and row.period_start and row.period_end and _time(row.period_end) <= current:
+                candidates.append({
+                    "scheduleId": row.schedule_id,
+                    "snapshotId": row.snapshot_id,
+                    "targetSemantics": row.target_semantics,
+                    "periodStart": _time(row.period_start),
+                    "periodEnd": _time(row.period_end),
+                    "deadline": _time(row.deadline) if row.deadline else None,
+                })
+            elif (
+                not is_period and row.deadline
+                and _time(row.deadline) + timedelta(seconds=OUTCOME_ALIGNMENT_TOLERANCE_SECONDS) < current
+            ):
+                candidates.append({
+                    "scheduleId": row.schedule_id,
+                    "snapshotId": row.snapshot_id,
+                    "targetSemantics": row.target_semantics,
+                    "periodStart": None,
+                    "periodEnd": None,
+                    "deadline": _time(row.deadline),
+                })
+
+    handled: list[str] = []
+    provider_failures: list[str] = []
+    completed = captured = incomplete = retry_pending = unavailable = 0
+    period_cache: dict[tuple[datetime, datetime], dict[str, Any]] = {}
+    point_cache: dict[datetime, tuple[dict[str, Any] | None, list[str]]] = {}
+    for item in candidates:
+        schedule_id = str(item["scheduleId"])
+        handled.append(schedule_id)
+        if item["periodStart"] is not None and item["periodEnd"] is not None:
+            try:
+                cache_key = (item["periodStart"], item["periodEnd"])
+                if cache_key not in period_cache:
+                    period_cache[cache_key] = _historical_period_series(
+                        period_start=item["periodStart"], period_end=item["periodEnd"],
+                        timeout_seconds=timeout_seconds,
+                    )
+                series = period_cache[cache_key]
+                provider_failures.extend(series["providerFailures"])
+                rows = list(series["rows"])
+                if not rows:
+                    raise ValueError("historical providers returned no period observations")
+                closes = [float(row["close"]) for row in rows]
+                lows = [float(row["low"]) for row in rows]
+                highs = [float(row["high"]) for row in rows]
+                raw_series = [{
+                    "observedAt": _time(row["observedAt"]).isoformat(),
+                    "open": row["open"], "high": row["high"],
+                    "low": row["low"], "close": row["close"],
+                    "volume": row.get("volume"), "providerId": row["providerId"],
+                    "raw": row.get("raw"),
+                } for row in rows]
+                market_observation = record_market_candle({
+                    "providerId": "+".join(series["providers"]),
+                    "venue": "canonical TAG spot historical hierarchy",
+                    "symbol": "TAG/USD", "interval": (
+                        "1h" if series["samplingIntervalSeconds"] == 3_600 else "1d"
+                    ),
+                    "periodStart": item["periodStart"].isoformat(),
+                    "periodEnd": item["periodEnd"].isoformat(),
+                    "openPrice": rows[0]["open"], "highPrice": max(highs),
+                    "lowPrice": min(lows), "closePrice": rows[-1]["close"],
+                    "vwapPrice": statistics.fmean(closes), "sampleCount": len(rows),
+                    "retrievedAt": current.isoformat(),
+                    "sourceReference": ";".join(sorted({
+                        str(row.get("sourceReference")) for row in rows
+                    })),
+                    "raw": {
+                        "coverage": {key: value for key, value in series.items() if key != "rows"},
+                        "series": raw_series,
+                    },
+                })
+                aggregate_payload = {
+                    "snapshotId": item["snapshotId"],
+                    "periodStart": item["periodStart"].isoformat(),
+                    "periodEnd": item["periodEnd"].isoformat(),
+                    "marketObservationId": market_observation["observationId"],
+                    "minimumPrice": min(lows), "maximumPrice": max(highs),
+                    "averagePrice": statistics.fmean(closes), "endPrice": closes[-1],
+                    "expectedSampleCount": series["expectedSampleCount"],
+                    "actualSampleCount": series["actualSampleCount"],
+                    "coveragePercentage": series["coveragePercentage"],
+                    "largestGapSeconds": series["largestGapSeconds"],
+                    "providers": series["providers"],
+                    "missingIntervals": series["missingIntervals"],
+                    "coverageStatus": series["coverageStatus"],
+                    "coverageThreshold": series["coverageThreshold"],
+                    "samplingIntervalSeconds": series["samplingIntervalSeconds"],
+                }
+                aggregate_hash = _hash(aggregate_payload)
+                with session_scope() as session:
+                    schedule = session.get(TagNextExternalOutcomeScheduleRow, schedule_id)
+                    if schedule is None:
+                        continue
+                    existing = session.scalar(select(TagNextPeriodOutcomeRow).where(
+                        TagNextPeriodOutcomeRow.snapshot_id == item["snapshotId"],
+                        TagNextPeriodOutcomeRow.period_start == item["periodStart"],
+                        TagNextPeriodOutcomeRow.period_end == item["periodEnd"],
+                    ))
+                    if existing is None:
+                        session.add(TagNextPeriodOutcomeRow(
+                            period_outcome_id=_id("tnpo", aggregate_payload),
+                            snapshot_id=item["snapshotId"],
+                            period_start=item["periodStart"], period_end=item["periodEnd"],
+                            observation_count=len(rows),
+                            expected_sample_count=series["expectedSampleCount"],
+                            actual_sample_count=series["actualSampleCount"],
+                            coverage_percentage=_decimal_value(series["coveragePercentage"]),
+                            largest_gap_seconds=series["largestGapSeconds"],
+                            provider_count=len(set(series["providers"])),
+                            missing_intervals_json=json_dumps(series["missingIntervals"]),
+                            coverage_status=series["coverageStatus"],
+                            coverage_threshold=_decimal_value(series["coverageThreshold"]),
+                            sampling_interval_seconds=series["samplingIntervalSeconds"],
+                            minimum_price=_decimal_value(min(lows)),
+                            maximum_price=_decimal_value(max(highs)),
+                            average_price=_decimal_value(statistics.fmean(closes)),
+                            end_price=_decimal_value(closes[-1]),
+                            source_ids_json=json_dumps(series["providers"]),
+                            payload_hash=aggregate_hash,
+                        ))
+                    schedule.capture_count = int(schedule.capture_count or 0) + len(rows)
+                    schedule.last_capture_at = item["periodEnd"]
+                    schedule.next_retry_at = None
+                    schedule.last_error = (
+                        None if series["coverageStatus"] == "COMPLETE"
+                        else "Historical period coverage failed the configured threshold/gap policy."
+                    )
+                    schedule.status = series["coverageStatus"]
+                    schedule.updated_at = current
+                captured += len(rows)
+                if series["coverageStatus"] == "COMPLETE":
+                    completed += 1
+                else:
+                    incomplete += 1
+            except Exception as exc:
+                failure = f"{schedule_id}: {type(exc).__name__}: {exc}"
+                provider_failures.append(failure)
+                with session_scope() as session:
+                    schedule = session.get(TagNextExternalOutcomeScheduleRow, schedule_id)
+                    if schedule is not None:
+                        state = _schedule_historical_retry(
+                            schedule, current=current, error=failure,
+                        )
+                        retry_pending += int(state == "retry_pending")
+                        unavailable += int(state == "historical_outcome_unavailable")
+        else:
+            try:
+                if item["deadline"] not in point_cache:
+                    point_cache[item["deadline"]] = _historical_point_observation(
+                        deadline=item["deadline"], timeout_seconds=timeout_seconds,
+                    )
+                observation, failures = point_cache[item["deadline"]]
+                provider_failures.extend(failures)
+                if observation is None:
+                    raise ValueError("no historical observation satisfies the exact-deadline tolerance")
+                market_observation = None
+                if observation.get("periodStart") and observation.get("periodEnd"):
+                    market_observation = record_market_candle(observation)
+                observed_at = _time(str(observation["observedAt"]))
+                price = _positive_value(observation["priceUsd"])
+                if price is None:
+                    raise ValueError("historical provider returned a nonpositive price")
+                outcome_payload = {
+                    "assetSymbol": "TAG", "observedAt": observed_at.isoformat(),
+                    "priceUsd": price, "sourceName": observation["sourceName"],
+                    "sourceReference": observation["sourceReference"],
+                    "marketObservationId": (
+                        market_observation["observationId"] if market_observation else None
+                    ),
+                    "deadlineSelectionPolicy": (
+                        "historical_canonical_pool_then_coingecko_nearest_within_60s_v1"
+                    ),
+                }
+                outcome_hash = _hash(outcome_payload)
+                with session_scope() as session:
+                    schedule = session.get(TagNextExternalOutcomeScheduleRow, schedule_id)
+                    if schedule is None:
+                        continue
+                    existing = session.scalar(select(VerifiedOutcomeRow).where(
+                        VerifiedOutcomeRow.outcome_hash == outcome_hash
+                    ))
+                    if existing is None:
+                        session.add(VerifiedOutcomeRow(
+                            outcome_id=_id("outcome", outcome_payload), outcome_hash=outcome_hash,
+                            asset_symbol="TAG", observed_at=observed_at, retrieved_at=current,
+                            price_usd=price, source_name=str(observation["sourceName"]),
+                            source_reference=str(observation["sourceReference"]),
+                            evidence_snapshot_id=None, verification_status="verified",
+                            payload_json=json_dumps({
+                                **outcome_payload, "providerPayload": observation.get("raw"),
+                                "deadline": item["deadline"].isoformat(),
+                                "outcomeOffsetSeconds": int(
+                                    (observed_at - item["deadline"]).total_seconds()
+                                ),
+                            }),
+                        ))
+                        captured += 1
+                    schedule.status = "complete"
+                    schedule.capture_count = int(schedule.capture_count or 0) + 1
+                    schedule.last_capture_at = observed_at
+                    schedule.next_retry_at = None
+                    schedule.last_error = None
+                    schedule.updated_at = current
+                completed += 1
+            except Exception as exc:
+                failure = f"{schedule_id}: {type(exc).__name__}: {exc}"
+                provider_failures.append(failure)
+                with session_scope() as session:
+                    schedule = session.get(TagNextExternalOutcomeScheduleRow, schedule_id)
+                    if schedule is not None:
+                        state = _schedule_historical_retry(
+                            schedule, current=current, error=failure,
+                        )
+                        retry_pending += int(state == "retry_pending")
+                        unavailable += int(state == "historical_outcome_unavailable")
+    return {
+        "handledScheduleIds": handled,
+        "captured": captured, "completed": completed,
+        "periodCoverageIncomplete": incomplete,
+        "retryPending": retry_pending, "historicalUnavailable": unavailable,
+        "providerFailures": provider_failures,
+    }
+
+
 def capture_due_external_outcomes(
     *, now: datetime | str | None = None,
     price_observation: Mapping[str, Any] | None = None,
@@ -1421,10 +2024,18 @@ def capture_due_external_outcomes(
     """
     current = _time(now)
     with session_scope() as session:
-        due = list(session.scalars(select(TagNextExternalOutcomeScheduleRow).where(
+        candidate_due = list(session.scalars(select(TagNextExternalOutcomeScheduleRow).where(
             TagNextExternalOutcomeScheduleRow.status.in_(("scheduled", "capturing", "retry_pending")),
             TagNextExternalOutcomeScheduleRow.next_capture_at <= current,
         ).order_by(TagNextExternalOutcomeScheduleRow.next_capture_at.asc())))
+        due = []
+        for row in candidate_due:
+            if _semantic_snapshot_is_active(session, row.snapshot_id):
+                due.append(row)
+            else:
+                row.status = "invalid_data_quarantined"
+                row.last_error = "Snapshot is excluded by the effective external-forecast quarantine/semantic ledger."
+                row.updated_at = current
         schedule_ids = [row.schedule_id for row in due]
     if not schedule_ids:
         result = {"due": 0, "captured": 0, "completed": 0, "missedExact": 0, "retryPending": 0}
@@ -1433,8 +2044,43 @@ def capture_due_external_outcomes(
         )
         return result
 
+    all_schedule_ids = list(schedule_ids)
+    historical = (
+        _capture_historical_due_schedules(
+            schedule_ids=schedule_ids, current=current, timeout_seconds=timeout_seconds,
+        )
+        if price_observation is None
+        else {
+            "handledScheduleIds": [], "captured": 0, "completed": 0,
+            "periodCoverageIncomplete": 0, "retryPending": 0,
+            "historicalUnavailable": 0, "providerFailures": [],
+        }
+    )
+    handled_ids = set(historical["handledScheduleIds"])
+    schedule_ids = [schedule_id for schedule_id in schedule_ids if schedule_id not in handled_ids]
+    provider_failures: list[str] = list(historical["providerFailures"])
+    if not schedule_ids:
+        result = {
+            "due": len(handled_ids),
+            "captured": historical["captured"],
+            "completed": historical["completed"],
+            "missedExact": 0,
+            "periodCoverageIncomplete": historical["periodCoverageIncomplete"],
+            "retryPending": historical["retryPending"],
+            "historicalUnavailable": historical["historicalUnavailable"],
+            "providerFailures": provider_failures,
+        }
+        _update_outcome_capture_cursor(
+            attempted_at=current,
+            success=not bool(historical["retryPending"]),
+            schedule_ids=all_schedule_ids,
+            due_at=due[0].next_capture_at if due else None,
+            metrics=result,
+            provider_failures=provider_failures,
+        )
+        return result
+
     observation = dict(price_observation or {})
-    provider_failures: list[str] = []
     if not observation:
         try:
             endpoint = "https://api.coingecko.com/api/v3/simple/price"
@@ -1497,12 +2143,17 @@ def capture_due_external_outcomes(
                         schedule.last_error = "; ".join(provider_failures)[:2000]
                         schedule.updated_at = current
                 result = {
-                    "due": len(schedule_ids), "captured": 0, "completed": 0,
-                    "missedExact": 0, "retryPending": len(schedule_ids),
+                    "due": len(schedule_ids) + len(handled_ids),
+                    "captured": historical["captured"],
+                    "completed": historical["completed"],
+                    "missedExact": 0,
+                    "retryPending": len(schedule_ids) + historical["retryPending"],
+                    "periodCoverageIncomplete": historical["periodCoverageIncomplete"],
+                    "historicalUnavailable": historical["historicalUnavailable"],
                     "providerFailures": provider_failures,
                 }
                 _update_outcome_capture_cursor(
-                    attempted_at=current, success=False, schedule_ids=schedule_ids,
+                    attempted_at=current, success=False, schedule_ids=all_schedule_ids,
                     due_at=due[0].next_capture_at if due else None,
                     metrics=result, provider_failures=provider_failures,
                 )
@@ -1622,6 +2273,15 @@ def capture_due_external_outcomes(
                         ]
                         period_minimum = min(minimum_candidates)
                         period_maximum = max(maximum_candidates)
+                        interval_seconds = _period_sampling_interval(period_start, period_end)
+                        coverage = _period_coverage_metrics(
+                            [
+                                *(row.observed_at for row in observations),
+                                *(row.period_end for row in candles),
+                            ],
+                            period_start=period_start, period_end=period_end,
+                            interval_seconds=interval_seconds,
+                        )
                         aggregate_payload = {
                             "snapshotId": schedule.snapshot_id,
                             "periodStart": period_start.isoformat(),
@@ -1629,6 +2289,7 @@ def capture_due_external_outcomes(
                             "observationIds": [row.outcome_id for row in observations],
                             "minimumPrice": period_minimum, "maximumPrice": period_maximum,
                             "averagePrice": statistics.fmean(prices), "endPrice": prices[-1],
+                            **coverage,
                         }
                         aggregate_hash = _hash(aggregate_payload)
                         if session.scalar(select(TagNextPeriodOutcomeRow).where(
@@ -1638,7 +2299,20 @@ def capture_due_external_outcomes(
                                 period_outcome_id=_id("tnpo", aggregate_payload),
                                 snapshot_id=schedule.snapshot_id,
                                 period_start=period_start, period_end=period_end,
-                                observation_count=len(prices), minimum_price=_decimal_value(period_minimum),
+                                observation_count=len(prices),
+                                expected_sample_count=coverage["expectedSampleCount"],
+                                actual_sample_count=coverage["actualSampleCount"],
+                                coverage_percentage=_decimal_value(coverage["coveragePercentage"]),
+                                largest_gap_seconds=coverage["largestGapSeconds"],
+                                provider_count=len({
+                                    *(row.source_name for row in observations),
+                                    *(row.provider_id for row in candles),
+                                }),
+                                missing_intervals_json=json_dumps(coverage["missingIntervals"]),
+                                coverage_status=coverage["coverageStatus"],
+                                coverage_threshold=_decimal_value(coverage["coverageThreshold"]),
+                                sampling_interval_seconds=coverage["samplingIntervalSeconds"],
+                                minimum_price=_decimal_value(period_minimum),
                                 maximum_price=_decimal_value(period_maximum),
                                 average_price=_decimal_value(statistics.fmean(prices)),
                                 end_price=_decimal_value(prices[-1]),
@@ -1648,8 +2322,9 @@ def capture_due_external_outcomes(
                                 })),
                                 payload_hash=aggregate_hash,
                             ))
-                        schedule.status = "complete"
-                        completed += 1
+                        schedule.status = coverage["coverageStatus"]
+                        if coverage["coverageStatus"] == "COMPLETE":
+                            completed += 1
                     else:
                         schedule.status = "period_observations_unavailable"
                 elif period_start and period_end:
@@ -1657,16 +2332,19 @@ def capture_due_external_outcomes(
                     schedule.next_capture_at = min(current + timedelta(hours=1), period_end)
             schedule.updated_at = current
     result = {
-        "due": len(schedule_ids), "captured": captured,
-        "completed": completed, "missedExact": missed,
-        "retryPending": retry_pending,
+        "due": len(schedule_ids) + len(handled_ids),
+        "captured": captured + historical["captured"],
+        "completed": completed + historical["completed"], "missedExact": missed,
+        "periodCoverageIncomplete": historical["periodCoverageIncomplete"],
+        "retryPending": retry_pending + historical["retryPending"],
+        "historicalUnavailable": historical["historicalUnavailable"],
         "providerObservedAt": observed_at.isoformat(), "outcomeId": outcome_id,
         "providerFailures": provider_failures,
     }
     _update_outcome_capture_cursor(
         attempted_at=current,
         success=True,
-        schedule_ids=schedule_ids,
+        schedule_ids=all_schedule_ids,
         due_at=due[0].next_capture_at if due else None,
         metrics=result,
         provider_failures=provider_failures,
@@ -1684,10 +2362,7 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
             TagNextExternalSnapshotRow.deadline <= current,
         )))
         for snapshot in due:
-            semantic_identity = session.scalar(select(TagNextForecastSemanticIdentityRow).where(
-                TagNextForecastSemanticIdentityRow.snapshot_id == snapshot.snapshot_id
-            ))
-            if semantic_identity is not None and semantic_identity.semantic_status == "SUPERSEDED_DUPLICATE":
+            if not _semantic_snapshot_is_active(session, snapshot.snapshot_id):
                 continue
             existing = session.scalar(select(TagNextExternalGradeRow).where(
                 TagNextExternalGradeRow.snapshot_id == snapshot.snapshot_id,
@@ -1704,10 +2379,13 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                 period_outcome = session.scalar(select(TagNextPeriodOutcomeRow).where(
                     TagNextPeriodOutcomeRow.snapshot_id == snapshot.snapshot_id
                 ).order_by(TagNextPeriodOutcomeRow.created_at.asc()).limit(1))
+                period_is_complete = bool(
+                    period_outcome and period_outcome.coverage_status == "COMPLETE"
+                )
                 actual = (
-                    period_outcome.minimum_price if period_outcome and target_semantics == "period_minimum"
-                    else period_outcome.maximum_price if period_outcome and target_semantics == "period_maximum"
-                    else period_outcome.average_price if period_outcome and target_semantics in {"period_average", "range_for_period"}
+                    period_outcome.minimum_price if period_is_complete and target_semantics == "period_minimum"
+                    else period_outcome.maximum_price if period_is_complete and target_semantics == "period_maximum"
+                    else period_outcome.average_price if period_is_complete and target_semantics in {"period_average", "range_for_period"}
                     else None
                 )
                 outcome_source = (
@@ -1722,7 +2400,10 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                 outcome_source = outcome.source_name if outcome else None
             if actual is None:
                 disposition = (
-                    "period_outcome_unavailable" if target_semantics.startswith("period_") or target_semantics == "range_for_period"
+                    "PERIOD_COVERAGE_INCOMPLETE" if period_outcome is not None
+                    and (target_semantics.startswith("period_") or target_semantics == "range_for_period")
+                    and period_outcome.coverage_status != "COMPLETE"
+                    else "period_outcome_unavailable" if target_semantics.startswith("period_") or target_semantics == "range_for_period"
                     else "exact_deadline_outcome_unavailable"
                 )
                 direction_correct = absolute_error = None
@@ -1731,6 +2412,24 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                     "requiredOutcome": "period_aggregate" if target_semantics.startswith("period_") or target_semantics == "range_for_period" else "exact_deadline",
                     "outcomeAlignmentPolicy": "exact_server_observation_or_verified_candle_then_nearest_within_60s_v2",
                 }
+                if period_outcome is not None:
+                    metrics["periodCoverage"] = {
+                        "status": period_outcome.coverage_status,
+                        "expectedSampleCount": period_outcome.expected_sample_count,
+                        "actualSampleCount": period_outcome.actual_sample_count,
+                        "coveragePercentage": (
+                            float(period_outcome.coverage_percentage)
+                            if period_outcome.coverage_percentage is not None else None
+                        ),
+                        "largestGapSeconds": period_outcome.largest_gap_seconds,
+                        "providerCount": period_outcome.provider_count,
+                        "missingIntervals": json.loads(period_outcome.missing_intervals_json or "[]"),
+                        "coverageThreshold": (
+                            float(period_outcome.coverage_threshold)
+                            if period_outcome.coverage_threshold is not None else None
+                        ),
+                        "samplingIntervalSeconds": period_outcome.sampling_interval_seconds,
+                    }
                 unavailable += 1
             else:
                 actual_value = float(actual)
@@ -1829,6 +2528,18 @@ def grade_due_external_forecasts(*, now: datetime | str | None = None) -> dict[s
                     "outcomeAlignmentPolicy": "exact_server_observation_or_verified_candle_then_nearest_within_60s_v2",
                     "outcomeOffsetSeconds": outcome_offset_seconds,
                 }
+                if period_outcome is not None:
+                    metrics["periodCoverage"] = {
+                        "status": period_outcome.coverage_status,
+                        "expectedSampleCount": period_outcome.expected_sample_count,
+                        "actualSampleCount": period_outcome.actual_sample_count,
+                        "coveragePercentage": float(period_outcome.coverage_percentage),
+                        "largestGapSeconds": period_outcome.largest_gap_seconds,
+                        "providerCount": period_outcome.provider_count,
+                        "missingIntervals": json.loads(period_outcome.missing_intervals_json or "[]"),
+                        "coverageThreshold": float(period_outcome.coverage_threshold),
+                        "samplingIntervalSeconds": period_outcome.sampling_interval_seconds,
+                    }
                 disposition = "scenario_graded" if target_semantics == "scenario_calculator" else "graded"
                 graded += 1
             session.add(TagNextExternalGradeRow(

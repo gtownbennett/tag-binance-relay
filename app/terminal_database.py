@@ -1626,6 +1626,28 @@ class TagNextExternalRevisionRow(Base):
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class TagNextExternalRevisionClassificationRow(Base):
+    __tablename__ = "tagnext_external_revision_classifications"
+    __table_args__ = (
+        CheckConstraint(
+            "classification IN ('SEMANTIC_FORECAST_REVISION','SUPERSEDED_FALSE_REVISION')",
+            name="ck_tagnext_external_revision_classification",
+        ),
+    )
+
+    classification_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    revision_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("tagnext_external_forecast_revisions.revision_id"), index=True
+    )
+    classification: Mapped[str] = mapped_column(Text, index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    evidence_package_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("tagnext_external_evidence_packages.evidence_package_id")
+    )
+    classified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
 class TagNextExternalGradeRow(Base):
     __tablename__ = "tagnext_external_forecast_grades"
     __table_args__ = (UniqueConstraint("snapshot_id", "deadline", "grader_version", name="uq_tagnext_external_grade"),)
@@ -2002,6 +2024,15 @@ class TagNextPeriodOutcomeRow(Base):
     period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     observation_count: Mapped[int] = mapped_column(BigInteger)
+    expected_sample_count: Mapped[int | None] = mapped_column(BigInteger)
+    actual_sample_count: Mapped[int | None] = mapped_column(BigInteger)
+    coverage_percentage: Mapped[Decimal | None] = mapped_column(Numeric(20, 12))
+    largest_gap_seconds: Mapped[int | None] = mapped_column(BigInteger)
+    provider_count: Mapped[int | None] = mapped_column(Integer)
+    missing_intervals_json: Mapped[str] = mapped_column(Text, default="[]")
+    coverage_status: Mapped[str | None] = mapped_column(Text, index=True)
+    coverage_threshold: Mapped[Decimal | None] = mapped_column(Numeric(20, 12))
+    sampling_interval_seconds: Mapped[int | None] = mapped_column(BigInteger)
     minimum_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
     maximum_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
     average_price: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
@@ -2593,6 +2624,17 @@ def _migrate_rc3_columns() -> None:
                 "next_retry_at": "TIMESTAMP",
                 "last_error": "TEXT",
                 "semantic_identity_id": "TEXT",
+            },
+            "tagnext_period_outcome_aggregates": {
+                "expected_sample_count": "BIGINT",
+                "actual_sample_count": "BIGINT",
+                "coverage_percentage": "NUMERIC(20,12)",
+                "largest_gap_seconds": "BIGINT",
+                "provider_count": "INTEGER",
+                "missing_intervals_json": "TEXT NOT NULL DEFAULT '[]'",
+                "coverage_status": "TEXT",
+                "coverage_threshold": "NUMERIC(20,12)",
+                "sampling_interval_seconds": "BIGINT",
             },
             "tagnext_discovery_candidates": {
                 "normalized_url": "TEXT",

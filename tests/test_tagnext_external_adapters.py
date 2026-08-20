@@ -157,3 +157,109 @@ def test_exchange_calculator_is_conditional_and_preserves_native_currency() -> N
     assert claims[0]["targetCurrency"] == "CAD"
     assert claims[0]["targetPrice"] is None
     assert claims[0]["targetNativePrice"] == 0.000989
+
+
+def test_nonpositive_target_is_not_a_forecast_claim() -> None:
+    fetched = datetime(2026, 8, 17, 21, tzinfo=timezone.utc)
+    url = "https://coincheckup.com/coins/tagger/predictions"
+    document = parse_document(
+        url=url,
+        html=(
+            "<html><title>TAGGER price prediction</title>"
+            "<table><tr><th>Year</th><th>Forecast price</th></tr>"
+            "<tr><td>2027</td><td>$0</td></tr></table></html>"
+        ),
+        fetched_at=fetched,
+    )
+    assert adapter_for_url(url).parse(source_id="coincheckup-tagger", document=document) == []
+
+
+def test_dmc_news_article_money_is_not_a_forecast_claim() -> None:
+    fetched = datetime(2026, 8, 17, 21, tzinfo=timezone.utc)
+    url = "https://dmcnews.org/prices/tagger"
+    document = parse_document(
+        url=url,
+        html=(
+            "<html><title>TAGGER Price Today</title><p>TAG $0.0013736 live price.</p>"
+            "<article>In 2026 another company announced a $225 million acquisition.</article></html>"
+        ),
+        fetched_at=fetched,
+    )
+    assert adapter_for_url(url).parse(source_id="dmcnews-tagger", document=document) == []
+
+
+def test_govcapital_accepts_only_explicit_dated_forecast_sentence() -> None:
+    fetched = datetime(2026, 8, 18, 21, tzinfo=timezone.utc)
+    url = "https://gov.capital/crypto/tagger/"
+    document = parse_document(
+        url=url,
+        html=(
+            "<html><title>Tagger (TAG) Forecast is 0.001197 USD for 2027-08-18; "
+            "And 0.000671 USD for 2031-08-18!</title>"
+            "<p>Advertisement: save $225 and see rank 2026.</p></html>"
+        ),
+        fetched_at=fetched,
+    )
+    claims = adapter_for_url(url).parse(source_id="govcapital-tagger", document=document)
+    assert [(row["normalizedHorizon"], row["targetPrice"]) for row in claims] == [
+        ("2027-08-18", 0.001197),
+        ("2031-08-18", 0.000671),
+    ]
+    assert all("labelled_title_sentence" in row["methodologyVersion"] for row in claims)
+
+
+def test_bitscreener_uses_visible_annual_rows_not_monthly_json_years() -> None:
+    fetched = datetime(2026, 8, 18, 21, tzinfo=timezone.utc)
+    url = "https://bitscreener.com/coins/tagger/price-prediction"
+    document = parse_document(
+        url=url,
+        html=(
+            "<html><title>Tagger (TAG) Price Prediction</title>"
+            "<p>Year Average Price (USD) Low Price (USD) High Price (USD) Change from today's price "
+            "2026 $0.0008433 $0.0002542 $0.002159 -7.53% "
+            "2027 $0.001666 $0.0008118 $0.002741 +82.73% "
+            "Tagger Price Prediction for 2026</p>"
+            "<script type='application/json'>"
+            '{"year":2026,"month":"February","low":0.000254194444055034,"high":0.000407392162231132}'
+            "</script></html>"
+        ),
+        fetched_at=fetched,
+    )
+    claims = adapter_for_url(url).parse(source_id="bitscreener-tagger", document=document)
+    assert len(claims) == 6
+    assert {(row["normalizedHorizon"], row["targetSemantics"], row["targetPrice"]) for row in claims} == {
+        ("2026", "period_minimum", 0.0002542),
+        ("2026", "period_average", 0.0008433),
+        ("2026", "period_maximum", 0.002159),
+        ("2027", "period_minimum", 0.0008118),
+        ("2027", "period_average", 0.001666),
+        ("2027", "period_maximum", 0.002741),
+    }
+    assert all("visible_annual_summary" in row["methodologyVersion"] for row in claims)
+
+
+def test_digitalcoinprice_uses_visible_month_table_not_embedded_daily_candles() -> None:
+    fetched = datetime(2026, 4, 6, 9, 5, 57, tzinfo=timezone.utc)
+    url = "https://digitalcoinprice.com/forecast/tagger"
+    document = parse_document(
+        url=url,
+        html=(
+            "<html><title>Tagger (TAG) Price Prediction 2026-2030</title><p>"
+            "Tagger (TAG) Price Prediction 2026 Month Minimum Price Average Price Maximum Price Avg. Change "
+            "Apr 2026 $0.000655 $0.000793 $0.000931 24.28 % "
+            "May 2026 $0.000727 $0.000752 $0.000776 17.82 % "
+            "In the first week of April 2026</p>"
+            "<script type='application/json'>"
+            '{"date":"2026-04-05T17:38:00.178Z","low":0.0006481821239996036,"high":0.0006896372180708402}'
+            "</script></html>"
+        ),
+        fetched_at=fetched,
+    )
+    claims = adapter_for_url(url).parse(source_id="digitalcoinprice-tagger", document=document)
+    assert len(claims) == 6
+    assert {row["normalizedHorizon"] for row in claims} == {"2026-04", "2026-05"}
+    assert {row["targetPrice"] for row in claims if row["normalizedHorizon"] == "2026-04"} == {
+        0.000655, 0.000793, 0.000931,
+    }
+    assert all(row["observedLive"] is False for row in claims)
+    assert all("visible_monthly_table" in row["methodologyVersion"] for row in claims)

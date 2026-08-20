@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from sqlalchemy import delete, select
 
 from app.tagnext_pipeline import (
     FEATURE_VERSION,
+    _period_coverage_metrics,
     build_external_consensus,
     capture_shadow_features,
     external_semantic_fingerprint,
@@ -357,6 +359,74 @@ def test_complete_period_range_e2e_uses_actual_minimum_and_maximum() -> None:
         assert metrics["actualPeriodMinimum"] == 0.0008
         assert metrics["actualPeriodMaximum"] == 0.0015
         assert metrics["rangeCoverage"] is False
+
+
+def test_period_coverage_policy_requires_threshold_and_bounded_gaps() -> None:
+    period_start = NOW.replace(second=0, microsecond=0)
+    period_end = period_start + timedelta(hours=23, minutes=59, seconds=59)
+    complete = _period_coverage_metrics(
+        [period_start + timedelta(hours=index) for index in range(24)],
+        period_start=period_start, period_end=period_end, interval_seconds=3_600,
+    )
+    assert complete["expectedSampleCount"] == 24
+    assert complete["actualSampleCount"] == 24
+    assert complete["coveragePercentage"] == 100.0
+    assert complete["coverageStatus"] == "COMPLETE"
+
+    incomplete = _period_coverage_metrics(
+        [period_start + timedelta(hours=index) for index in range(20)],
+        period_start=period_start, period_end=period_end, interval_seconds=3_600,
+    )
+    assert incomplete["actualSampleCount"] == 20
+    assert incomplete["coveragePercentage"] < 95.0
+    assert incomplete["largestGapSeconds"] > 2 * 3_600
+    assert incomplete["coverageStatus"] == "PERIOD_COVERAGE_INCOMPLETE"
+
+
+def test_incomplete_period_is_frozen_but_never_graded() -> None:
+    period_start = NOW.replace(second=0, microsecond=0)
+    period_end = period_start + timedelta(days=1) - timedelta(seconds=1)
+    register_external_source({
+        "sourceId": "period-incomplete", "label": "period-incomplete",
+        "canonicalUrl": "https://example.test/period-incomplete",
+        "identityChain": {
+            **IDENTITY_CHAIN,
+            "forecastAssetPage": "https://example.test/period-incomplete",
+        },
+    })
+    stored = store_external_snapshot({
+        "sourceId": "period-incomplete", "horizon": "period",
+        "targetSemantics": "period_average",
+        "periodStart": period_start.isoformat(), "periodEnd": period_end.isoformat(),
+        "deadline": period_end.isoformat(), "targetPrice": 0.00115,
+        "direction": "HIGHER", "referencePrice": 0.001,
+    }, captured_at=period_start - timedelta(minutes=1))
+    with session_scope() as session:
+        session.add(TagNextPeriodOutcomeRow(
+            period_outcome_id="tnpo-incomplete-fixture",
+            snapshot_id=stored["snapshotId"],
+            period_start=period_start, period_end=period_end,
+            observation_count=12, expected_sample_count=24, actual_sample_count=12,
+            coverage_percentage=Decimal("50"), largest_gap_seconds=43_200,
+            provider_count=1,
+            missing_intervals_json='[{"missingSamples":12}]',
+            coverage_status="PERIOD_COVERAGE_INCOMPLETE",
+            coverage_threshold=Decimal("0.95"), sampling_interval_seconds=3_600,
+            minimum_price=Decimal("0.0008"), maximum_price=Decimal("0.0014"),
+            average_price=Decimal("0.0011"), end_price=Decimal("0.0012"),
+            source_ids_json='["fixture"]', payload_hash="f" * 64,
+        ))
+    result = grade_due_external_forecasts(now=period_end + timedelta(seconds=1))
+    assert result == {"graded": 0, "outcomeUnavailable": 1}
+    with session_scope() as session:
+        grade = session.scalar(select(TagNextExternalGradeRow).where(
+            TagNextExternalGradeRow.snapshot_id == stored["snapshotId"]
+        ))
+        assert grade.disposition == "PERIOD_COVERAGE_INCOMPLETE"
+        assert grade.actual_price is None
+        metrics = json.loads(grade.metrics_json)
+        assert metrics["periodCoverage"]["status"] == "PERIOD_COVERAGE_INCOMPLETE"
+        assert metrics["periodCoverage"]["actualSampleCount"] == 12
 
 
 def test_semantic_reconciliation_reports_one_canonical_identity_per_snapshot() -> None:

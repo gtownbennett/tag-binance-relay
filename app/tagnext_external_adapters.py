@@ -651,6 +651,196 @@ def _scenario_calculator_text_claims(
     return deduplicate_claims(claims)
 
 
+def _govcapital_claims(
+    source_id: str, document: ForecastDocument, *, issue_at: datetime,
+    adapter_id: str,
+) -> list[dict[str, Any]]:
+    """Parse only Gov.Capital's explicitly labelled dated forecast sentence.
+
+    The page contains many unrelated currency, advertising, rank, and article
+    numbers.  A value is accepted only when the same sentence says both
+    ``Forecast is <value> USD for <YYYY-MM-DD>`` and identifies Tagger/TAG.
+    """
+
+    text = document.visible_text
+    if not re.search(r"\bTagger\s*\(TAG\)\s*(?:Price\s+)?Forecast\b", text, re.I):
+        return []
+    claims: list[dict[str, Any]] = []
+    for raw_value, date_text in re.findall(
+        r"(?:Forecast\s+is|\bAnd)\s+\$?\s*([0-9]+(?:\.[0-9]+)?)\s+USD\s+for\s+"
+        r"(20\d{2}-\d{2}-\d{2})",
+        text,
+        re.I,
+    ):
+        value = _number(raw_value)
+        if value is None or value <= 0:
+            continue
+        try:
+            deadline = datetime.strptime(date_text, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59, tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        claim = _claim(
+            source_id=source_id,
+            label=date_text,
+            semantics="point_at_deadline",
+            value=value,
+            issue_at=issue_at,
+            methodology_version=f"{adapter_id}:labelled_title_sentence",
+            gradeability="point",
+        )
+        claim.update({
+            "normalizedHorizon": date_text,
+            "periodStart": None,
+            "periodEnd": deadline,
+            "deadline": deadline,
+        })
+        claims.append(claim)
+    return deduplicate_claims(claims)
+
+
+def _bitscreener_annual_claims(
+    source_id: str, document: ForecastDocument, *, issue_at: datetime,
+    adapter_id: str,
+) -> list[dict[str, Any]]:
+    """Parse the visible annual summary without collapsing monthly JSON rows."""
+
+    text = document.visible_text
+    header = re.search(
+        r"Year\s+Average Price \(USD\)\s+Low Price \(USD\)\s+High Price \(USD\)\s+"
+        r"Change from today(?:'s)? price",
+        text,
+        re.I,
+    )
+    if not header:
+        return []
+    tail = text[header.end():]
+    tail = re.split(r"Tagger Price Prediction for 20\d{2}", tail, maxsplit=1, flags=re.I)[0]
+    claims: list[dict[str, Any]] = []
+    for year, average, low, high in re.findall(
+        r"\b(20\d{2})\s+\$\s*([0-9.]+)\s+\$\s*([0-9.]+)\s+\$\s*([0-9.]+)\s+"
+        r"[+-]?[0-9.]+%",
+        tail,
+    ):
+        for semantics, raw_value in (
+            ("period_minimum", low),
+            ("period_average", average),
+            ("period_maximum", high),
+        ):
+            value = _number(raw_value)
+            if value is None or value <= 0:
+                continue
+            claims.append(_claim(
+                source_id=source_id,
+                label=year,
+                semantics=semantics,
+                value=value,
+                issue_at=issue_at,
+                methodology_version=f"{adapter_id}:visible_annual_summary_v1",
+                gradeability="period",
+            ))
+    return deduplicate_claims(claims)
+
+
+def _digitalcoinprice_monthly_claims(
+    source_id: str, document: ForecastDocument, *, issue_at: datetime,
+    adapter_id: str,
+) -> list[dict[str, Any]]:
+    """Parse only the selected visible monthly forecast table.
+
+    Embedded page JSON also contains historical daily candles. Walking those
+    objects as forecasts loses their date semantics, so this adapter never
+    delegates to the generic structured-data parser.
+    """
+
+    text = document.visible_text
+    header = re.search(
+        r"Tagger\s*\(TAG\)\s*Price Prediction\s+(20\d{2})\s+Month\s+"
+        r"Minimum Price\s+Average Price\s+Maximum Price\s+Avg\. Change",
+        text,
+        re.I,
+    )
+    if not header:
+        return []
+    table_year = int(header.group(1))
+    tail = text[header.end():]
+    tail = re.split(r"\bIn the first week of\b", tail, maxsplit=1, flags=re.I)[0]
+    month_numbers = {name[:3].lower(): index for index, name in enumerate(calendar.month_name) if name}
+    claims: list[dict[str, Any]] = []
+    for month_name, year_text, minimum, average, maximum in re.findall(
+        r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(20\d{2})\s+"
+        r"\$\s*([0-9.]+)\s+\$\s*([0-9.]+)\s+\$\s*([0-9.]+)\s+[+-]?[0-9.]+\s*%",
+        tail,
+        re.I,
+    ):
+        year = int(year_text)
+        if year != table_year:
+            continue
+        month = month_numbers[month_name[:3].lower()]
+        last_day = calendar.monthrange(year, month)[1]
+        start = datetime(year, month, 1, tzinfo=timezone.utc)
+        end = datetime(year, month, last_day, 23, 59, 59, tzinfo=timezone.utc)
+        for semantics, raw_value in (
+            ("period_minimum", minimum),
+            ("period_average", average),
+            ("period_maximum", maximum),
+        ):
+            value = _number(raw_value)
+            if value is None or value <= 0:
+                continue
+            claim = _claim(
+                source_id=source_id,
+                label=f"{month_name} {year}",
+                semantics=semantics,
+                value=value,
+                issue_at=issue_at,
+                methodology_version=f"{adapter_id}:visible_monthly_table_v1",
+                gradeability="period",
+            )
+            claim.update({
+                "normalizedHorizon": f"{year:04d}-{month:02d}",
+                "periodStart": start,
+                "periodEnd": end,
+                "deadline": end,
+                "observedLive": False,
+            })
+            claims.append(claim)
+    return deduplicate_claims(claims)
+
+
+def _dmcnews_claims(
+    source_id: str, document: ForecastDocument, *, issue_at: datetime,
+    adapter_id: str,
+) -> list[dict[str, Any]]:
+    """Accept only a dedicated DMC forecast table, never news/article money."""
+
+    claims: list[dict[str, Any]] = []
+    for row in document.table_rows:
+        joined = " | ".join(row)
+        match = re.fullmatch(
+            r"\s*(20\d{2})\s*\|\s*(?:TAGGER\s+)?(?:forecast|prediction)\s*\|\s*"
+            r"(?:USD\s*|\$\s*)(0?\.\d+|\d+(?:\.\d+)?)\s*",
+            joined,
+            re.I,
+        )
+        if not match:
+            continue
+        value = _number(match.group(2))
+        if value is None or value <= 0:
+            continue
+        claims.append(_claim(
+            source_id=source_id,
+            label=match.group(1),
+            semantics="year_end",
+            value=value,
+            issue_at=issue_at,
+            methodology_version=f"{adapter_id}:dedicated_forecast_table",
+            gradeability="point",
+        ))
+    return deduplicate_claims(claims)
+
+
 def _document_issue_at(document: ForecastDocument) -> datetime:
     text = document.visible_text
     match = re.search(
@@ -711,6 +901,38 @@ class SourceAdapter:
             return _cmc_ai_claims(source_id, document, adapter_id=self.adapter_id)
         if self.parser_kind == "gate_native":
             return _gate_native_currency_claims(
+                source_id, document, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            )
+        if self.parser_kind == "govcapital":
+            return _govcapital_claims(
+                source_id, document, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            )
+        if self.parser_kind == "bitscreener_annual":
+            annual = _bitscreener_annual_claims(
+                source_id, document, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            )
+            if annual:
+                return annual
+            return _table_claims(
+                source_id, document.table_rows, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            )
+        if self.parser_kind == "digitalcoinprice_monthly":
+            monthly = _digitalcoinprice_monthly_claims(
+                source_id, document, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            )
+            if monthly:
+                return monthly
+            return _table_claims(
+                source_id, document.table_rows, issue_at=effective_issue_at,
+                adapter_id=self.adapter_id,
+            )
+        if self.parser_kind == "dmcnews":
+            return _dmcnews_claims(
                 source_id, document, issue_at=effective_issue_at,
                 adapter_id=self.adapter_id,
             )
@@ -776,15 +998,15 @@ ADAPTERS: tuple[SourceAdapter, ...] = (
     SourceAdapter("tradersunion_tagger_rendered_v3", ("tradersunion.com",), "algorithmic_forecast", 1_209_600, parser_kind="tradersunion"),
     SourceAdapter("coinarbitragebot_tagger_v2", ("coinarbitragebot.com",), "algorithmic_forecast", 2_592_000),
     SourceAdapter("midforex_tagger_v2", ("midforex.com",), "machine_learning_forecast", 2_592_000),
-    SourceAdapter("bitscreener_tagger_v2", ("bitscreener.com",), "algorithmic_forecast", 1_209_600),
-    SourceAdapter("digitalcoinprice_tagger_v2", ("digitalcoinprice.com",), "algorithmic_forecast", 2_592_000),
+    SourceAdapter("bitscreener_tagger_v3", ("bitscreener.com",), "algorithmic_forecast", 1_209_600, parser_kind="bitscreener_annual"),
+    SourceAdapter("digitalcoinprice_tagger_v3", ("digitalcoinprice.com",), "algorithmic_forecast", 2_592_000, parser_kind="digitalcoinprice_monthly"),
     SourceAdapter("walletinvestor_tagger_v2", ("walletinvestor.com",), "algorithmic_forecast", 1_209_600, parser_kind="walletinvestor"),
     SourceAdapter("blockspot_tagger_v2", ("blockspot.io",), "algorithmic_forecast", 2_592_000),
     SourceAdapter("cryptoticker_tagger_v1", ("cryptoticker.io",), "technical_analysis_article", 1_209_600),
-    SourceAdapter("dmcnews_tagger_v1", ("dmcnews.org",), "algorithmic_forecast", 2_592_000),
+    SourceAdapter("dmcnews_tagger_v2", ("dmcnews.org",), "algorithmic_forecast", 2_592_000, parser_kind="dmcnews"),
     SourceAdapter("coindataflow_tagger_v1", ("coindataflow.com",), "algorithmic_forecast", 2_592_000),
     SourceAdapter("coincheckup_tagger_v1", ("coincheckup.com",), "algorithmic_forecast", 2_592_000),
-    SourceAdapter("govcapital_tagger_v1", ("gov.capital",), "algorithmic_forecast", 2_592_000),
+    SourceAdapter("govcapital_tagger_v2", ("gov.capital",), "algorithmic_forecast", 2_592_000, parser_kind="govcapital"),
     SourceAdapter("hexn_tagger_v1", ("hexn.io",), "algorithmic_forecast", 2_592_000),
     SourceAdapter("coinmarketcap_ai_tagger_v2", ("coinmarketcap.com",), "ai_summary", 1_209_600, parser_kind="cmc_ai"),
     SourceAdapter("gate_tagger_native_currency_v3", ("miniapp.gate.com",), "algorithmic_forecast", 1_209_600, parser_kind="gate_native"),
@@ -805,6 +1027,20 @@ def deduplicate_claims(claims: Sequence[Mapping[str, Any]]) -> list[dict[str, An
     seen: set[str] = set()
     for raw in claims:
         claim = dict(raw)
+        numeric_targets = [
+            claim.get("targetPrice"), claim.get("targetLow"), claim.get("targetHigh"),
+            claim.get("targetNativePrice"), claim.get("targetNativeLow"),
+            claim.get("targetNativeHigh"),
+        ]
+        present_targets = [_number(value) for value in numeric_targets if value is not None]
+        if present_targets and any(value is None or value <= 0 for value in present_targets):
+            continue
+        if (
+            not present_targets
+            and not claim.get("direction")
+            and claim.get("probability") is None
+        ):
+            continue
         key = json.dumps({
             "horizon": claim.get("normalizedHorizon"),
             "original": claim.get("originalHorizonLabel"),
