@@ -11,5 +11,7 @@ def test_render_catalog_bootstrap_is_fail_closed_and_champion_empty() -> None:
     assert 'os.environ.get("TAGNEXT_CATALOG_BOOTSTRAP", "0") != "1"' in source
     assert 'refusing to restore over a partially populated catalog' in source
     assert 'champion-table isolation check failed' in source
+    assert 'tagnext_valid_external_forecast_snapshots' not in source
+    assert "'INVALID_PARSER_OUTPUT', 'INVALID_DATA_QUALITY', 'WRONG_ASSET'" in source
     assert "--single-transaction" in source
     assert "--exit-on-error" in source

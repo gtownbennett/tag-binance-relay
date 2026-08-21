@@ -30,10 +30,34 @@ def _catalog_counts(connection: psycopg.Connection) -> dict[str, int]:
              WHERE source_id <> 'rc4-scheduler-proof-local'),
           (SELECT count(*) FROM tagnext_external_forecast_sources
              WHERE source_id = 'rc4-scheduler-proof-local'),
-          (SELECT count(*) FROM tagnext_valid_external_forecast_snapshots
-             WHERE source_id <> 'rc4-scheduler-proof-local'),
-          (SELECT count(*) FROM tagnext_valid_external_forecast_snapshots
-             WHERE source_id = 'rc4-scheduler-proof-local'),
+          (SELECT count(*)
+             FROM tagnext_external_forecast_snapshots snapshot
+             LEFT JOIN tagnext_forecast_semantic_identities identity
+               ON identity.snapshot_id = snapshot.snapshot_id
+            WHERE snapshot.source_id <> 'rc4-scheduler-proof-local'
+              AND COALESCE(identity.semantic_status, 'active') = 'active'
+              AND NOT EXISTS (
+                SELECT 1 FROM tagnext_data_quality_quarantine quarantine
+                 WHERE quarantine.entity_type = 'external_forecast_snapshot'
+                   AND quarantine.entity_id = snapshot.snapshot_id
+                   AND quarantine.reason_code IN (
+                     'INVALID_PARSER_OUTPUT', 'INVALID_DATA_QUALITY', 'WRONG_ASSET'
+                   )
+              )),
+          (SELECT count(*)
+             FROM tagnext_external_forecast_snapshots snapshot
+             LEFT JOIN tagnext_forecast_semantic_identities identity
+               ON identity.snapshot_id = snapshot.snapshot_id
+            WHERE snapshot.source_id = 'rc4-scheduler-proof-local'
+              AND COALESCE(identity.semantic_status, 'active') = 'active'
+              AND NOT EXISTS (
+                SELECT 1 FROM tagnext_data_quality_quarantine quarantine
+                 WHERE quarantine.entity_type = 'external_forecast_snapshot'
+                   AND quarantine.entity_id = snapshot.snapshot_id
+                   AND quarantine.reason_code IN (
+                     'INVALID_PARSER_OUTPUT', 'INVALID_DATA_QUALITY', 'WRONG_ASSET'
+                   )
+              )),
           (SELECT count(*) FROM tagnext_champion_imports),
           (SELECT count(*) FROM tagnext_champion_comparisons),
           (SELECT count(*) FROM tagnext_paired_outcomes)
