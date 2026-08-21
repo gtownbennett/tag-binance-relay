@@ -784,22 +784,34 @@ Inspected read-only over the existing trusted Wireless debugging connection on
   `/data/user/0/com.eric.tagalyst`, Android UID 10698.
 - TAGneXt: `com.eric.tagnext`, private data directory
   `/data/user/0/com.eric.tagnext`, Android UID 10703.
-- No shared Android UID was reported. TAG Terminal and ChadTAG were not running,
-  and no matching scheduled jobs or alarms were present at inspection time.
+- No shared Android UID was reported. TAG Terminal had no process, alarm, or
+  active background job. ChadTAG had a cached-empty, frozen process and no alarm.
+- ChadTAG had one queued WorkManager job named `ChadTagComparisonWorker`. It had
+  zero running background jobs at final inspection and was then blocked by its
+  connectivity/quota constraints, but it remains eligible to run later.
+- Read-only inspection of the installed ChadTAG 0.1.0-alpha01 APK (SHA-256
+  `231d3c2b734d5d16844324cae900e0bf51e0125ee2b88a9cc05d047ae8536734`)
+  showed that this worker reads the saved relay key from Android secure storage,
+  makes an authenticated GET to the older Render relay's terminal endpoint with
+  `manual=true`, and imports the result into ChadTAG's private comparison store.
+  No remote-write call was found in that worker path. The endpoint host and key
+  are intentionally omitted from this report.
 
 ## Impact assessment
 
 The distinct UIDs and private data directories isolate ordinary on-device app
 storage. Merely leaving TAG Terminal or ChadTAG installed does not let either app
-overwrite TAGalysis or TAGneXt private storage, and there is no current evidence
-that either dormant app is interfering with TAGneXt, TAGalysis, Render, or Neon.
+overwrite TAGalysis or TAGneXt private storage, and there is no evidence of an
+on-device storage collision or a direct TAGalysis/TAGneXt write.
 
-Android package isolation is not a cloud firewall. If either older app is opened,
-it can make whatever network requests its compiled configuration and credentials
-permit. If an older app points at a shared backend and that backend grants writes,
-those requests could consume Render/Neon usage or mutate shared data. The current
-inspection establishes dormancy and device isolation, not a proof of every future
-network action inside the dormant binaries.
+Android package isolation is not a cloud firewall. ChadTAG's queued read worker
+can wake or keep the older Render relay active and can indirectly cause whatever
+Neon reads that relay performs. This can increase service requests, bandwidth,
+and database active time even though the inspected worker itself uses GET and
+writes only to ChadTAG's local store. Any server-side mutation would depend on
+the deployed relay implementation and its database role; the APK alone cannot
+prove that downstream service behavior. TAG Terminal was dormant at inspection,
+but can likewise make its compiled network requests when opened.
 
 The installed TAGneXt build targets only the local challenger backend. Its final
 validation backend ran with repair-mode write-producing jobs disabled. No
