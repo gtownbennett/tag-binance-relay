@@ -10,8 +10,13 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /service
 
 COPY requirements.txt .
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY scripts/bootstrap_render_catalog.py ./scripts/bootstrap_render_catalog.py
+COPY bootstrap_data/tagnext-rc4-external-catalog.pgcustom ./bootstrap_data/tagnext-rc4-external-catalog.pgcustom
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "python scripts/bootstrap_render_catalog.py && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
