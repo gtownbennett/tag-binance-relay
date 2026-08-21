@@ -373,10 +373,11 @@ def main() -> int:
     device_passed_verification = """\
 - Installed-phone LAN acceptance: passed on Samsung SM-F966U1 over the existing
   trusted Wireless debugging connection.
-- Package coexistence: `com.eric.tagnext`, `com.eric.tagalyst`, and
-  `com.eric.tagterminal` remained installed together.
-- Outer/inner layouts: passed at 1080×2520 and 1968×2184; the unfolded view used
-  the expanded navigation rail without overlap or clipping.
+- Package coexistence: `com.eric.tagnext`, `com.eric.tagalyst`,
+  `com.eric.tagterminal`, and `com.eric.chadtag` remained installed together.
+- Earlier outer/inner acceptance passed at 1080×2520 and 1968×2184. The final
+  Predictions correction was separately recaptured on the current default
+  1080×2520 display; it did not repeat the physical fold transition.
 - Restart persistence, populated forecast/position, honest offline state, local
   JSON export creation, and local challenger recovery: passed.
 """ if device_passed else ""
@@ -417,9 +418,10 @@ override the independent champion-comparison or provider-onboarding blockers.
 
 ## Result
 
-Backend RC4: local PostgreSQL service healthy, system ID `tagnext`, background
-scheduler running at a 300-second external-grading cadence, paid AI disabled,
-push disabled, and database source `TAGNEXT_DATABASE_URL`.
+Backend RC4: the isolated PostgreSQL pipeline and its scheduler proof passed.
+The final Predictions correction was validated in strict local repair mode with
+background jobs, live collectors, deterministic grading, backfill, paid AI, and
+push disabled. No champion connection was inherited by that validation process.
 
 Backend tests: 298 passed, 4 skipped. The four exact skips are preserved in
 `tests/backend/backend-skipped-tests-exact.log`; every skip protects a Phase 6
@@ -632,18 +634,22 @@ Status: **{args.device_state.upper()}**
 - Validation APK SHA-256: `{apk_sha256}`.
 - Stable signing certificate SHA-256:
   `87c119b3463c20fe32cbeadc42193bca3ba233781bce8da49cdbbaca454cee19`.
-- Coexistence verified: `com.eric.tagnext`, `com.eric.tagalyst`, and
-  `com.eric.tagterminal` remained installed. No package was uninstalled.
+- Coexistence verified: `com.eric.tagnext`, `com.eric.tagalyst`,
+  `com.eric.tagterminal`, and `com.eric.chadtag` remained installed. No package
+  was uninstalled.
 - The installed build targets only the private-LAN challenger. Device-runtime
   logs contain no TAGalysis/champion reference. No champion write was attempted.
 
 ## Display acceptance
 
-- Folded outer display: 1080×2520, populated and usable.
-- Unfolded inner display: 1968×2184, populated and usable with the expanded
-  navigation rail, no overlap, no clipped controls, and normal scrolling.
-- The fold transition preserved app state. Inner evidence includes populated
-  Forecast, Position, and read-only export screens.
+- Earlier folded outer-display acceptance at 1080×2520 and unfolded inner-display
+  acceptance at 1968×2184 passed, including the expanded navigation rail and fold
+  state preservation.
+- The final Predictions catalog and all-source sheet correction was captured on
+  the device's current default 1080×2520 display. That correction pass did not
+  repeat or re-label a new physical inner-display transition.
+- The combined evidence includes populated Forecast, Position, read-only export,
+  Predictions catalog, and all-source prediction-sheet screens.
 
 ## Market truth, funding, and portfolio
 
@@ -663,8 +669,9 @@ Status: **{args.device_state.upper()}**
 - Forecast, Predictions, Patterns, Position, Future Paths, Event Ledger, Whales
   / direct BNB-chain evidence, Heatmap, Leverage, Market & Evidence, Data Sources,
   Learning & History, forecast history, and local audit export were exercised.
-- The forecast was populated and authoritative. Prediction identity remained
-  honestly unavailable where no identity-verified snapshot existed.
+- The forecast was populated and authoritative. The selected 24-hour horizon had
+  zero outside claims, while the separate sheet honestly exposed all 374 active
+  claims across every published horizon and five explicit no-claim source rows.
 - Whales/on-chain correctly reported observed addresses rather than a complete
   holder census. Heatmap correctly separated observed order-book depth from the
   unavailable provider liquidation heatmap.
@@ -712,8 +719,8 @@ Render Standard 1 CPU/2 GB at $25/month plus the same 0.25-CU always-on Neon
 Launch assumption ($20.225 including 1 GB storage) totals about $45.23/month.
 
 Pricing sources checked 2026-08-20:
-- https://render.com/articles/render-vs-railway
-- https://render.com/articles/how-much-does-cloud-application-hosting-cost-for-small-businesses
+- https://render.com/pricing
+- https://render.com/docs/free
 - https://neon.com/pricing
 
 Actual billing depends on compute autoscaling, storage/WAL history, extra branches,
@@ -762,6 +769,42 @@ was created.
 All three remain non-influential. Unsupported or unconfigured data is not blended
 into TAGNEXT_BASELINE.
 """
+    installed_app_isolation = """# Installed-app isolation report
+
+Inspected read-only over the existing trusted Wireless debugging connection on
+2026-08-20. No package was removed, disabled, cleared, or modified by this audit.
+
+## Current evidence
+
+- TAG Terminal: `com.eric.tagterminal`, private data directory
+  `/data/user/0/com.eric.tagterminal`, Android UID 10689.
+- ChadTAG: `com.eric.chadtag`, private data directory
+  `/data/user/0/com.eric.chadtag`, Android UID 10673.
+- TAGalysis: `com.eric.tagalyst`, private data directory
+  `/data/user/0/com.eric.tagalyst`, Android UID 10698.
+- TAGneXt: `com.eric.tagnext`, private data directory
+  `/data/user/0/com.eric.tagnext`, Android UID 10703.
+- No shared Android UID was reported. TAG Terminal and ChadTAG were not running,
+  and no matching scheduled jobs or alarms were present at inspection time.
+
+## Impact assessment
+
+The distinct UIDs and private data directories isolate ordinary on-device app
+storage. Merely leaving TAG Terminal or ChadTAG installed does not let either app
+overwrite TAGalysis or TAGneXt private storage, and there is no current evidence
+that either dormant app is interfering with TAGneXt, TAGalysis, Render, or Neon.
+
+Android package isolation is not a cloud firewall. If either older app is opened,
+it can make whatever network requests its compiled configuration and credentials
+permit. If an older app points at a shared backend and that backend grants writes,
+those requests could consume Render/Neon usage or mutate shared data. The current
+inspection establishes dormancy and device isolation, not a proof of every future
+network action inside the dormant binaries.
+
+The installed TAGneXt build targets only the local challenger backend. Its final
+validation backend ran with repair-mode write-producing jobs disabled. No
+TAGalysis write was attempted.
+"""
     accounts = """# RC4 provider account manifest
 
 Accounts created in RC4: 0. API keys created: 0. Payment methods entered: 0.
@@ -796,6 +839,7 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
             "reports/FUNCTIONAL_STATE_INVENTORY.md": features.encode(),
             "reports/DEVICE_ACCEPTANCE.md": device_report.encode(),
             "reports/CHAMPION_READONLY_ROLE_AUDIT.md": champion_role_report.encode(),
+            "reports/INSTALLED_APP_ISOLATION.md": installed_app_isolation.encode(),
             "reports/DEPLOYMENT_PLAN_AND_COSTS.md": deployment.encode(),
             "providers/RC4_PROVIDER_COVERAGE_GATE.md": provider_gate.encode(),
             "providers/RC4_PROVIDER_ACCOUNT_MANIFEST.md": accounts.encode(),
