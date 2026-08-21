@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -217,3 +218,13 @@ def test_runtime_shadow_payload_marks_old_success_stale() -> None:
         row["freshnessState"] == "stale"
         for row in exposed["providers"].values()
     )
+
+
+def test_authenticated_provider_route_has_bounded_first_read_refresh() -> None:
+    source = (Path(__file__).parents[1] / "app" / "main.py").read_text(encoding="utf-8")
+    route = source[source.index('@app.get("/v1/tagnext/providers/live")'):]
+    route = route[:route.index('@app.get("/v1/tagnext/discovery/inventory")')]
+    assert 'require_relay_key(x_relay_key)' in route
+    assert 'if not latest.get("checkedAt")' in route
+    assert 'await asyncio.to_thread(collect_provider_shadow_snapshot)' in route
+    assert 'provider_shadow_payload()' in route

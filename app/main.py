@@ -3233,8 +3233,15 @@ async def tagnext_provider_shadows(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    # Side-effect free: provider collection runs only in the bounded server job.
-    return {"ok": True, **provider_shadow_payload()}
+    latest = provider_shadow_payload()
+    # A newly started free instance can have a long durable-job backlog.  Do one
+    # bounded, read-only provider refresh on the first authenticated request so
+    # the app never reports configured providers as absent merely because that
+    # background job has not yet reached the head of the queue.
+    if not latest.get("checkedAt"):
+        latest = await asyncio.to_thread(collect_provider_shadow_snapshot)
+        latest = provider_shadow_payload()
+    return {"ok": True, **latest}
 
 
 @app.get("/v1/tagnext/discovery/inventory")
