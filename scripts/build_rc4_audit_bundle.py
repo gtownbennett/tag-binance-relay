@@ -71,6 +71,8 @@ DEVICE_EVIDENCE_STEMS = {
         "app-current-1968x2184",
         "forecast-populated-1968x2184",
         "position-populated-1968x2184",
+        "predictions-catalog",
+        "predictions-all-sources-sheet",
     },
 }
 
@@ -419,12 +421,12 @@ Backend RC4: local PostgreSQL service healthy, system ID `tagnext`, background
 scheduler running at a 300-second external-grading cadence, paid AI disabled,
 push disabled, and database source `TAGNEXT_DATABASE_URL`.
 
-Backend tests: 297 passed, 4 skipped. The four exact skips are preserved in
+Backend tests: 298 passed, 4 skipped. The four exact skips are preserved in
 `tests/backend/backend-skipped-tests-exact.log`; every skip protects a Phase 6
 warehouse that is an external artifact rather than a Git-tracked CI fixture.
 
 Android Gradle/JVM tests: 78 passed, 0 failed, 0 skipped across 15 suites.
-Android source-contract tests: 32 passed, 0 failed, 0 skipped. The validation
+Android source-contract tests: 33 passed, 0 failed, 0 skipped. The validation
 APK has package `com.eric.tagnext`, version 0.9.0-rc4/versionCode 10004, and a
 signed build-time environment gate for the private LAN challenger. The APK SHA-256
 is `{apk_sha256}`. The signing certificate SHA-256 is
@@ -434,6 +436,12 @@ is `{apk_sha256}`. The signing certificate SHA-256 is
 The source-score scheduler amplification defect is fixed: unchanged score
 payloads no longer append rows merely because cutoff time changed. Existing
 append-only historical rows were retained rather than destructively rewritten.
+
+The Predictions page now retains all 24 public source records regardless of the
+selected horizon. Its all-source bottom sheet renders all 374 active frozen
+claims and five explicit no-claim rows; no source is hidden merely because the
+selected 24-hour horizon has no outside claim. The catalog query projects only
+display fields and does not transfer stored raw-page evidence on each refresh.
 
 Device status: {args.device_state}. On-device acceptance covered the outer and
 inner displays, populated decision/intelligence surfaces, portfolio math,
@@ -489,8 +497,8 @@ compression driven primarily by price, not a 24.8% token-OI liquidation.
 - Public popularity coverage: {counts['popularity_complete_sources']}/{counts['valid_source_records']}.
 - Valid nonpositive targets: {counts['accepted_nonpositive_targets']}.
 - Real background scheduler proof: passed.
-- Backend tests: 297 passed; four deliberate external-artifact skips documented.
-- Android tests: 78 Gradle/JVM plus 32 source-contract tests passed; validation APK built.
+- Backend tests: 298 passed; four deliberate external-artifact skips documented.
+- Android tests: 78 Gradle/JVM plus 33 source-contract tests passed; validation APK built.
 - RC3 immutability checksum: {actual_rc3_sha}.
 {device_passed_verification}
 
@@ -826,13 +834,13 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
 
         _add_file(archive, "apk/TAGneXt-0.9.0-rc4-validation.apk", apk, checksums)
         _add_file(archive, "exports/TAGneXt_FULL_BRAIN_RC4.zip", brain, checksums)
-        _add_file(archive, "tests/backend/backend-pytest-final.log", backend / "outputs/rc4/backend-pytest-final.log", checksums)
-        _add_file(archive, "tests/backend/backend-skipped-tests-exact.log", backend / "outputs/rc4/backend-skipped-tests-exact.log", checksums)
+        _add_file(archive, "tests/backend/backend-pytest-final.log", backend / "outputs/rc4/backend-pytest-predictions-sheet-rerun.log", checksums)
+        _add_file(archive, "tests/backend/backend-skipped-tests-exact.log", backend / "outputs/rc4/backend-skipped-tests-exact-predictions-sheet.log", checksums)
         _add_file(archive, "tests/backend/rc4-scheduler-proof-final.json", backend / "outputs/rc4/scheduler-proof-final.json", checksums)
-        _add_file(archive, "tests/android/android-gradle-final-rerun.log", android / "outputs/rc4/android-gradle-final-rerun.log", checksums)
+        _add_file(archive, "tests/android/android-gradle-final-rerun.log", android / "outputs/rc4/android-gradle-predictions-sheet-final.log", checksums)
         _add_file(archive, "tests/android/android-gradle-device-lan-final.log", android / "outputs/rc4/android-gradle-device-lan-final.log", checksums)
         _add_file(archive, "tests/android/android-gradle-stable-signed-final.log", android / "outputs/rc4/android-gradle-stable-signed-final.log", checksums)
-        _add_file(archive, "tests/android/android-python-contract-tests-final.log", android / "outputs/rc4/android-python-contract-tests-final.log", checksums)
+        _add_file(archive, "tests/android/android-python-contract-tests-final.log", android / "outputs/rc4/android-python-contract-tests-predictions-sheet.log", checksums)
         for path in sorted((android / "app/build/test-results/testDebugUnitTest").glob("TEST-*.xml")):
             _add_file(archive, f"tests/android/xml/{path.name}", path, checksums)
         for runtime_log in (
@@ -840,6 +848,8 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
             "backend-runtime-device-auth-ready.stderr.log",
             "backend-runtime-device-auth-restored.stdout.log",
             "backend-runtime-device-auth-restored.stderr.log",
+            "backend-runtime-predictions-sheet-v2.stdout.log",
+            "backend-runtime-predictions-sheet-v2.stderr.log",
         ):
             _add_file(archive, f"build-logs/backend/{runtime_log}", backend / "outputs/rc4" / runtime_log, checksums)
         _add_file(archive, "build-logs/database/rc4-postgres-device.log", workspace / "work/rc4-postgres-device.log", checksums)

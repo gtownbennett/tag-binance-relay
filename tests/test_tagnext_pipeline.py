@@ -222,6 +222,56 @@ def test_scenario_calculators_are_visible_but_never_consensus_components() -> No
     assert {row["sourceId"] for row in predictions_payload(horizon="2030")["externalForecasts"]} == {"forecast", "calculator"}
 
 
+def test_prediction_catalog_keeps_every_source_and_builds_all_source_sheet_rows() -> None:
+    for source_id, claim_class in (
+        ("selected-source", "explicit_forecast"),
+        ("other-horizon-source", "algorithmic_forecast"),
+        ("no-claim-source", "ai_summary"),
+    ):
+        register_external_source({
+            "sourceId": source_id,
+            "label": source_id.replace("-", " ").title(),
+            "canonicalUrl": f"https://example.test/{source_id}",
+            "identityChain": {
+                **IDENTITY_CHAIN,
+                "forecastAssetPage": f"https://example.test/{source_id}",
+            },
+            "claimClass": claim_class,
+            "popularity": {"score": 10 if source_id == "selected-source" else 5},
+        })
+    store_external_snapshot({
+        "sourceId": "selected-source", "horizon": "24h",
+        "deadline": "2026-08-18T12:00:00Z", "direction": "HIGHER",
+        "targetPrice": 0.0012,
+    }, captured_at=NOW)
+    store_external_snapshot({
+        "sourceId": "other-horizon-source", "horizon": "2030",
+        "deadline": "2030-12-31T23:59:59Z", "direction": "HIGHER",
+        "targetPrice": 0.01,
+    }, captured_at=NOW)
+
+    payload = predictions_payload(horizon="24h")
+    catalog = {row["sourceId"]: row for row in payload["externalSourceCatalog"]}
+
+    assert set(catalog) == {"selected-source", "other-horizon-source", "no-claim-source"}
+    assert catalog["selected-source"]["displayState"] == "selected_horizon_available"
+    assert float(catalog["selected-source"]["predictions"][0]["targetPrice"]) == 0.0012
+    assert catalog["other-horizon-source"]["displayState"] == "other_horizons_available"
+    assert catalog["other-horizon-source"]["availableHorizons"] == ["2030"]
+    assert catalog["no-claim-source"]["displayState"] == "no_published_prediction"
+    assert catalog["no-claim-source"]["predictions"] == []
+    assert payload["externalSourceCatalogSummary"] == {
+        "sourceCount": 3,
+        "sourcesWithPublishedPredictions": 2,
+        "publishedPredictionCount": 2,
+        "selectedHorizonSourceCount": 1,
+        "selectedHorizonPredictionCount": 1,
+        "noPredictionSourceCount": 1,
+        "sheetIncludesNoPredictionRows": True,
+        "internalAcceptanceSourcesExcluded": 0,
+    }
+
+
 def test_verified_candle_alignment_is_recorded_and_single_interval_is_not_called_wis() -> None:
     deadline = NOW.replace(second=0, microsecond=0)
     register_external_source({

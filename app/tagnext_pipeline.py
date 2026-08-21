@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from sqlalchemy import func, select
+from sqlalchemy.orm import load_only
 
 from .canonical_forecast import TAGNEXT_BASELINE
 from .tagnext_external_adapters import (
@@ -2859,41 +2860,105 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
         links = [] if forecast is None else list(session.scalars(select(TagNextForecastFeatureLinkRow).where(
             TagNextForecastFeatureLinkRow.forecast_id == forecast.forecast_id
         )))
-        external_rows = list(session.scalars(select(TagNextExternalSnapshotRow).join(
-            TagNextExternalSourceRow, TagNextExternalSourceRow.source_id == TagNextExternalSnapshotRow.source_id
-        ).where(TagNextExternalSnapshotRow.horizon == selected).order_by(
-            TagNextExternalSnapshotRow.captured_at.desc()
+        all_sources = list(session.scalars(select(TagNextExternalSourceRow).order_by(
+            TagNextExternalSourceRow.label.asc(),
+            TagNextExternalSourceRow.source_id.asc(),
         )))
-        external_rows = [
-            row for row in external_rows if _semantic_snapshot_is_active(session, row.snapshot_id)
+        sources = {row.source_id: row for row in all_sources}
+        all_external_rows = list(session.scalars(select(TagNextExternalSnapshotRow).options(load_only(
+            TagNextExternalSnapshotRow.snapshot_id,
+            TagNextExternalSnapshotRow.source_id,
+            TagNextExternalSnapshotRow.captured_at,
+            TagNextExternalSnapshotRow.deadline,
+            TagNextExternalSnapshotRow.horizon,
+            TagNextExternalSnapshotRow.direction,
+            TagNextExternalSnapshotRow.target_price,
+            TagNextExternalSnapshotRow.target_low,
+            TagNextExternalSnapshotRow.target_high,
+            TagNextExternalSnapshotRow.target_currency,
+            TagNextExternalSnapshotRow.target_native_price,
+            TagNextExternalSnapshotRow.target_native_low,
+            TagNextExternalSnapshotRow.target_native_high,
+            TagNextExternalSnapshotRow.move_pct,
+            TagNextExternalSnapshotRow.provenance_json,
+            TagNextExternalSnapshotRow.original_horizon_label,
+            TagNextExternalSnapshotRow.target_semantics,
+            TagNextExternalSnapshotRow.source_issue_at,
+            TagNextExternalSnapshotRow.source_update_at,
+            TagNextExternalSnapshotRow.period_start,
+            TagNextExternalSnapshotRow.period_end,
+            TagNextExternalSnapshotRow.methodology_version,
+            TagNextExternalSnapshotRow.conditional_trigger,
+            TagNextExternalSnapshotRow.independent_family_id,
+            TagNextExternalSnapshotRow.gradeability,
+            TagNextExternalSnapshotRow.observed_live,
+            TagNextExternalSnapshotRow.payload_hash,
+        )).order_by(
+            TagNextExternalSnapshotRow.captured_at.desc(),
+            TagNextExternalSnapshotRow.snapshot_id.asc(),
+        )))
+
+        # Resolve the immutable semantic/quarantine gate in batches. The Predictions
+        # screen needs the complete source catalog, and doing two lookups per snapshot
+        # would turn a single refresh into hundreds of avoidable database round trips.
+        semantic_states = {
+            row.snapshot_id: row.semantic_status
+            for row in session.scalars(select(TagNextForecastSemanticIdentityRow))
+        }
+        quarantined_snapshot_ids = set(session.scalars(select(
+            TagNextDataQualityQuarantineRow.entity_id
+        ).where(
+            TagNextDataQualityQuarantineRow.entity_type == "external_forecast_snapshot",
+            TagNextDataQualityQuarantineRow.reason_code.in_(EXTERNAL_SNAPSHOT_QUARANTINE_REASONS),
+        )))
+        active_external_rows = [
+            row for row in all_external_rows
+            if semantic_states.get(row.snapshot_id, "active") == "active"
+            and row.snapshot_id not in quarantined_snapshot_ids
         ]
-        sources = {row.source_id: session.get(TagNextExternalSourceRow, row.source_id) for row in external_rows}
-        grade_counts = {
-            row.source_id: sum(
-                1 for grade in session.scalars(select(TagNextExternalGradeRow).join(
-                    TagNextExternalSnapshotRow,
-                    TagNextExternalSnapshotRow.snapshot_id == TagNextExternalGradeRow.snapshot_id,
-                ).where(
-                    TagNextExternalSnapshotRow.source_id == row.source_id,
-                    TagNextExternalGradeRow.disposition == "graded",
-                ))
-                if _semantic_snapshot_is_active(session, grade.snapshot_id)
-            )
-            for row in external_rows
-        }
-        latest_scores = {
-            row.source_id: session.scalar(select(TagNextSourceScoreRow).where(
-                TagNextSourceScoreRow.source_id == row.source_id,
-                TagNextSourceScoreRow.horizon == selected,
-            ).order_by(TagNextSourceScoreRow.cutoff_at.desc()).limit(1))
-            for row in external_rows
-        }
-        latest_grades = {
-            row.snapshot_id: session.scalar(select(TagNextExternalGradeRow).where(
-                TagNextExternalGradeRow.snapshot_id == row.snapshot_id,
-            ).order_by(TagNextExternalGradeRow.graded_at.desc()).limit(1))
-            for row in external_rows
-        }
+        active_snapshot_ids = {row.snapshot_id for row in active_external_rows}
+        external_rows = [row for row in active_external_rows if row.horizon == selected]
+
+        all_grade_rows = list(session.scalars(select(TagNextExternalGradeRow).order_by(
+            TagNextExternalGradeRow.graded_at.desc()
+        )))
+        latest_grades: dict[str, TagNextExternalGradeRow] = {}
+        grade_counts: dict[str, int] = {}
+        snapshot_source_ids = {row.snapshot_id: row.source_id for row in active_external_rows}
+        for grade in all_grade_rows:
+            if grade.snapshot_id not in active_snapshot_ids:
+                continue
+            latest_grades.setdefault(grade.snapshot_id, grade)
+            if grade.disposition == "graded":
+                source_id = snapshot_source_ids.get(grade.snapshot_id)
+                if source_id:
+                    grade_counts[source_id] = grade_counts.get(source_id, 0) + 1
+
+        latest_scores: dict[str, TagNextSourceScoreRow] = {}
+        for score in session.scalars(select(TagNextSourceScoreRow).where(
+            TagNextSourceScoreRow.horizon == selected,
+        ).order_by(TagNextSourceScoreRow.cutoff_at.desc())):
+            latest_scores.setdefault(score.source_id, score)
+
+        classification_corrections: dict[str, TagNextForecastClassificationCorrectionRow] = {}
+        for correction in session.scalars(select(TagNextForecastClassificationCorrectionRow).order_by(
+            TagNextForecastClassificationCorrectionRow.corrected_at.desc()
+        )):
+            classification_corrections.setdefault(correction.snapshot_id, correction)
+        observed_live_metadata: dict[str, TagNextExternalMetadataRevisionRow] = {}
+        for correction in session.scalars(select(TagNextExternalMetadataRevisionRow).where(
+            TagNextExternalMetadataRevisionRow.field_name == "observed_live",
+        ).order_by(TagNextExternalMetadataRevisionRow.corrected_at.desc())):
+            observed_live_metadata.setdefault(correction.snapshot_id, correction)
+
+        def catalog_observed_live(row: TagNextExternalSnapshotRow) -> bool:
+            classification = classification_corrections.get(row.snapshot_id)
+            if classification is not None:
+                return classification.corrected_classification == "LIVE_OBSERVED"
+            metadata = observed_live_metadata.get(row.snapshot_id)
+            if metadata is not None:
+                return bool(json.loads(metadata.corrected_value_json))
+            return bool(row.observed_live)
         forecast_payload = json.loads(forecast.payload_json) if forecast is not None else None
         previous_forecast_payload = (
             json.loads(previous_forecast.payload_json) if previous_forecast is not None else None
@@ -3011,7 +3076,7 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
                 "duplicateFamily": row.independent_family_id or (source.independent_family_id if source else None),
                 "identityEvidence": json.loads(source.identity_chain_json or "{}") if source else {},
                 "conditionalTrigger": row.conditional_trigger,
-                "snapshotId": row.snapshot_id, "gradedCount": grade_counts[row.source_id],
+                "snapshotId": row.snapshot_id, "gradedCount": grade_counts.get(row.source_id, 0),
                 "forecastSemanticHash": row.payload_hash,
                 "evidenceMetadataHash": json.loads(row.provenance_json or "{}").get("evidenceMetadataHash"),
                 "popularity": popularity,
@@ -3045,6 +3110,206 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
                 ),
             })
         external.sort(key=lambda item: float(item["popularity"].get("score") or 0), reverse=True)
+
+        # `externalForecasts` remains the selected-horizon compatibility view.
+        # `externalSourceCatalog` is the complete Predictions-page contract: one
+        # source card per registered public source plus every active, displayable
+        # claim for the all-sources sheet. Sources with no claim are deliberately
+        # retained with their exact terminal reason.
+        rows_by_source: dict[str, list[TagNextExternalSnapshotRow]] = {}
+        for row in active_external_rows:
+            rows_by_source.setdefault(row.source_id, []).append(row)
+
+        revision_ids_by_source: dict[str, set[str]] = {}
+        for revision in session.scalars(select(TagNextExternalRevisionRow)):
+            source_id = snapshot_source_ids.get(revision.current_snapshot_id)
+            if source_id is None:
+                source_id = snapshot_source_ids.get(revision.previous_snapshot_id)
+            if source_id is not None:
+                revision_ids_by_source.setdefault(source_id, set()).add(revision.revision_id)
+
+        metadata_revision_counts: dict[str, int] = {}
+        for correction in session.scalars(select(TagNextExternalMetadataRevisionRow)):
+            source_id = snapshot_source_ids.get(correction.snapshot_id)
+            if source_id is not None:
+                metadata_revision_counts[source_id] = metadata_revision_counts.get(source_id, 0) + 1
+
+        horizon_order = {
+            value: index for index, value in enumerate([
+                "1h", "4h", "6h", "12h", "24h", "7d", "30d", "3m", "6m", "1y",
+                "2026", "2027", "2028", "2029", "2030",
+            ])
+        }
+
+        def horizon_sort_key(value: str | None) -> tuple[int, str]:
+            normalized = str(value or "unavailable").lower()
+            return (horizon_order.get(normalized, len(horizon_order)), normalized)
+
+        def sheet_prediction(row: TagNextExternalSnapshotRow) -> dict[str, Any]:
+            grade = latest_grades.get(row.snapshot_id)
+            observed_live = catalog_observed_live(row)
+            return {
+                "snapshotId": row.snapshot_id,
+                "horizon": row.horizon,
+                "originalHorizonLabel": row.original_horizon_label,
+                "direction": row.direction,
+                "targetPrice": row.target_price,
+                "targetLow": row.target_low,
+                "targetHigh": row.target_high,
+                "targetCurrency": row.target_currency,
+                "targetNativePrice": row.target_native_price,
+                "targetNativeLow": row.target_native_low,
+                "targetNativeHigh": row.target_native_high,
+                "movePct": row.move_pct,
+                "deadline": row.deadline.isoformat() if row.deadline else None,
+                "periodStart": row.period_start.isoformat() if row.period_start else None,
+                "periodEnd": row.period_end.isoformat() if row.period_end else None,
+                "targetSemantics": row.target_semantics,
+                "gradeability": row.gradeability,
+                "observedLive": observed_live,
+                "observationClass": "LIVE_OBSERVED" if observed_live else "HISTORICAL_DISCOVERED",
+                "sourceIssueAt": row.source_issue_at.isoformat() if row.source_issue_at else None,
+                "sourceUpdateAt": row.source_update_at.isoformat() if row.source_update_at else None,
+                "capturedAt": row.captured_at.isoformat(),
+                "methodology": row.methodology_version,
+                "conditionalTrigger": row.conditional_trigger,
+                "selectedHorizon": row.horizon == selected,
+                "grade": None if grade is None else {
+                    "disposition": grade.disposition,
+                    "deadline": grade.deadline.isoformat(),
+                    "actualPrice": grade.actual_price,
+                    "directionCorrect": grade.direction_correct,
+                    "absoluteError": grade.absolute_error,
+                },
+            }
+
+        source_catalog = []
+        for source in all_sources:
+            if source.source_id == "rc4-scheduler-proof-local":
+                continue
+            source_state = json.loads(source.source_state_json or "{}")
+            popularity = json.loads(source.popularity_json or "{}")
+            identity_verified = source.access_state == "verified_identity"
+            source_rows = rows_by_source.get(source.source_id, []) if identity_verified else []
+            source_rows = sorted(
+                source_rows,
+                key=lambda row: (
+                    horizon_sort_key(row.horizon),
+                    str(row.target_semantics or ""),
+                    -_time(row.captured_at).timestamp(),
+                    row.snapshot_id,
+                ),
+            )
+            selected_rows = [row for row in source_rows if row.horizon == selected]
+            available_horizons = sorted(
+                {str(row.horizon) for row in source_rows if row.horizon},
+                key=horizon_sort_key,
+            )
+            if not identity_verified:
+                display_state = "identity_unverified"
+                display_reason = "Identity proof is incomplete; predictions are hidden fail-closed."
+            elif selected_rows:
+                display_state = "selected_horizon_available"
+                display_reason = f"{len(selected_rows)} published {selected.upper()} claim(s)."
+            elif source_rows:
+                display_state = "other_horizons_available"
+                display_reason = (
+                    f"No published {selected.upper()} claim. Available horizons: "
+                    + ", ".join(available_horizons)
+                )
+            else:
+                display_state = "no_published_prediction"
+                display_reason = str(
+                    source_state.get("terminalReason")
+                    or source_state.get("reason")
+                    or "No valid forecast claim was extractable from the verified source."
+                )
+            is_stale = bool(
+                source.next_check_at is not None and _time(source.next_check_at) < utc_now()
+            )
+            score = latest_scores.get(source.source_id)
+            live_count = sum(catalog_observed_live(row) for row in source_rows)
+            numeric_count = sum(
+                row.target_price is not None or row.target_low is not None or row.target_high is not None
+                or row.target_native_price is not None or row.target_native_low is not None
+                or row.target_native_high is not None
+                for row in source_rows
+            )
+            direction_count = sum(bool(row.direction) for row in source_rows)
+            gradeable_count = sum(row.gradeability not in {None, "", "ungradeable"} for row in source_rows)
+            source_catalog.append({
+                "sourceId": source.source_id,
+                "sourceLabel": source.label,
+                "sourceUrl": source.canonical_url,
+                "accessState": source.access_state,
+                "identityVerified": identity_verified,
+                "claimClass": source.claim_class,
+                "adapterId": source.adapter_id,
+                "independentFamilyId": source.independent_family_id,
+                "selectedHorizon": selected,
+                "displayState": display_state,
+                "displayReason": display_reason,
+                "terminalState": source_state.get("terminalState"),
+                "popularityRank": 0,
+                "popularity": popularity,
+                "publishedPredictionCount": len(source_rows),
+                "selectedHorizonPredictionCount": len(selected_rows),
+                "availableHorizons": available_horizons,
+                "livePredictionCount": live_count,
+                "historicalPredictionCount": len(source_rows) - live_count,
+                "numericTargetCount": numeric_count,
+                "directionOnlyCount": direction_count,
+                "gradeablePredictionCount": gradeable_count,
+                "gradedCount": grade_counts.get(source.source_id, 0),
+                "lastSemanticChange": (
+                    source.last_semantic_change_at.isoformat()
+                    if source.last_semantic_change_at else None
+                ),
+                "lastChecked": source.last_checked_at.isoformat() if source.last_checked_at else None,
+                "stale": is_stale,
+                "revisionCount": len(revision_ids_by_source.get(source.source_id, set())),
+                "metadataRevisionCount": metadata_revision_counts.get(source.source_id, 0),
+                "influenceState": (
+                    "eligible"
+                    if source.claim_class in CONSENSUS_ELIGIBLE_CLAIM_CLASSES
+                    and source.claim_class != "scenario_calculator"
+                    else "zero_influence"
+                ),
+                "accuracy": None if score is None else {
+                    "sampleCount": score.sample_count,
+                    "directionAccuracy": score.direction_accuracy,
+                    "meanAbsoluteError": score.mean_absolute_error,
+                    "cutoffAt": score.cutoff_at.isoformat(),
+                },
+                "predictions": [sheet_prediction(row) for row in source_rows],
+            })
+
+        source_catalog.sort(key=lambda item: (
+            -float(item["popularity"].get("score") or 0),
+            item["sourceLabel"].casefold(),
+        ))
+        for rank, source in enumerate(source_catalog, start=1):
+            source["popularityRank"] = rank
+        source_catalog_summary = {
+            "sourceCount": len(source_catalog),
+            "sourcesWithPublishedPredictions": sum(
+                int(item["publishedPredictionCount"] > 0) for item in source_catalog
+            ),
+            "publishedPredictionCount": sum(
+                int(item["publishedPredictionCount"]) for item in source_catalog
+            ),
+            "selectedHorizonSourceCount": sum(
+                int(item["selectedHorizonPredictionCount"] > 0) for item in source_catalog
+            ),
+            "selectedHorizonPredictionCount": sum(
+                int(item["selectedHorizonPredictionCount"]) for item in source_catalog
+            ),
+            "noPredictionSourceCount": sum(
+                int(item["publishedPredictionCount"] == 0) for item in source_catalog
+            ),
+            "sheetIncludesNoPredictionRows": True,
+            "internalAcceptanceSourcesExcluded": 1 if "rc4-scheduler-proof-local" in sources else 0,
+        }
         scored_sources = sorted(
             (
                 item for item in external
@@ -3086,6 +3351,8 @@ def predictions_payload(*, horizon: str | None = None) -> dict[str, Any]:
             "featureSnapshotIds": json.loads(row.feature_snapshot_ids_json or "[]"),
         } for row in links],
         "externalForecasts": external,
+        "externalSourceCatalog": source_catalog,
+        "externalSourceCatalogSummary": source_catalog_summary,
         "internetConsensus": {
             **consensus,
             "selectedHorizonGrade": consensus_grade,
