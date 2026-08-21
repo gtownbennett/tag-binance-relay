@@ -146,16 +146,23 @@ def _counts() -> dict[str, Any]:
         ), valid_public AS (
             SELECT * FROM tagnext_valid_external_forecast_snapshots
             WHERE source_id <> 'rc4-scheduler-proof-local'
-        ), latest_revision AS (
-            SELECT DISTINCT ON (revision_id) revision_id, classification
+        ), latest_revision_ranked AS (
+            SELECT revision_id, classification,
+                   row_number() OVER (
+                       PARTITION BY revision_id
+                       ORDER BY classified_at DESC, classification_id DESC
+                   ) AS revision_rank
             FROM tagnext_external_revision_classifications
-            ORDER BY revision_id, classified_at DESC, classification_id DESC
+        ), latest_revision AS (
+            SELECT revision_id, classification
+            FROM latest_revision_ranked
+            WHERE revision_rank = 1
         )
         SELECT
           (SELECT count(*) FROM tagnext_discovery_candidates) AS canonical_url_count,
           (SELECT count(*) FROM tagnext_discovery_candidates WHERE final_status IS NOT NULL) AS terminal_rows,
           (SELECT count(*) FROM tagnext_discovery_candidates WHERE retry_status='retry_scheduled' OR next_check_at IS NOT NULL) AS retry_scheduled_candidates,
-          (SELECT count(*) FROM tagnext_discovery_candidates WHERE coalesce(final_status,'') ILIKE '%OWNER%' OR coalesce(final_status,'') ILIKE '%CAPTCHA%' OR coalesce(state,'') ILIKE '%OWNER%') AS owner_action_rows,
+          (SELECT count(*) FROM tagnext_discovery_candidates WHERE lower(coalesce(final_status,'')) LIKE '%owner%' OR lower(coalesce(final_status,'')) LIKE '%captcha%' OR lower(coalesce(state,'')) LIKE '%owner%') AS owner_action_rows,
           (SELECT count(*) FROM public_sources WHERE access_state='verified_identity') AS valid_source_records,
           (SELECT count(DISTINCT source_id) FROM valid_public) AS sources_with_claims,
           (SELECT count(*) FROM public_sources p WHERE NOT EXISTS (SELECT 1 FROM valid_public v WHERE v.source_id=p.source_id)) AS sources_with_zero_claims,
