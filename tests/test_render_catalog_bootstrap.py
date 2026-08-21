@@ -16,3 +16,12 @@ def test_render_catalog_bootstrap_is_fail_closed_and_champion_empty() -> None:
     assert "'INVALID_PARSER_OUTPUT', 'INVALID_DATA_QUALITY', 'WRONG_ASSET'" in source
     assert "--single-transaction" in source
     assert "--exit-on-error" in source
+
+
+def test_render_launcher_opens_health_port_before_bootstrap() -> None:
+    source = (Path(__file__).parents[1] / "scripts" / "start_render_service.py").read_text(
+        encoding="utf-8"
+    )
+    assert source.index("subprocess.Popen") < source.index("bootstrap_render_catalog.main()")
+    assert "server.terminate()" in source
+    assert "server.wait(timeout=15)" in source
