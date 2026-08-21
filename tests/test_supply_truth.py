@@ -65,9 +65,23 @@ def test_tagnext_startup_runs_bounded_verified_supply_independently() -> None:
     source = (Path(__file__).parents[1] / "app" / "main.py").read_text(encoding="utf-8")
     lifespan = source[source.index("async def lifespan"):source.index("app = FastAPI")]
     assert 'name="tagnext-startup-verified-supply"' in lifespan
-    assert "collect_verified_tag_supply_once()" in lifespan
+    assert "collect_startup_verified_supply()" in lifespan
     assert 'SYSTEM_ID == "tagnext"' in lifespan
     assert "startup_supply_task.cancel()" in lifespan
+
+
+def test_verified_supply_prefers_validated_nodereal_for_total_supply_only() -> None:
+    source = (Path(__file__).parents[1] / "app" / "main.py").read_text(encoding="utf-8")
+    collector = source[
+        source.index("async def collect_verified_tag_supply_once"):
+        source.index("async def collect_startup_verified_supply")
+    ]
+    assert 'os.getenv("NODEREAL_BNB_RPC_URL")' in collector
+    assert 'rpc_host.endswith(".nodereal.io")' in collector
+    assert '"https://api.coingecko.com/api/v3/coins/tagger"' in collector
+    assert '"https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger"' in collector
+    assert 'http_client.post(\n                supply_rpc_url' in collector
+    assert '"totalSupplyRpcProvider": supply_rpc_provider' in collector
 
 
 def test_cmc_gecko_market_cap_price_fallback_is_forbidden() -> None:

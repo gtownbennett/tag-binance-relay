@@ -11,6 +11,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 from app.ledger import PredictionLedger
 from app.chad_reactivation import (
@@ -2311,6 +2312,22 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
     if http_client is None:
         raise RuntimeError("HTTP client is unavailable")
 
+    configured_rpc = (os.getenv("NODEREAL_BNB_RPC_URL") or "").strip()
+    if configured_rpc:
+        rpc_host = (urlsplit(configured_rpc).hostname or "").lower()
+        if not (rpc_host == "nodereal.io" or rpc_host.endswith(".nodereal.io")):
+            return {
+                "stored": False,
+                "verified": False,
+                "reason": "configured BNB supply RPC failed the approved-host gate",
+                "automaticPaidAiCalls": 0,
+            }
+        supply_rpc_url = configured_rpc
+        supply_rpc_provider = "nodereal-validated-bnb-readonly"
+    else:
+        supply_rpc_url = "https://bsc-dataseed.binance.org/"
+        supply_rpc_provider = "public-binance-bnb-readonly"
+
     async def collect() -> dict[str, Any]:
         coin_gecko_response, coin_market_cap_response, bsc_response = await asyncio.gather(
             http_client.get(
@@ -2326,7 +2343,7 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
             ),
             http_client.get("https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger"),
             http_client.post(
-                "https://bsc-dataseed.binance.org/",
+                supply_rpc_url,
                 json={
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -2359,6 +2376,7 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
         return {
             **stored,
             "source": "cross-checked-public-supply-truth",
+            "totalSupplyRpcProvider": supply_rpc_provider,
             "automaticPaidAiCalls": 0,
         }
 
@@ -2367,6 +2385,31 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
     except SupplyTruthError as exc:
         # A failed source is visible and leaves existing verified truth intact.
         return {"stored": False, "verified": False, "reason": str(exc), "automaticPaidAiCalls": 0}
+
+
+async def collect_startup_verified_supply() -> dict[str, Any]:
+    """Record a sanitized startup result without ever retaining a secret URL."""
+
+    try:
+        result = await collect_verified_tag_supply_once()
+        phase1_state["startupSupply"] = {
+            key: result.get(key)
+            for key in (
+                "stored", "verified", "reason", "snapshotId", "source",
+                "totalSupplyRpcProvider", "automaticPaidAiCalls",
+            )
+            if key in result
+        }
+        return result
+    except Exception as error:  # pragma: no cover - exact external failures vary
+        sanitized = {
+            "stored": False,
+            "verified": False,
+            "errorClass": type(error).__name__,
+            "automaticPaidAiCalls": 0,
+        }
+        phase1_state["startupSupply"] = sanitized
+        return sanitized
 
 
 async def evaluate_event_driven_chad() -> dict[str, Any]:
@@ -2911,7 +2954,7 @@ async def lifespan(_: FastAPI):
     # of a potentially long durable-job backlog on a newly provisioned challenger.
     startup_supply_task = (
         asyncio.create_task(
-            collect_verified_tag_supply_once(),
+            collect_startup_verified_supply(),
             name="tagnext-startup-verified-supply",
         )
         if automatic_live_work and SYSTEM_ID == "tagnext"
