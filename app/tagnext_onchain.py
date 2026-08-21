@@ -9,6 +9,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
 
 import httpx
 from eth_hash.auto import keccak
@@ -140,10 +141,26 @@ def decode_v3_pool_log(
     }
 
 
+def _safe_rpc_label(endpoint: str) -> str:
+    """Return a provenance label that cannot contain path/query credentials."""
+    parsed = urlsplit(endpoint)
+    host = parsed.hostname or "configured-rpc"
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return f"{parsed.scheme or 'https'}://{host}{port}"
+
+
 class BnbRpc:
-    def __init__(self, url: str | None = None, *, timeout_seconds: int = 20) -> None:
+    def __init__(
+        self, url: str | None = None, *, timeout_seconds: int = 20,
+        failover_urls: Sequence[str] | None = None,
+    ) -> None:
         self.url = (url or os.getenv("BNB_RPC_URL") or DEFAULT_RPC_URL).strip()
-        failovers = [value.strip() for value in os.getenv("BNB_RPC_FAILOVER_URLS", DEFAULT_LOG_RPC_URL).split(",") if value.strip()]
+        configured_failovers = (
+            [value.strip() for value in os.getenv("BNB_RPC_FAILOVER_URLS", DEFAULT_LOG_RPC_URL).split(",") if value.strip()]
+            if failover_urls is None
+            else [str(value).strip() for value in failover_urls if str(value).strip()]
+        )
+        failovers = configured_failovers
         self.urls = list(dict.fromkeys([self.url, *failovers]))
         self.client = httpx.Client(timeout=timeout_seconds, headers={"User-Agent": "TAGneXt-BNB-readonly/1.0"})
         self._request_id = 0
@@ -174,13 +191,13 @@ class BnbRpc:
                         f"BNB RPC {method} failed: {error.get('code')} {error.get('message')}"
                     )
                 self.url = endpoint
-                self.method_endpoints[method] = endpoint
+                self.method_endpoints[method] = _safe_rpc_label(endpoint)
                 return body.get("result")
             except (httpx.HTTPError, ValueError, RuntimeError) as exc:
                 last_error = exc
         raise RuntimeError(
             f"all configured BNB RPC endpoints failed for {method}: "
-            f"{type(last_error).__name__}: {last_error}"
+            f"{type(last_error).__name__ if last_error is not None else 'unknown_error'}"
         )
 
     def eth_call(self, to: str, data: str, block: str = "latest") -> str:

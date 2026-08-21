@@ -365,8 +365,8 @@ def main() -> int:
         )
     if args.device_state != "passed":
         hard_blockers.append("Final installed-phone LAN, restart, coexistence, inner-display, and no-TAGalysis-contact acceptance is pending.")
-    hard_blockers.append("The dedicated TAGalysis importer role could not be repaired by the available Neon identity, and the authorized Render secret field could not be updated without callable Chrome control.")
-    hard_blockers.append("NodeReal/Coinalyze/Moralis account onboarding was not completed; no paid account or unverified TAG adapter was created.")
+    hard_blockers.append("Legacy TAGalysis importer grants were removed, but the available database owner is still denied ALTER ROLE; password rotation, default read-only, LOGIN, role-self proof, and the dependent Render secret update remain owner-control-plane steps.")
+    hard_blockers.append("NodeReal/Coinalyze account and credential onboarding was not completed; their bounded shadow adapters are implemented but inactive. Moralis remains ineligible without an authenticated exact-contract response.")
     gate_state = "RC4_PASSED" if not hard_blockers else "RC4_NOT_PASSED"
     generated = datetime.now(timezone.utc).isoformat()
     local_functional_state = "LOCAL_RC_FUNCTIONAL" if device_passed else "LOCAL_RC_DEVICE_ACCEPTANCE_PENDING"
@@ -423,12 +423,12 @@ The final Predictions correction was validated in strict local repair mode with
 background jobs, live collectors, deterministic grading, backfill, paid AI, and
 push disabled. No champion connection was inherited by that validation process.
 
-Backend tests: 298 passed, 4 skipped. The four exact skips are preserved in
+Backend tests: 301 passed, 4 skipped. The four exact skips are preserved in
 `tests/backend/backend-skipped-tests-exact.log`; every skip protects a Phase 6
 warehouse that is an external artifact rather than a Git-tracked CI fixture.
 
 Android Gradle/JVM tests: 78 passed, 0 failed, 0 skipped across 15 suites.
-Android source-contract tests: 33 passed, 0 failed, 0 skipped. The validation
+Android source-contract tests: 55 passed, 0 failed, 0 skipped. The validation
 APK has package `com.eric.tagnext`, version 0.9.0-rc4/versionCode 10004, and a
 signed build-time environment gate for the private LAN challenger. The APK SHA-256
 is `{apk_sha256}`. The signing certificate SHA-256 is
@@ -499,18 +499,20 @@ compression driven primarily by price, not a 24.8% token-OI liquidation.
 - Public popularity coverage: {counts['popularity_complete_sources']}/{counts['valid_source_records']}.
 - Valid nonpositive targets: {counts['accepted_nonpositive_targets']}.
 - Real background scheduler proof: passed.
-- Backend tests: 298 passed; four deliberate external-artifact skips documented.
-- Android tests: 78 Gradle/JVM plus 33 source-contract tests passed; validation APK built.
+- Backend tests: 301 passed; four deliberate external-artifact skips documented.
+- Android tests: 78 Gradle/JVM plus 55 source-contract tests passed; validation APK built.
 - RC3 immutability checksum: {actual_rc3_sha}.
 {device_passed_verification}
 
 ## Owner/external action still required
 
-- The owner authorized re-enabling/rotating only `tagalysis_history_importer`,
-  but the available Neon identity returned `permission denied to alter role`.
-  Its atomic transaction rolled back; LOGIN remains disabled and six legacy
-  write grants remain unusable. A signed-in Neon owner session must perform this
-  narrow repair, followed by the sanitized read-only proof.
+- The available Neon database owner removed every legacy table, sequence, and
+  default grant and left only SELECT on the three approved tables. PostgreSQL
+  still returned `permission denied to alter role`; that combined transaction
+  rolled back before the successful grants-only transaction. LOGIN remains
+  disabled and expired, and default read-only is not yet configured. A signed-in
+  Neon control-plane owner session must complete the narrow role/password repair,
+  followed by the sanitized role-self proof.
 - Render service `tagnext-challenger` → Environment → Environment Variables →
   `TAGALYSIS_HISTORY_IMPORT_URL` still requires the newly rotated dedicated URL.
   Required Chrome control was unavailable, so the field was not changed and no
@@ -544,11 +546,12 @@ Until these checks pass, the release state remains `{gate_state}`.
 
 ## Adapters waiting for credentials or account eligibility
 
-- NodeReal free/no-card BSC archive RPC is coverage-eligible but signup is blocked
-  by unavailable Chrome control. Coinalyze exact TAG/USDT coverage and its free
-  API are proven, but signup is likewise blocked. Moralis generic BNB/ERC-20
-  capability is documented, while an exact TAG contract response remains
-  unverified; it is not eligible for signup. No credentials are present.
+- NodeReal free/no-card BSC archive RPC and Coinalyze exact TAG/USDT coverage are
+  proven. Their bounded read-only, secret-safe shadow adapters are implemented,
+  but account/key creation still requires owner authentication in the opened
+  signup surfaces. Moralis generic BNB/ERC-20 capability is documented, while an
+  authenticated exact TAG response remains unverified; it is not eligible for
+  signup. No credentials are present.
 
 ## Honest unavailable/not implemented states
 
@@ -577,19 +580,23 @@ resource was created, and no TAGalysis application data was written.
 - Role inheritance: false.
 - Other active sessions for the role: 0.
 - Role timeouts: statement 60 seconds; lock 5 seconds.
-- Login capability: **false**.
-- Direct legacy grants: SELECT on five historical tables and six write grants
-  across five historical tables. Because LOGIN is false, those grants are not
-  currently usable through this role, but they must be removed before LOGIN is
-  re-enabled.
+- Login capability: **false**; the prior validity timestamp is expired.
+- The successful grants-only transaction removed all legacy table, sequence,
+  function, and direct default grants. Effective table access is now SELECT-only
+  on exactly `canonical_forecasts`, `canonical_forecast_grades`, and
+  `verified_outcomes`; effective table writes and sequences are zero.
+- CONNECT is present; database CREATE and schema CREATE are absent. TEMPORARY is
+  still effective through PostgreSQL's `PUBLIC` database privilege and cannot be
+  denied to one role without changing `PUBLIC`; default read-only remains the
+  required write-enforcement boundary.
 
 The owner explicitly authorized rotating only this role, removing the legacy
 write privileges, preserving every negative capability flag, and enforcing
-default read-only transactions. The available Neon identity attempted that work
-in one atomic transaction, but PostgreSQL returned `permission denied to alter
-role`. Verification proved the transaction rolled back: LOGIN remained false,
-timeouts were unchanged, the six legacy write grants remained, and there were no
-partial role changes.
+default read-only transactions. The combined transaction reached PostgreSQL's
+`permission denied to alter role` and rolled back. A second transaction containing
+only the authorized grants cleanup succeeded and was independently re-read from
+the catalogs. The role attributes, password, LOGIN, expiry, and default read-only
+setting remain unchanged; there was no partial password or LOGIN change.
 
 The legacy `scripts/import_validated_history.py` reads a local SQLite warehouse
 and performs INSERT/UPDATE operations on its destination. It was not pointed at
@@ -604,11 +611,11 @@ role gate; the manifest says so explicitly.
 
 ## Exact owner-interaction surfaces
 
-1. Neon Console → existing project → production branch → SQL Editor: rotate only
-   `tagalysis_history_importer`, revoke every write/sequence/default privilege,
-   grant only CONNECT/schema USAGE/allow-listed SELECT, retain all negative role
+1. Neon Console → existing project → production branch → Roles & Databases / SQL
+   Editor: rotate only `tagalysis_history_importer`, retain all negative role
    flags, set default read-only plus 60-second statement and 5-second lock
-   timeouts, then re-enable LOGIN.
+   timeouts, clear the expired validity timestamp, then re-enable LOGIN. The
+   grants are already narrowed to the approved allow-list and must not be widened.
 2. Render Dashboard → service `tagnext-challenger` → Environment → Environment
    Variables → `TAGALYSIS_HISTORY_IMPORT_URL`: replace the secret without showing,
    logging, exporting, or committing it.
@@ -617,10 +624,11 @@ role gate; the manifest says so explicitly.
 4. After configuration, verify `BEGIN READ ONLY`, a harmless read,
    a rejected write attempt, and `ROLLBACK` without exposing the connection value.
 
-The Chrome-control plugin was installed, but its required runtime was not callable
-in this session. No alternate browser was substituted because the owner explicitly
-required Chrome. The role/Render proof remains blocked. Local champion rows/pairs
-are 47/0; the zero pairs are an honest overlap result, not a missing import.
+The exact production branch plus NodeReal and Coinalyze signup surfaces were
+opened in the user's existing Chrome session, but callable Chrome control was not
+available for the owner-authenticated submissions. The role/Render proof remains
+blocked. Local champion rows/pairs are 47/0; the zero pairs are an honest overlap
+result, not a missing import.
 """
     device_report = f"""# Device acceptance report
 
@@ -737,8 +745,8 @@ was created.
 - Coverage: BNB Smart Chain mainnet and archive access are documented for the
   free tier; generic JSON-RPC can address the verified TAG contract.
 - Eligibility: official FAQ says signup does not require a credit card.
-- State: `exact_bsc_capability_verified_signup_blocked`; no signup because the
-  required Chrome controller was unavailable.
+- State: `adapter_ready_waiting_for_credentials`; the exact-contract adapter is
+  read-only, secret-safe, and shadow-only. Account/key creation remains pending.
 - Sources: https://docs.nodereal.io/docs/pricing-plan,
   https://docs.nodereal.io/docs/pricing,
   https://docs.nodereal.io/docs/archive-node
@@ -749,8 +757,9 @@ was created.
   funding, open interest, and liquidations, including Binance TAGUSDT.
 - Eligibility: official API documentation says the API is free, requires an
   account-issued key, and allows 40 calls/minute/key.
-- State: `exact_tagusdt_verified_signup_blocked`; no signup because the required
-  Chrome controller was unavailable.
+- State: `adapter_ready_waiting_for_credentials`; the bounded OI, funding and
+  liquidation adapter uses header authentication and never infers a heatmap.
+  Account/key creation remains pending.
 - Sources: https://coinalyze.net/tagger/funding-rate/,
   https://coinalyze.net/tagger/liquidations/,
   https://api.coinalyze.net/v1/doc/
@@ -822,10 +831,11 @@ TAGalysis write was attempted.
 Accounts created in RC4: 0. API keys created: 0. Payment methods entered: 0.
 
 NodeReal and Coinalyze passed the pre-signup coverage/eligibility evidence gate,
-but no callable Chrome controller was available for their signup UI. Moralis did
+and bounded shadow adapters were implemented and tested. Account/key creation
+still requires owner authentication in the opened signup surfaces. Moralis did
 not pass the exact-contract-response gate and was not eligible for signup. No
-alternate browser, paid account, placeholder credential, or fake adapter was
-substituted, and no credential is present in this archive.
+paid account, placeholder credential, or fake live response was substituted,
+and no credential is present in this archive.
 """
     legacy_readme = f"""# Legacy reference only
 
@@ -890,13 +900,20 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
 
         _add_file(archive, "apk/TAGneXt-0.9.0-rc4-validation.apk", apk, checksums)
         _add_file(archive, "exports/TAGneXt_FULL_BRAIN_RC4.zip", brain, checksums)
-        _add_file(archive, "tests/backend/backend-pytest-final.log", backend / "outputs/rc4/backend-pytest-predictions-sheet-rerun.log", checksums)
-        _add_file(archive, "tests/backend/backend-skipped-tests-exact.log", backend / "outputs/rc4/backend-skipped-tests-exact-predictions-sheet.log", checksums)
+        _add_file(archive, "tests/backend/backend-pytest-final.xml", backend / "outputs/rc4/backend-pytest-final-authorized.xml", checksums)
+        _add_file(archive, "tests/backend/backend-skipped-tests-exact.log", backend / "outputs/rc4/backend-skipped-tests-exact-final-authorized.log", checksums)
         _add_file(archive, "tests/backend/rc4-scheduler-proof-final.json", backend / "outputs/rc4/scheduler-proof-final.json", checksums)
-        _add_file(archive, "tests/android/android-gradle-final-rerun.log", android / "outputs/rc4/android-gradle-predictions-sheet-final.log", checksums)
+        _add_file(archive, "tests/android/android-gradle-final-authorized.log", android / "outputs/rc4/android-gradle-final-authorized.log", checksums)
         _add_file(archive, "tests/android/android-gradle-device-lan-final.log", android / "outputs/rc4/android-gradle-device-lan-final.log", checksums)
         _add_file(archive, "tests/android/android-gradle-stable-signed-final.log", android / "outputs/rc4/android-gradle-stable-signed-final.log", checksums)
-        _add_file(archive, "tests/android/android-python-contract-tests-final.log", android / "outputs/rc4/android-python-contract-tests-predictions-sheet.log", checksums)
+        _add_file(archive, "tests/android/android-source-contracts-final-authorized.log", android / "outputs/rc4/android-source-contracts-final-authorized.log", checksums)
+        _add_file(archive, "tests/android/android-source-contracts-final-authorized.xml", android / "outputs/rc4/android-source-contracts-final-authorized.xml", checksums)
+        _add_file(archive, "tests/android/android-test-summary-final-authorized.json", android / "outputs/rc4/android-test-summary-final-authorized.json", checksums)
+        _add_file(archive, "reports/NEON_ROLE_PROOF_20260820.json", backend / "outputs/rc4/neon-role-proof-20260820.json", checksums)
+        _add_file(archive, "reports/PROSPECTIVE_CHAMPION_PROTOCOL_20260820.md", backend / "outputs/rc4/prospective-champion-protocol-20260820.md", checksums)
+        _add_file(archive, "reports/PROVIDER_ONBOARDING_20260820.md", backend / "outputs/rc4/provider-onboarding-20260820.md", checksums)
+        _add_file(archive, "reports/CHADTAG_ISOLATION_20260820.md", backend / "outputs/rc4/chadtag-isolation-20260820.md", checksums)
+        _add_file(archive, "reports/FINAL_DEVICE_INSTALL_20260820.md", backend / "outputs/rc4/final-device-install-20260820.md", checksums)
         for path in sorted((android / "app/build/test-results/testDebugUnitTest").glob("TEST-*.xml")):
             _add_file(archive, f"tests/android/xml/{path.name}", path, checksums)
         for runtime_log in (
