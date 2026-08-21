@@ -116,7 +116,7 @@ def _metrics(row: CanonicalForecastGradeRow | None) -> dict[str, Any]:
 
 
 def build_paired_same_deadline_outcomes(*, cutoff_at: datetime | None = None) -> dict[str, Any]:
-    """Persist only forecasts sharing horizon, immutable deadline, and outcome."""
+    """Persist only forecasts sharing exact issue time, horizon, deadline, and outcome."""
     cutoff = cutoff_at or datetime.now(timezone.utc)
     written = complete = ungraded = 0
     with session_scope() as session:
@@ -124,14 +124,22 @@ def build_paired_same_deadline_outcomes(*, cutoff_at: datetime | None = None) ->
             CanonicalForecastRow.producer == "tagnext",
             CanonicalForecastRow.deadline <= cutoff,
         )))
+        champions = list(session.scalars(select(TagNextChampionImportRow).where(
+            TagNextChampionImportRow.deadline <= cutoff,
+        )))
+        matched_champion_ids: set[str] = set()
+        matched_challenger_ids: set[str] = set()
         for challenger in challengers:
             champion = session.scalar(select(TagNextChampionImportRow).where(
                 TagNextChampionImportRow.producer.in_(CHAMPION_PRODUCERS),
                 TagNextChampionImportRow.horizon == challenger.horizon,
+                TagNextChampionImportRow.issued_at == challenger.issued_at,
                 TagNextChampionImportRow.deadline == challenger.deadline,
             ).order_by(TagNextChampionImportRow.issued_at.desc()).limit(1))
             if champion is None:
                 continue
+            matched_champion_ids.add(champion.imported_forecast_id)
+            matched_challenger_ids.add(challenger.forecast_id)
             challenger_grade = session.scalar(select(CanonicalForecastGradeRow).where(
                 CanonicalForecastGradeRow.forecast_id == challenger.forecast_id,
                 CanonicalForecastGradeRow.evaluation_kind == "live",
@@ -165,7 +173,18 @@ def build_paired_same_deadline_outcomes(*, cutoff_at: datetime | None = None) ->
     return {
         "version": COMPARISON_VERSION, "pairsWritten": written,
         "completeSameOutcomePairs": complete, "ungradedPairs": ungraded,
+        "eligibleChampionRows": len(champions),
+        "matureChallengerRows": len(challengers),
+        "exactIssueHorizonDeadlineMatches": len(matched_challenger_ids),
+        "unmatchedChampionRows": len(champions) - len(matched_champion_ids),
+        "unmatchedChallengerRows": len(challengers) - len(matched_challenger_ids),
+        "quarantinedRows": 0,
         "cutoffAt": cutoff.isoformat(), "sameDeadlineRequired": True,
+        "sameIssueTimeRequired": True,
+        "sameHorizonRequired": True,
+        "downstreamIdentityRegimeOutcomeChecks": (
+            "not_reached" if not matched_challenger_ids else "required_before_complete_pair"
+        ),
     }
 
 
@@ -222,7 +241,14 @@ def rolling_comparison_report(*, cutoff_at: datetime | None = None, minimum_pair
                         metrics_json=json_dumps({**metrics, "window": window_label}), decision=decision,
                     ))
                 reports.append(payload)
-    return {"version": COMPARISON_VERSION, "reports": reports, "automaticPromotion": False}
+    return {
+        "version": COMPARISON_VERSION,
+        "reports": reports,
+        "populationStatus": "matched_population_available" if pairs else "no_exact_matched_population",
+        "overallDecision": "review_required" if pairs else "retain_champion_insufficient_overlap",
+        "pairedSampleCount": len(pairs),
+        "automaticPromotion": False,
+    }
 
 
 def run_shadow_ablation_report(*, cutoff_at: datetime | None = None) -> dict[str, Any]:

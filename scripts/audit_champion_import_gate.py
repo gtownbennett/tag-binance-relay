@@ -32,12 +32,32 @@ def main() -> None:
         import_status = "blocked_missing_row_level_export"
     pairs = build_paired_same_deadline_outcomes()
     comparisons = rolling_comparison_report()
+    paired_count = pairs["completeSameOutcomePairs"]
+    metric_status = "computed" if paired_count else "not_estimable_no_exact_matched_population"
     payload = {
         "baselineChecksumVerification": verification,
         "importStatus": import_status, "championImport": champion_import,
         "pairing": pairs, "rollingComparisons": comparisons,
         "sameHorizonRequired": True, "sameDeadlineRequired": True,
+        "sameIssueTimeRequired": True,
         "sameVerifiedOutcomeRequiredForCompletePair": True,
+        "comparisonPopulation": {
+            "sampleSize": paired_count,
+            "championCoverage": None if not paired_count else 1.0,
+            "challengerCoverage": None if not paired_count else 1.0,
+            "mae": {"champion": None, "challenger": None, "status": metric_status},
+            "rmse": {"champion": None, "challenger": None, "status": metric_status},
+            "directionAccuracy": {"champion": None, "challenger": None, "status": metric_status},
+            "intervalCoverage": {"champion": None, "challenger": None, "status": metric_status},
+            "calibration": {"champion": None, "challenger": None, "status": metric_status},
+            "abstentions": {"champion": None, "challenger": None, "status": metric_status},
+            "statisticalUncertainty": {"status": metric_status},
+            "decision": "retain_tagalysis_champion" if not paired_count else "review_required",
+            "reason": (
+                "No TAGneXt forecast shares the exact issue time, horizon, and immutable deadline with an imported champion forecast."
+                if not paired_count else "Exact matched population is available for metric review."
+            ),
+        },
         "tagalysisWritten": False,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

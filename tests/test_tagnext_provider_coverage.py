@@ -46,3 +46,14 @@ def test_exact_contract_probes_are_recorded_as_verified() -> None:
     for provider_id in ("coinranking", "coinpaprika", "defillama", "coingecko"):
         assert by_id[provider_id]["correctTagSupported"] is True
         assert by_id[provider_id]["influencesForecast"] is False or provider_id == "coingecko"
+
+
+def test_rc4_provider_gate_is_honest_about_coverage_and_signup_state() -> None:
+    by_id = {row["providerId"]: row for row in MODULE.coverage_rows()}
+    assert by_id["coinalyze"]["correctTagSupported"] is True
+    assert by_id["coinalyze"]["tagusdtSupported"] is True
+    assert by_id["coinalyze"]["adapterState"] == "exact_tagusdt_verified_signup_blocked"
+    assert by_id["nodereal"]["adapterState"] == "exact_bsc_capability_verified_signup_blocked"
+    assert by_id["moralis"]["correctTagSupported"] is None
+    assert by_id["moralis"]["adapterState"] == "blocked_exact_contract_response_unverified"
+    assert all(not by_id[name]["influencesForecast"] for name in ("nodereal", "moralis", "coinalyze"))

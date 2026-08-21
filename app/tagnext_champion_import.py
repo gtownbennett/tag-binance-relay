@@ -8,6 +8,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping
 
+from sqlalchemy import func, select
+
 from .terminal_database import TagNextChampionImportRow, json_dumps, session_scope
 
 
@@ -85,7 +87,7 @@ def verify_checksum_manifest(directory: str | Path) -> dict[str, Any]:
         if actual != expected:
             raise ValueError(f"checksum mismatch: {relative}")
         checked.append({"path": relative.replace("\\", "/"), "sha256": actual, "bytes": candidate.stat().st_size})
-    return {"root": str(root), "manifest": str(manifest), "filesChecked": checked, "passed": True}
+    return {"root": root.name, "manifest": CHECKSUM_FILENAME, "filesChecked": checked, "passed": True}
 
 
 def import_champion_export(directory: str | Path) -> dict[str, Any]:
@@ -107,6 +109,7 @@ def import_champion_export(directory: str | Path) -> dict[str, Any]:
         except (json.JSONDecodeError, ValueError, ArithmeticError) as exc:
             raise ValueError(f"invalid champion record at line {line_number}: {exc}") from exc
     written = deduplicated = 0
+    available_after_import = 0
     with session_scope() as session:
         for record in records:
             record_serializable = {
@@ -130,8 +133,11 @@ def import_champion_export(directory: str | Path) -> dict[str, Any]:
                 source_record_hash=record_hash,
             ))
             written += 1
+        session.flush()
+        available_after_import = int(session.scalar(select(func.count()).select_from(TagNextChampionImportRow)) or 0)
     return {
-        "sourceArtifact": str(export), "sourceArtifactSha256": artifact_hash,
+        "sourceArtifact": EXPORT_FILENAME, "sourceArtifactSha256": artifact_hash,
         "recordsSeen": len(records), "recordsWritten": written, "deduplicated": deduplicated,
+        "recordsAvailableAfterImport": available_after_import,
         "checksums": verification, "championWrites": False, "importDirection": "champion_export_to_tagnext_only",
     }

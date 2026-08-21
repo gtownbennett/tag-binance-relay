@@ -1,12 +1,12 @@
 {
-  "checkedAt": "2026-08-17T10:03:54.927431Z",
+  "checkedAt": "2026-08-21T00:38:27.412738Z",
   "correctTagContract": "0x208bf3e7da9639f1eaefa2de78c23396b0682025",
   "counts": {
     "configured": 12,
-    "correctTagVerified": 26,
+    "correctTagVerified": 27,
     "influencesForecast": 12,
     "providers": 51,
-    "tagusdtVerified": 7
+    "tagusdtVerified": 8
   },
   "policy": {
     "noAccountCreatedByThisScript": true,
@@ -20,7 +20,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: exact instrument and immutable history; regional live failures are explicit",
       "evidence": [
@@ -44,7 +44,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: exact TAGUSDT history through the acceptance cutoff",
       "evidence": [
@@ -67,7 +67,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: exact contract and pool identity verified",
       "evidence": [
@@ -91,7 +91,7 @@
       "adapterState": "configured_shadow",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted for collection/shadow; observed holders are not a complete census",
       "evidence": [
@@ -114,7 +114,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: exact pool observed",
       "evidence": [
@@ -137,7 +137,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: exact BSC token/pool observed",
       "evidence": [
@@ -160,7 +160,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: exact contract and CMC id 34958 verified",
       "evidence": [
@@ -184,7 +184,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: live contract lookup returned id=tagger",
       "evidence": [
@@ -207,7 +207,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: exact TAGUSDT live evidence",
       "evidence": [
@@ -230,7 +230,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: exact TAG_USDT live evidence",
       "evidence": [
@@ -253,7 +253,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: exact TAGUSDT live evidence",
       "evidence": [
@@ -276,7 +276,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: exact TAG-USDT live evidence",
       "evidence": [
@@ -299,7 +299,7 @@
       "adapterState": "configured",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted: exact TAG-USDT live evidence",
       "evidence": [
@@ -322,7 +322,7 @@
       "adapterState": "tested_no_exact_instrument",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": false,
       "decision": "rejected: exact TAG/TAGUSDT instrument was not present",
       "evidence": [
@@ -345,7 +345,7 @@
       "adapterState": "tested_inaccessible",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected for this build: response was not valid JSON, so coverage remains unverified",
       "evidence": [
@@ -368,7 +368,7 @@
       "adapterState": "configured_shadow",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted for bounded collection only",
       "evidence": [
@@ -391,7 +391,7 @@
       "adapterState": "tested_quota_exhausted",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "rejected for final run: quota prevented exact reconstruction",
       "evidence": [
@@ -414,7 +414,7 @@
       "adapterState": "tested_chain_not_free",
       "apiAvailable": true,
       "cardRequired": null,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "rejected: an account would not unlock free BNB API access",
       "evidence": [
@@ -434,20 +434,21 @@
     },
     {
       "accountNeeded": true,
-      "adapterState": "generic_rpc_waiting_for_credentials",
+      "adapterState": "exact_bsc_capability_verified_signup_blocked",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
-      "decision": "accepted as the highest-value credential candidate; verification is queued",
+      "decision": "eligible free/no-card candidate, but signup was not attempted because required Chrome control is unavailable",
       "evidence": [
-        "Official FAQ says no card and archive data; exact quota conflict is preserved rather than resolved by guesswork."
+        "Official NodeReal pricing and archive documentation list free BNB Smart Chain mainnet archive access.",
+        "Official pricing FAQ says no credit card is required; the exact TAG contract is a verified BSC ERC-20 address reachable through generic JSON-RPC."
       ],
       "freePlan": true,
       "historyAvailable": true,
       "influencesForecast": false,
       "providerId": "nodereal",
-      "quotaText": "Free plan: 3 keys and documented monthly CU allowance; official pages currently conflict between 10M and 100M CU",
+      "quotaText": "Free plan: 3 keys; official pages currently conflict between 10M and 100M monthly CU",
       "role": "primary-onchain-candidate",
       "snapshotStorageAllowed": true,
       "tagusdtSupported": false,
@@ -457,20 +458,21 @@
     },
     {
       "accountNeeded": true,
-      "adapterState": "not_implemented",
+      "adapterState": "blocked_exact_contract_response_unverified",
       "apiAvailable": true,
       "cardRequired": null,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
-      "decision": "deferred: generic chain value exists but exact TAG response and storage rights are unverified",
+      "decision": "not eligible for signup in this gate: BNB Chain and contract-address endpoints are documented, but an exact TAG response remains unverified",
       "evidence": [
-        "https://docs.moralis.com/data-api/resources/rate-limits"
+        "Official Token API documentation supports contract-address ERC-20 queries across supported EVM chains.",
+        "Official supported-chain documentation includes BNB Smart Chain, but no authenticated response for the exact TAG contract was available."
       ],
       "freePlan": true,
       "historyAvailable": true,
       "influencesForecast": false,
       "providerId": "moralis",
-      "quotaText": "Free throughput documented at 40 requests/second; monthly CU not revalidated",
+      "quotaText": "Free plan: 40,000 CU/day and 40 requests/second; free usage suspends at exhaustion",
       "role": "optional-onchain",
       "snapshotStorageAllowed": null,
       "tagusdtSupported": false,
@@ -480,14 +482,15 @@
     },
     {
       "accountNeeded": true,
-      "adapterState": "waiting_for_credentials_and_market_list",
+      "adapterState": "exact_tagusdt_verified_signup_blocked",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
-      "correctTagSupported": null,
-      "decision": "deferred: free API is legitimate, but exact TAGUSDT support must be proven after key issuance",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
+      "correctTagSupported": true,
+      "decision": "exact TAG/USDT perpetual coverage and free API are proven; signup was not attempted because required Chrome control is unavailable",
       "evidence": [
-        "Official API docs; no TAG support claim without authenticated supported-market response."
+        "Official Coinalyze TAG pages list TAG/USDT perpetual markets, funding, open interest and liquidations.",
+        "Official API documentation states the API is free, requires signup for a key, and is limited to 40 calls/minute/key."
       ],
       "freePlan": true,
       "historyAvailable": true,
@@ -496,7 +499,7 @@
       "quotaText": "40 API calls/minute/key; intraday retains about 1,500-2,000 points; daily retained",
       "role": "derivatives-candidate",
       "snapshotStorageAllowed": true,
-      "tagusdtSupported": null,
+      "tagusdtSupported": true,
       "termsUrl": "https://api.coinalyze.net/v1/doc/",
       "trialOnly": false,
       "uniqueValue": "Cross-exchange OI, funding, liquidations, long/short and OHLCV"
@@ -506,7 +509,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "deferred: candidate union already resolved to zero; signup would add credentials without acceptance value",
       "evidence": [
@@ -529,7 +532,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "deferred: exhaustive discovery gate is already closed",
       "evidence": [
@@ -552,7 +555,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "deferred: exhaustive discovery gate is already closed",
       "evidence": [
@@ -575,7 +578,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "rejected for autonomous signup: explicit overage path requires a verified $0 cap",
       "evidence": [
@@ -598,7 +601,7 @@
       "adapterState": "exact_contract_tested_not_integrated",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted as optional corroboration; quota conflict and storage rights require conservative use",
       "evidence": [
@@ -621,7 +624,7 @@
       "adapterState": "exact_contract_tested_not_integrated",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted as optional corroboration; no signup needed for tested endpoint",
       "evidence": [
@@ -644,7 +647,7 @@
       "adapterState": "tested_no_exact_asset",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": false,
       "decision": "rejected: full public asset list contained no exact Tagger/TAG match at check time",
       "evidence": [
@@ -667,7 +670,7 @@
       "adapterState": "exact_contract_tested_not_integrated",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted as optional price corroboration only",
       "evidence": [
@@ -690,7 +693,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "rejected: trial-only and not suitable for sustained production",
       "evidence": [
@@ -713,7 +716,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "rejected: trial-only; historical self-service access is otherwise paid",
       "evidence": [
@@ -736,7 +739,7 @@
       "adapterState": "not_tested_no_verified_tag_catalog",
       "apiAvailable": null,
       "cardRequired": null,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: exact TAG coverage and durable free API were not verified",
       "evidence": [
@@ -759,7 +762,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": true,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: paid API and exact TAG support unverified",
       "evidence": [
@@ -782,7 +785,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "deferred: generic BNB/token endpoints could query TAG, but redistribution restrictions and scarce credits preclude integration",
       "evidence": [
@@ -805,7 +808,7 @@
       "adapterState": "not_tested_no_verified_tag_catalog",
       "apiAvailable": null,
       "cardRequired": null,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: no exact TAG/API entitlement evidence",
       "evidence": [
@@ -828,7 +831,7 @@
       "adapterState": "no_supported_api",
       "apiAvailable": false,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: no verified API and exact TAG coverage unproven",
       "evidence": [
@@ -851,7 +854,7 @@
       "adapterState": "not_tested_no_verified_tag_catalog",
       "apiAvailable": null,
       "cardRequired": null,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: exact TAG support and API terms unverified",
       "evidence": [
@@ -874,7 +877,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": true,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: paid API, trial request, personal-use data restriction and exact TAG support unverified",
       "evidence": [
@@ -897,7 +900,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": true,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: free UI does not provide the required production API",
       "evidence": [
@@ -920,7 +923,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": true,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: paid API and exact TAG coverage unverified",
       "evidence": [
@@ -943,7 +946,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": null,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: no verified free/no-card plan or exact TAG entitlement",
       "evidence": [
@@ -966,7 +969,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": null,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: exact TAG support and free entitlement unverified",
       "evidence": [
@@ -989,7 +992,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": true,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: no verified TAG coverage or free production API",
       "evidence": [
@@ -1012,7 +1015,7 @@
       "adapterState": "anonymous_catalog_tested_not_integrated",
       "apiAvailable": true,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted as optional specialist candidate; metric-by-metric TAG coverage and storage rights remain gating",
       "evidence": [
@@ -1035,7 +1038,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": null,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: exact TAG coverage and free terms unverified",
       "evidence": [
@@ -1058,7 +1061,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": true,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: TAG is a token, not a verified covered protocol",
       "evidence": [
@@ -1081,7 +1084,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": true,
       "cardRequired": null,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: no exact TAG unlock coverage proof",
       "evidence": [
@@ -1104,7 +1107,7 @@
       "adapterState": "no_supported_data_api",
       "apiAvailable": false,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected as a data provider; public forecast pages remain discovery candidates when independently classified",
       "evidence": [
@@ -1127,7 +1130,7 @@
       "adapterState": "not_implemented",
       "apiAvailable": null,
       "cardRequired": null,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: exact TAG API support and storage terms unverified",
       "evidence": [
@@ -1150,7 +1153,7 @@
       "adapterState": "identity_unresolved",
       "apiAvailable": null,
       "cardRequired": null,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": null,
       "decision": "rejected: Coin Monkey/CoinMonkey name maps to multiple unrelated products",
       "evidence": [
@@ -1173,7 +1176,7 @@
       "adapterState": "configured_collection_only",
       "apiAvailable": false,
       "cardRequired": false,
-      "checkedAt": "2026-08-17T10:03:54.927431Z",
+      "checkedAt": "2026-08-21T00:38:27.412738Z",
       "correctTagSupported": true,
       "decision": "accepted for separate snapshots, grading and consensus; never silently blended into TAGNEXT_BASELINE",
       "evidence": [

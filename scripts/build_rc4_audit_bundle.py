@@ -329,7 +329,9 @@ def main() -> int:
     brain = backend / "outputs" / "rc4" / "TAGneXt_FULL_BRAIN_RC4.zip"
     rc3 = workspace / "outputs" / "TAGneXt_RELEASE_CANDIDATE_3_AUDIT.zip"
     champion = workspace / "outputs" / "TAGalysis_CHAMPION_BASELINE_20260817T030726Z"
-    for required in (apk, brain, rc3, champion):
+    champion_rows = workspace / "outputs" / "rc4" / "champion-readonly-export"
+    champion_gate = backend / "outputs" / "rc4" / "champion-import-gate-completed.json"
+    for required in (apk, brain, rc3, champion, champion_rows, champion_gate):
         if not required.exists():
             raise FileNotFoundError(required)
     actual_rc3_sha = hashlib.sha256(rc3.read_bytes()).hexdigest()
@@ -353,10 +355,15 @@ def main() -> int:
     device_passed = args.device_state == "passed"
 
     hard_blockers = []
-    if counts["champion_export_rows"] == 0 or counts["champion_pairs"] == 0:
-        hard_blockers.append("Champion read-only export is empty and no paired outcomes exist; winner comparison is prohibited.")
+    if counts["champion_export_rows"] == 0:
+        hard_blockers.append("Champion read-only export is empty; winner comparison is prohibited.")
+    elif counts["champion_pairs"] == 0:
+        hard_blockers.append(
+            f"{counts['champion_export_rows']} champion rows were imported, but no TAGneXt row shares the exact issue time, horizon, and immutable deadline; winner comparison is prohibited."
+        )
     if args.device_state != "passed":
         hard_blockers.append("Final installed-phone LAN, restart, coexistence, inner-display, and no-TAGalysis-contact acceptance is pending.")
+    hard_blockers.append("The dedicated TAGalysis importer role could not be repaired by the available Neon identity, and the authorized Render secret field could not be updated without callable Chrome control.")
     hard_blockers.append("NodeReal/Coinalyze/Moralis account onboarding was not completed; no paid account or unverified TAG adapter was created.")
     gate_state = "RC4_PASSED" if not hard_blockers else "RC4_NOT_PASSED"
     generated = datetime.now(timezone.utc).isoformat()
@@ -412,11 +419,12 @@ Backend RC4: local PostgreSQL service healthy, system ID `tagnext`, background
 scheduler running at a 300-second external-grading cadence, paid AI disabled,
 push disabled, and database source `TAGNEXT_DATABASE_URL`.
 
-Backend tests: 294 passed, 4 skipped. The four exact skips are preserved in
+Backend tests: 297 passed, 4 skipped. The four exact skips are preserved in
 `tests/backend/backend-skipped-tests-exact.log`; every skip protects a Phase 6
 warehouse that is an external artifact rather than a Git-tracked CI fixture.
 
-Android tests: 78 passed, 0 failed, 0 skipped across 15 suites. The validation
+Android Gradle/JVM tests: 78 passed, 0 failed, 0 skipped across 15 suites.
+Android source-contract tests: 32 passed, 0 failed, 0 skipped. The validation
 APK has package `com.eric.tagnext`, version 0.9.0-rc4/versionCode 10004, and a
 signed build-time environment gate for the private LAN challenger. The APK SHA-256
 is `{apk_sha256}`. The signing certificate SHA-256 is
@@ -458,7 +466,10 @@ Period grading retains {counts['completed_period_outcomes']} complete-coverage
 outcomes; incomplete periods are blocked from grading.
 
 Champion rows/pairs are {counts['champion_export_rows']}/{counts['champion_pairs']}.
-No winner is claimed. Holder history contains {counts['holder_rows']} observations,
+All imported rows are independent live TAGalysis grades with exact-deadline
+verified outcomes. No TAGneXt forecast has the same issue time, horizon, and
+deadline, so no pair was fabricated and TAGalysis remains champion. Holder
+history contains {counts['holder_rows']} observations,
 not a complete census. Whale events: {counts['whale_events']}. Order-book snapshots:
 {counts['order_book_snapshots']}. Liquidation observations:
 {counts['liquidation_observations']}; these are event observations, not a provider
@@ -478,20 +489,22 @@ compression driven primarily by price, not a 24.8% token-OI liquidation.
 - Public popularity coverage: {counts['popularity_complete_sources']}/{counts['valid_source_records']}.
 - Valid nonpositive targets: {counts['accepted_nonpositive_targets']}.
 - Real background scheduler proof: passed.
-- Backend tests: 294 passed; four deliberate external-artifact skips documented.
-- Android unit tests: 78 passed; validation APK built.
+- Backend tests: 297 passed; four deliberate external-artifact skips documented.
+- Android tests: 78 Gradle/JVM plus 32 source-contract tests passed; validation APK built.
 - RC3 immutability checksum: {actual_rc3_sha}.
 {device_passed_verification}
 
 ## Owner/external action still required
 
-- Read-only Neon inspection confirmed `tagalysis_history_importer` exists with
-  no elevated role flags and zero other active sessions, but `LOGIN` is disabled.
-  Explicit owner approval is still required before re-enabling/rotating only that
-  role. After rotation, verify `BEGIN READ ONLY`, harmless reads, rejected write,
-  and `ROLLBACK`; then set Render service `tagnext-challenger` → Environment →
-  `TAGALYSIS_HISTORY_IMPORT_URL` without displaying the value. Saving must wait
-  while the no-deploy review hold remains in force.
+- The owner authorized re-enabling/rotating only `tagalysis_history_importer`,
+  but the available Neon identity returned `permission denied to alter role`.
+  Its atomic transaction rolled back; LOGIN remains disabled and six legacy
+  write grants remain unusable. A signed-in Neon owner session must perform this
+  narrow repair, followed by the sanitized read-only proof.
+- Render service `tagnext-challenger` → Environment → Environment Variables →
+  `TAGALYSIS_HISTORY_IMPORT_URL` still requires the newly rotated dedicated URL.
+  Required Chrome control was unavailable, so the field was not changed and no
+  service restart occurred.
 {device_pending_verification}
 - Complete only free/no-card provider onboarding after exact TAG coverage is
   proven. No account, credential, or paid resource was created in this run.
@@ -512,20 +525,25 @@ Until these checks pass, the release state remains `{gate_state}`.
 ## Partially functional
 
 {"- Android: build and unit-test complete; physical-device RC4 acceptance pending." if not device_passed else ""}
-- Historical comparison: importer and pairing code exist; champion row-level data
-  is unavailable, leaving imports and pairs at zero.
+- Historical comparison: 47 checksum-verified TAGalysis rows were imported into
+  the local challenger. Exact issue-time/horizon/deadline overlap is zero, so all
+  47 champion rows and all 9 matured challenger rows remain unmatched and the
+  champion is retained.
 - Holder/whale intelligence: 21 holder observations are not a complete census.
 - Liquidations: observed events exist, but no verified provider heatmap exists.
 
 ## Adapters waiting for credentials or account eligibility
 
-- NodeReal archive BNB RPC, Moralis holder enrichment, and Coinalyze only if exact
-  TAG market support is first verified. No credentials are present in this archive.
+- NodeReal free/no-card BSC archive RPC is coverage-eligible but signup is blocked
+  by unavailable Chrome control. Coinalyze exact TAG/USDT coverage and its free
+  API are proven, but signup is likewise blocked. Moralis generic BNB/ERC-20
+  capability is documented, while an exact TAG contract response remains
+  unverified; it is not eligible for signup. No credentials are present.
 
 ## Honest unavailable/not implemented states
 
 - Cloud challenger endpoint: not deployed.
-- Champion comparison winner: prohibited with zero imported champion rows/pairs.
+- Champion comparison winner: prohibited with zero exact matched pairs.
 - Complete holder census, verified whale-event feed, and provider liquidation
   heatmap: unavailable.
 - Feature promotion: {counts['promoted_features']} promoted,
@@ -538,11 +556,11 @@ Database-level feature rows are in `intelligence/feature-registry.json`.
 This report is sanitized. It contains no connection URL, password, token,
 account identifier, or personal login data.
 
-## Read-only inspection result
+## Inspection and attempted repair
 
-A purpose-built Neon connector issued one harmless `SELECT` against the existing
-production branch. No resource was created and no data or role configuration was
-changed.
+The existing Neon connector issued bounded `SELECT` statements against the
+existing production branch. No project, branch, database, endpoint, or paid
+resource was created, and no TAGalysis application data was written.
 
 - Role: `tagalysis_history_importer`.
 - Superuser, create-role, create-database, replication, and bypass-RLS flags: all false.
@@ -550,28 +568,49 @@ changed.
 - Other active sessions for the role: 0.
 - Role timeouts: statement 60 seconds; lock 5 seconds.
 - Login capability: **false**.
+- Direct legacy grants: SELECT on five historical tables and six write grants
+  across five historical tables. Because LOGIN is false, those grants are not
+  currently usable through this role, but they must be removed before LOGIN is
+  re-enabled.
 
-Because `LOGIN` is disabled, a URL using this role cannot currently be a valid
-connection even if the stored password text is otherwise correct. The RC4 gate
-requires explicit owner approval before re-enabling or rotating only this role.
+The owner explicitly authorized rotating only this role, removing the legacy
+write privileges, preserving every negative capability flag, and enforcing
+default read-only transactions. The available Neon identity attempted that work
+in one atomic transaction, but PostgreSQL returned `permission denied to alter
+role`. Verification proved the transaction rolled back: LOGIN remained false,
+timeouts were unchanged, the six legacy write grants remained, and there were no
+partial role changes.
+
+The legacy `scripts/import_validated_history.py` reads a local SQLite warehouse
+and performs INSERT/UPDATE operations on its destination. It was not pointed at
+TAGalysis. The new `scripts/export_tagalysis_champion_history.py` is the safe
+source-side path: it requires the exact dedicated role, default and transaction
+read-only state, a SQLSTATE 25006 rejected-write proof, and selects only
+`canonical_forecasts`, `canonical_forecast_grades`, and `verified_outcomes`.
+
+Separately, 47 allow-listed row-level records were selected through the existing
+Neon connector and packaged locally. Those SELECTs do not prove the dedicated
+role gate; the manifest says so explicitly.
 
 ## Exact owner-interaction surfaces
 
-1. Neon Console → project `tag-terminal-rc2-preview-db` → production branch →
-   SQL Editor: re-enable/rotate only `tagalysis_history_importer` after explicit
-   approval, retaining least privilege and enforcing read-only transactions.
+1. Neon Console → existing project → production branch → SQL Editor: rotate only
+   `tagalysis_history_importer`, revoke every write/sequence/default privilege,
+   grant only CONNECT/schema USAGE/allow-listed SELECT, retain all negative role
+   flags, set default read-only plus 60-second statement and 5-second lock
+   timeouts, then re-enable LOGIN.
 2. Render Dashboard → service `tagnext-challenger` → Environment → Environment
    Variables → `TAGALYSIS_HISTORY_IMPORT_URL`: replace the secret without showing,
    logging, exporting, or committing it.
-3. Do not save a Render change while the no-deploy review hold is active if the
-   save would restart or deploy the service.
-4. After approval and configuration, verify `BEGIN READ ONLY`, a harmless read,
+3. Saving only this authorized environment variable may perform its directly
+   required service restart; no source deploy or other variable change is allowed.
+4. After configuration, verify `BEGIN READ ONLY`, a harmless read,
    a rejected write attempt, and `ROLLBACK` without exposing the connection value.
 
 The Chrome-control plugin was installed, but its required runtime was not callable
 in this session. No alternate browser was substituted because the owner explicitly
-required Chrome. The champion import therefore remains blocked and rows/pairs
-remain 0/0.
+required Chrome. The role/Render proof remains blocked. Local champion rows/pairs
+are 47/0; the zero pairs are an honest overlap result, not a missing import.
 """
     device_report = f"""# Device acceptance report
 
@@ -672,15 +711,58 @@ Pricing sources checked 2026-08-20:
 Actual billing depends on compute autoscaling, storage/WAL history, extra branches,
 egress, and workspace plan. Owner approval is required before any rollout.
 """
+    provider_gate = """# RC4 provider coverage gate
+
+Checked 2026-08-20 using official provider documentation and provider-owned
+market pages. No account, key, payment method, paid trial, or billable resource
+was created.
+
+## NodeReal
+
+- Coverage: BNB Smart Chain mainnet and archive access are documented for the
+  free tier; generic JSON-RPC can address the verified TAG contract.
+- Eligibility: official FAQ says signup does not require a credit card.
+- State: `exact_bsc_capability_verified_signup_blocked`; no signup because the
+  required Chrome controller was unavailable.
+- Sources: https://docs.nodereal.io/docs/pricing-plan,
+  https://docs.nodereal.io/docs/pricing,
+  https://docs.nodereal.io/docs/archive-node
+
+## Coinalyze
+
+- Coverage: official Tagger pages explicitly list TAG/USDT perpetual markets,
+  funding, open interest, and liquidations, including Binance TAGUSDT.
+- Eligibility: official API documentation says the API is free, requires an
+  account-issued key, and allows 40 calls/minute/key.
+- State: `exact_tagusdt_verified_signup_blocked`; no signup because the required
+  Chrome controller was unavailable.
+- Sources: https://coinalyze.net/tagger/funding-rate/,
+  https://coinalyze.net/tagger/liquidations/,
+  https://api.coinalyze.net/v1/doc/
+
+## Moralis
+
+- Coverage: official docs support BNB Smart Chain and generic ERC-20 contract
+  queries, but no authenticated response for the exact TAG contract was obtained.
+- Eligibility: the free plan exists and stops at quota exhaustion, but exact
+  contract coverage remains the prior gate.
+- State: `blocked_exact_contract_response_unverified`; no signup and no adapter.
+- Sources: https://docs.moralis.com/data-api/evm/token/overview,
+  https://docs.moralis.com/data-api/overview,
+  https://moralis.com/pricing/
+
+All three remain non-influential. Unsupported or unconfigured data is not blended
+into TAGNEXT_BASELINE.
+"""
     accounts = """# RC4 provider account manifest
 
 Accounts created in RC4: 0. API keys created: 0. Payment methods entered: 0.
 
-NodeReal, Coinalyze, and Moralis remain evaluation/onboarding candidates. The
-stale RC3 statement that a Chrome native-host repair is missing is not carried
-forward. In this execution session, no callable Chrome/computer controller was
-available, so no legitimate signup UI, OTP, or CAPTCHA flow could be completed.
-No paid account was substituted and no credential is present in this archive.
+NodeReal and Coinalyze passed the pre-signup coverage/eligibility evidence gate,
+but no callable Chrome controller was available for their signup UI. Moralis did
+not pass the exact-contract-response gate and was not eligible for signup. No
+alternate browser, paid account, placeholder credential, or fake adapter was
+substituted, and no credential is present in this archive.
 """
     legacy_readme = f"""# Legacy reference only
 
@@ -707,6 +789,7 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
             "reports/DEVICE_ACCEPTANCE.md": device_report.encode(),
             "reports/CHAMPION_READONLY_ROLE_AUDIT.md": champion_role_report.encode(),
             "reports/DEPLOYMENT_PLAN_AND_COSTS.md": deployment.encode(),
+            "providers/RC4_PROVIDER_COVERAGE_GATE.md": provider_gate.encode(),
             "providers/RC4_PROVIDER_ACCOUNT_MANIFEST.md": accounts.encode(),
             "inventory/RC4_AUTHORITATIVE_COUNTS.json": _json_bytes(counts),
             "inventory/candidate-terminal-status.json": _json_bytes(candidate_status),
@@ -749,6 +832,7 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
         _add_file(archive, "tests/android/android-gradle-final-rerun.log", android / "outputs/rc4/android-gradle-final-rerun.log", checksums)
         _add_file(archive, "tests/android/android-gradle-device-lan-final.log", android / "outputs/rc4/android-gradle-device-lan-final.log", checksums)
         _add_file(archive, "tests/android/android-gradle-stable-signed-final.log", android / "outputs/rc4/android-gradle-stable-signed-final.log", checksums)
+        _add_file(archive, "tests/android/android-python-contract-tests-final.log", android / "outputs/rc4/android-python-contract-tests-final.log", checksums)
         for path in sorted((android / "app/build/test-results/testDebugUnitTest").glob("TEST-*.xml")):
             _add_file(archive, f"tests/android/xml/{path.name}", path, checksums)
         for runtime_log in (
@@ -775,6 +859,11 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
                         raise FileNotFoundError(evidence_path)
         _add_file(archive, "forensics/TAGNEXT_AUGUST15_FORENSIC_CORRECTED.json", workspace / "work/final_validation/forensics/TAGNEXT_AUGUST15_FORENSIC_CORRECTED.json", checksums)
         _add_file(archive, "forensics/TAGUSDT-metrics-2026-08-15.zip", workspace / "work/final_validation/forensics/TAGUSDT-metrics-2026-08-15.zip", checksums)
+        _add_file(archive, "grading/champion-import-pairing-comparison.json", champion_gate, checksums)
+        for path in sorted(champion_rows.rglob("*")):
+            relative = path.relative_to(champion_rows).as_posix()
+            if path.is_file() and not FORBIDDEN_PATH.search(relative):
+                _add_file(archive, f"champion-row-level-export/{relative}", path, checksums)
         for path in sorted(champion.rglob("*")):
             relative = path.relative_to(champion).as_posix()
             if path.is_file() and not FORBIDDEN_PATH.search(relative):
