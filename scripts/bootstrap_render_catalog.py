@@ -16,7 +16,7 @@ import psycopg
 
 ROOT = Path(__file__).resolve().parents[1]
 DUMP_PATH = ROOT / "bootstrap_data" / "tagnext-rc4-external-catalog.pgcustom"
-EXPECTED_DUMP_SHA256 = "e99182243cb9ee3a360928dcc6bf08306578c4639b0926bbdbd6256e750a8e68"
+EXPECTED_DUMP_SHA256 = "484884150806fde223a2b94af746c95f1a151f11f776cf61e272f8d7523256f5"
 EXPECTED_DATABASE = "tagnext_challenger"
 EXPECTED_PUBLIC_SOURCES = 24
 EXPECTED_PUBLIC_PREDICTIONS = 374
