@@ -321,7 +321,14 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device-state", choices=("pending", "passed", "failed"), default="pending")
+    parser.add_argument("--deployment-state", choices=("pending", "passed", "failed"), default="pending")
+    parser.add_argument(
+        "--champion-importer-state",
+        choices=("disabled_safe", "verified_read_only", "failed"),
+        default="disabled_safe",
+    )
     parser.add_argument("--health-json", type=Path)
+    parser.add_argument("--provider-runtime-json", type=Path)
     args = parser.parse_args()
 
     workspace = args.workspace.resolve()
@@ -333,7 +340,15 @@ def main() -> int:
     champion = workspace / "outputs" / "TAGalysis_CHAMPION_BASELINE_20260817T030726Z"
     champion_rows = workspace / "outputs" / "rc4" / "champion-readonly-export"
     champion_gate = backend / "outputs" / "rc4" / "champion-import-gate-completed.json"
-    for required in (apk, brain, rc3, champion, champion_rows, champion_gate):
+    provider_runtime_path = (
+        args.provider_runtime_json.resolve()
+        if args.provider_runtime_json
+        else backend / "outputs" / "rc4" / "provider-runtime-integration-final-20260821.json"
+    )
+    for required in (
+        apk, brain, rc3, champion, champion_rows, champion_gate,
+        provider_runtime_path,
+    ):
         if not required.exists():
             raise FileNotFoundError(required)
     actual_rc3_sha = hashlib.sha256(rc3.read_bytes()).hexdigest()
@@ -342,6 +357,7 @@ def main() -> int:
 
     counts = _counts()
     health = _health(args.health_json.resolve() if args.health_json else None)
+    provider_runtime = json.loads(provider_runtime_path.read_text(encoding="utf-8"))
     inventory = _inventory()
     provider_registry = _rows("SELECT * FROM tagnext_provider_registry ORDER BY provider_id")
     provider_coverage = _rows("SELECT * FROM tagnext_provider_coverage ORDER BY provider_id")
@@ -355,19 +371,41 @@ def main() -> int:
     android_diff, android_diff_redactions = _redact_high_confidence_matches(android_diff)
     apk_sha256 = hashlib.sha256(apk.read_bytes()).hexdigest()
     device_passed = args.device_state == "passed"
+    deployment_passed = args.deployment_state == "passed"
+    importer_safe = args.champion_importer_state in {
+        "disabled_safe", "verified_read_only",
+    }
+    provider_checks = provider_runtime.get("checks") or {}
+    providers_passed = bool(
+        provider_runtime.get("allPassed")
+        and provider_checks.get("bothLive")
+        and provider_checks.get("bothFresh")
+        and provider_checks.get("readOnly")
+        and provider_checks.get("zeroForecastInfluence")
+        and provider_checks.get("noSecretsInPayload")
+    )
 
     hard_blockers = []
     if counts["champion_export_rows"] == 0:
-        hard_blockers.append("Champion read-only export is empty; winner comparison is prohibited.")
-    elif counts["champion_pairs"] == 0:
-        hard_blockers.append(
-            f"{counts['champion_export_rows']} champion rows were imported, but no TAGneXt row shares the exact issue time, horizon, and immutable deadline; winner comparison is prohibited."
-        )
+        hard_blockers.append("The preserved champion baseline/export is empty.")
     if args.device_state != "passed":
         hard_blockers.append("Final installed-phone LAN, restart, coexistence, inner-display, and no-TAGalysis-contact acceptance is pending.")
-    hard_blockers.append("Legacy TAGalysis importer grants were removed, but the available database owner is still denied ALTER ROLE; password rotation, default read-only, LOGIN, role-self proof, and the dependent Render secret update remain owner-control-plane steps.")
-    hard_blockers.append("NodeReal/Coinalyze account and credential onboarding was not completed; their bounded shadow adapters are implemented but inactive. Moralis remains ineligible without an authenticated exact-contract response.")
+    if not deployment_passed:
+        hard_blockers.append("The existing challenger Render service has not passed deployed health and authenticated app-data acceptance.")
+    if not importer_safe:
+        hard_blockers.append("The TAGalysis importer is neither proven read-only nor disabled, so champion isolation is not established.")
+    if not providers_passed:
+        hard_blockers.append("NodeReal and Coinalyze did not both pass the fresh, exact-TAG, read-only, zero-forecast-influence runtime gate.")
     gate_state = "RC4_PASSED" if not hard_blockers else "RC4_NOT_PASSED"
+    promotion_holds = []
+    if counts["champion_pairs"] == 0:
+        promotion_holds.append(
+            f"{counts['champion_export_rows']} champion rows and the matured TAGneXt rows have zero legitimate exact identity/issue-time/horizon/deadline/outcome pairs; TAGalysis remains champion and automatic promotion stays off."
+        )
+    if args.champion_importer_state == "disabled_safe":
+        promotion_holds.append(
+            "The dedicated TAGalysis importer remains LOGIN-disabled. This is the safest release state and prevents live champion synchronization until an owner later proves the role read-only."
+        )
     generated = datetime.now(timezone.utc).isoformat()
     local_functional_state = "LOCAL_RC_FUNCTIONAL" if device_passed else "LOCAL_RC_DEVICE_ACCEPTANCE_PENDING"
     device_passed_verification = """\
@@ -403,16 +441,23 @@ counts come from `inventory/RC4_AUTHORITATIVE_COUNTS.json` and the checksummed
 `legacy-reference/` and are labeled `LEGACY_RC1_OR_RC2_REFERENCE_ONLY`.
 
 The code, database export, APK, build/test logs, migrations, forensic evidence,
-provider matrices, Git evidence, and secret scan are included. No deployment,
-push, paid account/resource creation, trade, or TAGalysis write was performed.
+provider matrices, Git evidence, deployed-health evidence, and secret scan are
+included. No paid resource, trade, automatic winner promotion, or TAGalysis write
+was performed.
 
 ## Blocking truth
 
 {chr(10).join('- ' + item for item in hard_blockers)}
 
-The local challenger backend is functional and intentionally separate from the
-champion. Local functional state: **{local_functional_state}**. This does not
-override the independent champion-comparison or provider-onboarding blockers.
+## Promotion holds (not functional-release blockers)
+
+{chr(10).join('- ' + item for item in promotion_holds) or '- None.'}
+
+The challenger is intentionally separate from the champion. Functional state:
+**{local_functional_state}**; deployment state: **{args.deployment_state}**;
+champion importer state: **{args.champion_importer_state}**. RC4 functional
+release and future challenger promotion are separate decisions: TAGalysis remains
+champion until preregistered exact-pair evidence supports an independent review.
 """
     engineering = f"""# Engineering report
 
@@ -423,12 +468,12 @@ The final Predictions correction was validated in strict local repair mode with
 background jobs, live collectors, deterministic grading, backfill, paid AI, and
 push disabled. No champion connection was inherited by that validation process.
 
-Backend tests: 301 passed, 4 skipped. The four exact skips are preserved in
+Backend tests: 308 passed, 4 skipped. The four exact skips are preserved in
 `tests/backend/backend-skipped-tests-exact.log`; every skip protects a Phase 6
 warehouse that is an external artifact rather than a Git-tracked CI fixture.
 
-Android Gradle/JVM tests: 78 passed, 0 failed, 0 skipped across 15 suites.
-Android source-contract tests: 55 passed, 0 failed, 0 skipped. The validation
+Android Gradle/JVM tests: 79 passed, 0 failed, 0 skipped across 15 suites.
+Android source-contract tests: 56 passed, 0 failed, 0 skipped. The validation
 APK has package `com.eric.tagnext`, version 0.9.0-rc4/versionCode 10004, and a
 signed build-time environment gate for the private LAN challenger. The APK SHA-256
 is `{apk_sha256}`. The signing certificate SHA-256 is
@@ -445,10 +490,25 @@ claims and five explicit no-claim rows; no source is hidden merely because the
 selected 24-hour horizon has no outside claim. The catalog query projects only
 display fields and does not transfer stored raw-page evidence on each refresh.
 
+Every outside prediction headline is now USD. Native source currency/values stay
+visible only as provenance, unavailable conversion is never relabeled, and saved
+portfolio quantity drives projected values. The full-width all-source button opens
+the complete source/prediction sheet.
+
+The Android chart is a native interactive candlestick/volume view for the
+canonical TAG/WBNB pool, with 5m/15m/1h/4h/1d timeframes, pan, pinch zoom,
+candle selection, MA20, VWAP, and saved-portfolio valuation.
+
+NodeReal and Coinalyze run through a 15-minute read-only shadow collector. The
+authenticated evidence API reports live and freshness separately; stale success
+cannot appear current. Their live runtime integration proof is
+`providers/provider-runtime-integration-final-20260821.json`. Forecast influence
+remains exactly zero.
+
 Device status: {args.device_state}. On-device acceptance covered the outer and
 inner displays, populated decision/intelligence surfaces, portfolio math,
 restart persistence, honest offline behavior, export generation, and recovery.
-Cloud status: not deployed by instruction.
+Cloud status: {args.deployment_state}.
 """
     intelligence = f"""# Intelligence report
 
@@ -499,29 +559,24 @@ compression driven primarily by price, not a 24.8% token-OI liquidation.
 - Public popularity coverage: {counts['popularity_complete_sources']}/{counts['valid_source_records']}.
 - Valid nonpositive targets: {counts['accepted_nonpositive_targets']}.
 - Real background scheduler proof: passed.
-- Backend tests: 301 passed; four deliberate external-artifact skips documented.
-- Android tests: 78 Gradle/JVM plus 55 source-contract tests passed; validation APK built.
+- Backend tests: 308 passed; four deliberate external-artifact skips documented.
+- Android tests: 79 Gradle/JVM plus 56 source-contract tests passed; validation APK built.
+- NodeReal and Coinalyze fresh runtime gate: {'passed' if providers_passed else 'not passed'}.
+- Deployed challenger health/app-data gate: {args.deployment_state}.
+- TAGalysis importer isolation state: {args.champion_importer_state}.
 - RC3 immutability checksum: {actual_rc3_sha}.
 {device_passed_verification}
 
-## Owner/external action still required
+## Remaining functional-release blockers
 
-- The available Neon database owner removed every legacy table, sequence, and
-  default grant and left only SELECT on the three approved tables. PostgreSQL
-  still returned `permission denied to alter role`; that combined transaction
-  rolled back before the successful grants-only transaction. LOGIN remains
-  disabled and expired, and default read-only is not yet configured. A signed-in
-  Neon control-plane owner session must complete the narrow role/password repair,
-  followed by the sanitized role-self proof.
-- Render service `tagnext-challenger` → Environment → Environment Variables →
-  `TAGALYSIS_HISTORY_IMPORT_URL` still requires the newly rotated dedicated URL.
-  Required Chrome control was unavailable, so the field was not changed and no
-  service restart occurred.
+{chr(10).join('- ' + item for item in hard_blockers) or '- None.'}
 {device_pending_verification}
-- Complete only free/no-card provider onboarding after exact TAG coverage is
-  proven. No account, credential, or paid resource was created in this run.
 
-Until these checks pass, the release state remains `{gate_state}`.
+## Prospective comparison queue
+
+{chr(10).join('- ' + item for item in promotion_holds) or '- None.'}
+
+Release state: `{gate_state}`. Automatic promotion remains off in every state.
 """
     features = f"""# Functional-state inventory
 
@@ -544,18 +599,17 @@ Until these checks pass, the release state remains `{gate_state}`.
 - Holder/whale intelligence: 21 holder observations are not a complete census.
 - Liquidations: observed events exist, but no verified provider heatmap exists.
 
-## Adapters waiting for credentials or account eligibility
+## Credentialed runtime adapters
 
-- NodeReal free/no-card BSC archive RPC and Coinalyze exact TAG/USDT coverage are
-  proven. Their bounded read-only, secret-safe shadow adapters are implemented,
-  but account/key creation still requires owner authentication in the opened
-  signup surfaces. Moralis generic BNB/ERC-20 capability is documented, while an
+- NodeReal free/no-card BSC RPC and Coinalyze exact TAG/USDT coverage are proven.
+  Their scheduled collector, freshness gate, authenticated API contract, and app
+  presentation passed. Keys remain excluded and stored only in approved secret
+  stores. Both are shadow-only and non-influential. Moralis generic BNB/ERC-20 capability is documented, while an
   authenticated exact TAG response remains unverified; it is not eligible for
-  signup. No credentials are present.
+  signup. No credentials are present in this archive.
 
 ## Honest unavailable/not implemented states
 
-- Cloud challenger endpoint: not deployed.
 - Champion comparison winner: prohibited with zero exact matched pairs.
 - Complete holder census, verified whale-event feed, and provider liquidation
   heatmap: unavailable.
@@ -693,13 +747,15 @@ Status: **{args.device_state.upper()}**
   target was selected and nothing was transmitted. The chooser image is excluded
   from this archive to avoid including unrelated personal-device suggestions.
 
-The device gate can establish `{local_functional_state}` only. It cannot establish
-the independent champion-comparison or provider-onboarding gates, so the overall
-archive state remains `{gate_state}`.
+The installed-device gate, deployed-health gate, provider-freshness gate, and
+champion-isolation gate jointly determine functional RC4 state. Exact paired
+comparison remains a separate future-promotion gate, never an excuse to fabricate
+or backdate evidence. Archive state: `{gate_state}`.
 """
-    deployment = """# Deployment plan and projected monthly cost
+    deployment = f"""# Deployment plan and projected monthly cost
 
-No deployment or billable resource was created.
+Deployment state captured for this archive: `{args.deployment_state}`. No paid
+resource or plan upgrade was created.
 
 ## Owner option A — preview only, $0 baseline
 
@@ -732,21 +788,25 @@ Pricing sources checked 2026-08-20:
 - https://neon.com/pricing
 
 Actual billing depends on compute autoscaling, storage/WAL history, extra branches,
-egress, and workspace plan. Owner approval is required before any rollout.
+egress, and workspace plan. This RC4 uses only the already-authorized free preview
+configuration unless the owner separately approves an upgrade.
 """
     provider_gate = """# RC4 provider coverage gate
 
-Checked 2026-08-20 using official provider documentation and provider-owned
-market pages. No account, key, payment method, paid trial, or billable resource
-was created.
+Checked through 2026-08-21 using official provider documentation, provider-owned
+market pages, and bounded authenticated read-only probes. Two free accounts and
+two API keys were created; no payment method, paid trial, or billable resource
+was created. Credentials remain excluded.
 
 ## NodeReal
 
 - Coverage: BNB Smart Chain mainnet and archive access are documented for the
   free tier; generic JSON-RPC can address the verified TAG contract.
 - Eligibility: official FAQ says signup does not require a credit card.
-- State: `adapter_ready_waiting_for_credentials`; the exact-contract adapter is
-  read-only, secret-safe, and shadow-only. Account/key creation remains pending.
+- State: `runtime_shadow_ready_not_deployed` before rollout and `runtime_shadow_active`
+  only after deployed fresh-state proof. The scheduled collector passed chain id
+  56 and exact TAG decimals/positive-total-supply reads. It remains read-only,
+  secret-safe, shadow-only, and visible on the chart/Whales surfaces.
 - Sources: https://docs.nodereal.io/docs/pricing-plan,
   https://docs.nodereal.io/docs/pricing,
   https://docs.nodereal.io/docs/archive-node
@@ -757,9 +817,11 @@ was created.
   funding, open interest, and liquidations, including Binance TAGUSDT.
 - Eligibility: official API documentation says the API is free, requires an
   account-issued key, and allows 40 calls/minute/key.
-- State: `adapter_ready_waiting_for_credentials`; the bounded OI, funding and
-  liquidation adapter uses header authentication and never infers a heatmap.
-  Account/key creation remains pending.
+- State: `runtime_shadow_ready_not_deployed` before rollout and `runtime_shadow_active`
+  only after deployed fresh-state proof. The bounded header-authenticated collector
+  found exact TAG/USDT perpetuals and current OI/funding. Missing per-market values
+  and liquidation rows remain unavailable and no heatmap is inferred. Funding is
+  converted from provider decimal units to percent exactly once in the UI.
 - Sources: https://coinalyze.net/tagger/funding-rate/,
   https://coinalyze.net/tagger/liquidations/,
   https://api.coinalyze.net/v1/doc/
@@ -775,8 +837,9 @@ was created.
   https://docs.moralis.com/data-api/overview,
   https://moralis.com/pricing/
 
-All three remain non-influential. Unsupported or unconfigured data is not blended
-into TAGNEXT_BASELINE.
+NodeReal and Coinalyze remain non-influential until an independent future promotion
+review. Moralis is optional/rejected, not an RC4 blocker. Unsupported or
+unconfigured data is never blended into TAGNEXT_BASELINE.
 """
     installed_app_isolation = """# Installed-app isolation report
 
@@ -828,11 +891,11 @@ TAGalysis write was attempted.
 """
     accounts = """# RC4 provider account manifest
 
-Accounts created in RC4: 0. API keys created: 0. Payment methods entered: 0.
+Accounts created in RC4: 2. API keys created: 2. Payment methods entered: 0.
 
-NodeReal and Coinalyze passed the pre-signup coverage/eligibility evidence gate,
-and bounded shadow adapters were implemented and tested. Account/key creation
-still requires owner authentication in the opened signup surfaces. Moralis did
+NodeReal and Coinalyze passed the coverage/eligibility gate, account/key creation,
+and bounded authenticated read-only shadow validation. Their credentials are
+stored only in a local Windows DPAPI store and are excluded here. Moralis did
 not pass the exact-contract-response gate and was not eligible for signup. No
 paid account, placeholder credential, or fake live response was substituted,
 and no credential is present in this archive.
@@ -900,7 +963,7 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
 
         _add_file(archive, "apk/TAGneXt-0.9.0-rc4-validation.apk", apk, checksums)
         _add_file(archive, "exports/TAGneXt_FULL_BRAIN_RC4.zip", brain, checksums)
-        _add_file(archive, "tests/backend/backend-pytest-final.xml", backend / "outputs/rc4/backend-pytest-final-authorized.xml", checksums)
+        _add_file(archive, "tests/backend/backend-pytest-final.xml", backend / "outputs/rc4/backend-pytest-provider-final-20260821.xml", checksums)
         _add_file(archive, "tests/backend/backend-skipped-tests-exact.log", backend / "outputs/rc4/backend-skipped-tests-exact-final-authorized.log", checksums)
         _add_file(archive, "tests/backend/rc4-scheduler-proof-final.json", backend / "outputs/rc4/scheduler-proof-final.json", checksums)
         _add_file(archive, "tests/android/android-gradle-final-authorized.log", android / "outputs/rc4/android-gradle-final-authorized.log", checksums)
@@ -912,6 +975,11 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
         _add_file(archive, "reports/NEON_ROLE_PROOF_20260820.json", backend / "outputs/rc4/neon-role-proof-20260820.json", checksums)
         _add_file(archive, "reports/PROSPECTIVE_CHAMPION_PROTOCOL_20260820.md", backend / "outputs/rc4/prospective-champion-protocol-20260820.md", checksums)
         _add_file(archive, "reports/PROVIDER_ONBOARDING_20260820.md", backend / "outputs/rc4/provider-onboarding-20260820.md", checksums)
+        _add_file(archive, "reports/PROVIDER_ONBOARDING_20260821.md", backend / "outputs/rc4/provider-onboarding-20260821.md", checksums)
+        _add_file(archive, "providers/credential-validation-final-20260821.json", backend / "outputs/rc4/provider-credential-validation-final-20260821.json", checksums)
+        _add_file(archive, "providers/provider-runtime-live-final-20260821.json", backend / "outputs/rc4/provider-runtime-live-final-20260821.json", checksums)
+        _add_file(archive, "providers/provider-runtime-integration-final-20260821.json", provider_runtime_path, checksums)
+        _add_file(archive, "reports/RC4_RELEASE_AND_PROMOTION_POLICY.md", backend / "RC4_RELEASE_AND_PROMOTION_POLICY.md", checksums)
         _add_file(archive, "reports/CHADTAG_ISOLATION_20260820.md", backend / "outputs/rc4/chadtag-isolation-20260820.md", checksums)
         _add_file(archive, "reports/FINAL_DEVICE_INSTALL_20260820.md", backend / "outputs/rc4/final-device-install-20260820.md", checksums)
         for path in sorted((android / "app/build/test-results/testDebugUnitTest").glob("TEST-*.xml")):

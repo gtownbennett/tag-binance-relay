@@ -28,7 +28,10 @@ URL_PATTERN = re.compile(rb"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{4,}")
 
 def _tracked(repo: Path) -> list[Path]:
     result = subprocess.run(
-        ["git", "ls-files", "-z"], cwd=repo, check=True, capture_output=True
+        ["git", "-c", f"safe.directory={repo}", "ls-files", "-z"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
     ).stdout.decode("utf-8", errors="strict")
     return [repo / name for name in result.split("\0") if name]
 

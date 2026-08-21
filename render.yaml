@@ -15,6 +15,10 @@ services:
         value: "true"
       - key: TAGNEXT_DATABASE_URL
         sync: false
+      - key: NODEREAL_BNB_RPC_URL
+        sync: false
+      - key: COINALYZE_API_KEY
+        sync: false
       - key: REPAIR_MODE
         value: "false"
       - key: TAGNEXT_RUNTIME_MODE

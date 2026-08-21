@@ -125,6 +125,12 @@ from app.tagnext_comparison import (
     rolling_comparison_report,
     run_shadow_ablation_report,
 )
+from app.tagnext_chart import ChartDataError, chart_payload
+from app.tagnext_credentialed_providers import (
+    collect_provider_shadow_snapshot,
+    provider_shadow_payload,
+)
+from app.tagnext_fx import apply_usd_display_conversions
 from app.tagnext_future_engine import (
     build_future_paths as build_server_future_paths,
     event_ledger_payload as tagnext_event_ledger_payload,
@@ -2598,6 +2604,8 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
         return result
     if job_type == "collect_tagnext_bnb_chain":
         return await asyncio.to_thread(collect_bnb_chain_once)
+    if job_type == "collect_tagnext_provider_shadows":
+        return await asyncio.to_thread(collect_provider_shadow_snapshot)
     if job_type == "grade_tagnext_onchain_events":
         return await asyncio.to_thread(grade_due_onchain_event_outcomes)
     if job_type == "compare_tagnext_to_champion":
@@ -2710,6 +2718,19 @@ async def phase1_job_loop() -> None:
                         idempotency_key=f"tagnext-bnb-chain:{chain_bucket}",
                         origin="server-scheduler",
                         payload={"bucket": chain_bucket, "access": "free_direct_readonly"},
+                        max_attempts=2,
+                    )
+                    provider_bucket = int(time.time()) // 900 * 900
+                    await asyncio.to_thread(
+                        enqueue_job,
+                        job_type="collect_tagnext_provider_shadows",
+                        idempotency_key=f"tagnext-provider-shadows:{provider_bucket}",
+                        origin="server-scheduler",
+                        payload={
+                            "bucket": provider_bucket,
+                            "mode": "read_only_shadow",
+                            "influencesForecast": False,
+                        },
                         max_attempts=2,
                     )
                     await asyncio.to_thread(
@@ -3184,7 +3205,36 @@ async def tagnext_predictions(
     selected = horizon.strip().lower()
     if selected not in supported:
         raise HTTPException(status_code=422, detail="unsupported TAGneXt prediction horizon")
-    return {"ok": True, **await asyncio.to_thread(predictions_payload, horizon=selected)}
+    payload = await asyncio.to_thread(predictions_payload, horizon=selected)
+    converted = await asyncio.to_thread(apply_usd_display_conversions, payload)
+    return {"ok": True, **converted}
+
+
+@app.get("/v1/tagnext/chart")
+async def tagnext_chart(
+    timeframe: str = Query("1h"),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    try:
+        payload = await asyncio.to_thread(chart_payload, timeframe=timeframe)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except ChartDataError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="canonical TAG chart provider is temporarily unavailable",
+        ) from error
+    return {"ok": True, **payload}
+
+
+@app.get("/v1/tagnext/providers/live")
+async def tagnext_provider_shadows(
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_relay_key(x_relay_key)
+    # Side-effect free: provider collection runs only in the bounded server job.
+    return {"ok": True, **provider_shadow_payload()}
 
 
 @app.get("/v1/tagnext/discovery/inventory")

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import math
 import os
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -22,6 +24,31 @@ from .tagnext_onchain import BnbRpc, DECIMALS_SELECTOR, TOTAL_SUPPLY_SELECTOR
 COINALYZE_BASE_URL = "https://api.coinalyze.net/v1"
 COINALYZE_MAX_LOOKBACK = timedelta(days=7)
 BNB_CHAIN_ID = 56
+SHADOW_COLLECTION_INTERVAL_SECONDS = 900
+SHADOW_STALE_AFTER_SECONDS = SHADOW_COLLECTION_INTERVAL_SECONDS * 2
+
+
+_SHADOW_LOCK = Lock()
+_SHADOW_STATE: dict[str, Any] = {
+    "schemaVersion": "tagnext-provider-shadow-v1",
+    "checkedAt": "",
+    "collectionMode": "read_only_shadow",
+    "influencesForecast": False,
+    "providers": {
+        "nodereal": {
+            "providerId": "nodereal",
+            "state": "not_configured",
+            "readOnly": True,
+            "influencesForecast": False,
+        },
+        "coinalyze": {
+            "providerId": "coinalyze",
+            "state": "not_configured",
+            "readOnly": True,
+            "influencesForecast": False,
+        },
+    },
+}
 
 
 class ProviderConfigurationError(RuntimeError):
@@ -43,20 +70,31 @@ def _finite(value: Any, *, label: str) -> float:
 
 
 def _utc_from_epoch(value: Any, *, label: str) -> datetime:
-    seconds = int(_finite(value, label=label))
-    # Coinalyze documents epoch seconds; reject millisecond-shaped timestamps so
-    # a schema change cannot silently corrupt freshness calculations.
-    if seconds < 1_000_000_000 or seconds > 4_102_444_800:
+    raw = int(_finite(value, label=label))
+    if 1_000_000_000 <= raw <= 4_102_444_800:
+        seconds = raw
+    elif 1_000_000_000_000 <= raw <= 4_102_444_800_000:
+        seconds = raw / 1000
+    else:
         raise ProviderResponseError(f"{label} is outside the supported epoch-second range")
     return datetime.fromtimestamp(seconds, tz=timezone.utc)
 
 
-def _single_row(payload: Any, *, symbol: str, label: str) -> Mapping[str, Any]:
-    rows = payload if isinstance(payload, list) else []
-    matches = [row for row in rows if isinstance(row, Mapping) and str(row.get("symbol")) == symbol]
-    if len(matches) != 1:
-        raise ProviderResponseError(f"{label} did not return exactly one matching TAG market")
-    return matches[0]
+def _available_rows_by_symbol(
+    payload: Any, *, symbols: Sequence[str], label: str,
+) -> dict[str, Mapping[str, Any]]:
+    if not isinstance(payload, list):
+        raise ProviderResponseError(f"{label} response is not a list")
+    rows = payload
+    expected = set(symbols)
+    matches = [
+        row for row in rows
+        if isinstance(row, Mapping) and str(row.get("symbol")) in expected
+    ]
+    by_symbol = {str(row.get("symbol")): row for row in matches}
+    if len(matches) != len(by_symbol):
+        raise ProviderResponseError(f"{label} returned duplicate TAG market rows")
+    return by_symbol
 
 
 class CoinalyzeReadOnlyClient:
@@ -102,7 +140,7 @@ class CoinalyzeReadOnlyClient:
         except ValueError as exc:
             raise ProviderResponseError(f"Coinalyze {path} returned invalid JSON") from exc
 
-    def exact_tag_market(self) -> dict[str, Any]:
+    def exact_tag_markets(self) -> list[dict[str, Any]]:
         payload = self._get("future-markets")
         rows = payload if isinstance(payload, list) else []
         matches = [
@@ -112,23 +150,38 @@ class CoinalyzeReadOnlyClient:
             and str(row.get("quote_asset") or "").upper() == "USDT"
             and row.get("is_perpetual") is True
         ]
-        if len(matches) != 1:
+        if not matches or len(matches) > 20:
             raise ProviderResponseError(
-                "Coinalyze market catalog did not return exactly one TAG/USDT perpetual"
+                "Coinalyze market catalog returned an unsupported TAG/USDT perpetual count"
             )
-        row = matches[0]
-        symbol = str(row.get("symbol") or "").strip()
-        if not symbol:
-            raise ProviderResponseError("Coinalyze TAG/USDT market has no canonical symbol")
+        normalized: list[dict[str, Any]] = []
+        for row in matches:
+            symbol = str(row.get("symbol") or "").strip()
+            if not symbol:
+                raise ProviderResponseError("Coinalyze TAG/USDT market has no canonical symbol")
+            normalized.append({
+                "providerId": "coinalyze",
+                "symbol": symbol,
+                "symbolOnExchange": str(row.get("symbol_on_exchange") or ""),
+                "exchange": str(row.get("exchange") or ""),
+                "baseAsset": "TAG",
+                "quoteAsset": "USDT",
+                "perpetual": True,
+                "margined": str(row.get("margined") or ""),
+                "oiLiquidationVolumeDenomination": str(row.get("oi_lq_vol_denominated_in") or ""),
+                "exactCoverage": True,
+            })
+        return sorted(normalized, key=lambda item: item["symbol"])
+
+    def exact_tag_market(self) -> dict[str, Any]:
+        markets = self.exact_tag_markets()
         return {
             "providerId": "coinalyze",
-            "symbol": symbol,
-            "symbolOnExchange": str(row.get("symbol_on_exchange") or ""),
-            "exchange": str(row.get("exchange") or ""),
             "baseAsset": "TAG",
             "quoteAsset": "USDT",
             "perpetual": True,
-            "oiLiquidationVolumeDenomination": str(row.get("oi_lq_vol_denominated_in") or ""),
+            "marketCount": len(markets),
+            "symbols": [market["symbol"] for market in markets],
             "exactCoverage": True,
         }
 
@@ -145,18 +198,18 @@ class CoinalyzeReadOnlyClient:
             "4hour", "6hour", "12hour", "daily",
         }:
             raise ValueError("unsupported Coinalyze interval")
-        market = self.exact_tag_market()
-        symbol = market["symbol"]
-        common = {"symbols": symbol}
-        oi = _single_row(
+        markets = self.exact_tag_markets()
+        symbols = [market["symbol"] for market in markets]
+        common = {"symbols": ",".join(symbols)}
+        oi_by_symbol = _available_rows_by_symbol(
             self._get("open-interest", params={**common, "convert_to_usd": "true"}),
-            symbol=symbol, label="open interest",
+            symbols=symbols, label="open interest",
         )
-        funding = _single_row(
+        funding_by_symbol = _available_rows_by_symbol(
             self._get("funding-rate", params=common),
-            symbol=symbol, label="funding rate",
+            symbols=symbols, label="funding rate",
         )
-        history = _single_row(
+        history_by_symbol = _available_rows_by_symbol(
             self._get("liquidation-history", params={
                 **common,
                 "interval": interval,
@@ -164,36 +217,122 @@ class CoinalyzeReadOnlyClient:
                 "to": int(end_utc.timestamp()),
                 "convert_to_usd": "true",
             }),
-            symbol=symbol, label="liquidation history",
+            symbols=symbols, label="liquidation history",
         )
-        liquidation_rows = history.get("history") if isinstance(history.get("history"), list) else []
         normalized_liquidations: list[dict[str, Any]] = []
-        for item in liquidation_rows:
-            if not isinstance(item, Mapping):
-                raise ProviderResponseError("liquidation history contains an invalid row")
-            normalized_liquidations.append({
-                "observedAt": _utc_from_epoch(item.get("t"), label="liquidation timestamp").isoformat(),
-                "longLiquidationUsd": _finite(item.get("l"), label="long liquidations"),
-                "shortLiquidationUsd": _finite(item.get("s"), label="short liquidations"),
+        market_snapshots: list[dict[str, Any]] = []
+        total_open_interest = 0.0
+        weighted_funding_numerator = 0.0
+        weighted_funding_denominator = 0.0
+        available_funding_rates: list[float] = []
+        observed_times: list[datetime] = []
+        for market in markets:
+            symbol = market["symbol"]
+            oi = oi_by_symbol.get(symbol)
+            funding = funding_by_symbol.get(symbol)
+            history = history_by_symbol.get(symbol)
+            oi_current = (
+                oi is not None
+                and oi.get("value") is not None
+                and oi.get("update") not in (None, 0, "0")
+            )
+            funding_current = (
+                funding is not None
+                and funding.get("value") is not None
+                and funding.get("update") not in (None, 0, "0")
+            )
+            open_interest = (
+                _finite(oi.get("value"), label="open interest")
+                if oi_current else None
+            )
+            funding_rate = (
+                _finite(funding.get("value"), label="funding rate")
+                if funding_current else None
+            )
+            market_observed_times = []
+            if open_interest is not None:
+                market_observed_times.append(
+                    _utc_from_epoch(oi.get("update"), label="open-interest update")
+                )
+            if funding_rate is not None:
+                market_observed_times.append(
+                    _utc_from_epoch(funding.get("update"), label="funding update")
+                )
+            observed_at = max(market_observed_times) if market_observed_times else None
+            if open_interest is not None:
+                total_open_interest += open_interest
+            if open_interest is not None and funding_rate is not None:
+                weighted_funding_numerator += funding_rate * open_interest
+                weighted_funding_denominator += open_interest
+            if funding_rate is not None:
+                available_funding_rates.append(funding_rate)
+            if observed_at is not None:
+                observed_times.append(observed_at)
+            market_snapshots.append({
+                **market,
+                "observedAt": observed_at.isoformat() if observed_at else None,
+                "openInterestUsd": open_interest,
+                "fundingRate": funding_rate,
+                "openInterestAvailable": open_interest is not None,
+                "fundingRateAvailable": funding_rate is not None,
             })
-        observed_at = max(
-            _utc_from_epoch(oi.get("update"), label="open-interest update"),
-            _utc_from_epoch(funding.get("update"), label="funding update"),
-        )
+            liquidation_rows = (
+                history.get("history")
+                if history is not None and isinstance(history.get("history"), list)
+                else []
+            )
+            for item in liquidation_rows:
+                if not isinstance(item, Mapping):
+                    raise ProviderResponseError("liquidation history contains an invalid row")
+                normalized_liquidations.append({
+                    "symbol": symbol,
+                    "exchange": market["exchange"],
+                    "observedAt": _utc_from_epoch(
+                        item.get("t"), label="liquidation timestamp"
+                    ).isoformat(),
+                    "longLiquidationUsd": _finite(item.get("l"), label="long liquidations"),
+                    "shortLiquidationUsd": _finite(item.get("s"), label="short liquidations"),
+                })
+        if total_open_interest <= 0:
+            raise ProviderResponseError("aggregate TAG open interest is not positive")
+        if not available_funding_rates or not observed_times:
+            raise ProviderResponseError("no current numeric TAG funding row is available")
+        if weighted_funding_denominator > 0:
+            aggregate_funding = weighted_funding_numerator / weighted_funding_denominator
+            funding_aggregation = "open_interest_weighted_across_markets_with_both_values"
+        else:
+            aggregate_funding = sum(available_funding_rates) / len(available_funding_rates)
+            funding_aggregation = "equal_weighted_across_markets_with_current_funding_only"
+        normalized_liquidations.sort(key=lambda item: (item["observedAt"], item["symbol"]))
         return {
             "providerId": "coinalyze",
-            "observedAt": observed_at.isoformat(),
-            "market": market,
-            "openInterestUsd": _finite(oi.get("value"), label="open interest"),
-            "fundingRate": _finite(funding.get("value"), label="funding rate"),
+            "observedAt": max(observed_times).isoformat(),
+            "market": {
+                "providerId": "coinalyze", "baseAsset": "TAG", "quoteAsset": "USDT",
+                "perpetual": True, "marketCount": len(markets), "exactCoverage": True,
+            },
+            "markets": market_snapshots,
+            "openInterestUsd": total_open_interest,
+            "fundingRate": aggregate_funding,
+            "fundingAggregation": funding_aggregation,
+            "openInterestMarketsAvailable": sum(
+                item["openInterestAvailable"] for item in market_snapshots
+            ),
+            "fundingMarketsAvailable": sum(
+                item["fundingRateAvailable"] for item in market_snapshots
+            ),
+            "liquidationMarketsAvailable": len(history_by_symbol),
             "fundingInterval": "provider_market_interval_not_in_current_endpoint",
             "liquidationInterval": interval,
             "liquidations": normalized_liquidations,
+            "liquidationDataAvailable": bool(history_by_symbol),
             "liquidationHeatmapAvailable": False,
             "readOnly": True,
             "influencesForecast": False,
             "credentialPresent": True,
             "apiCalls": 4,
+            "providerCallUnits": 1 + (3 * len(markets)),
+            "timestampNormalization": "explicit_epoch_seconds_or_milliseconds_by_magnitude",
         }
 
 
@@ -237,3 +376,140 @@ def probe_nodereal_exact_tag(
     finally:
         if owned_rpc:
             chain.close()
+
+
+def collect_provider_shadow_snapshot(
+    *,
+    checked_at: datetime | None = None,
+    coinalyze_client: CoinalyzeReadOnlyClient | None = None,
+    nodereal_rpc: BnbRpc | None = None,
+) -> dict[str, Any]:
+    """Collect bounded provider evidence without affecting any forecast.
+
+    Runtime credentials stay in environment variables.  Errors are deliberately
+    reduced to exception classes so provider responses and secret-bearing URLs
+    can never enter logs, API payloads, or audit archives.
+    """
+
+    now = (checked_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    providers: dict[str, dict[str, Any]] = {}
+
+    nodereal_configured = bool(
+        nodereal_rpc is not None or (os.getenv("NODEREAL_BNB_RPC_URL") or "").strip()
+    )
+    if nodereal_configured:
+        try:
+            proof = probe_nodereal_exact_tag(rpc=nodereal_rpc)
+            providers["nodereal"] = {
+                **proof,
+                "state": "live_shadow",
+                "checkedAt": now.isoformat(),
+            }
+        except Exception as error:  # pragma: no cover - exact network failures vary
+            providers["nodereal"] = {
+                "providerId": "nodereal",
+                "state": "degraded",
+                "checkedAt": now.isoformat(),
+                "errorClass": type(error).__name__,
+                "readOnly": True,
+                "influencesForecast": False,
+            }
+    else:
+        providers["nodereal"] = {
+            "providerId": "nodereal",
+            "state": "not_configured",
+            "checkedAt": now.isoformat(),
+            "readOnly": True,
+            "influencesForecast": False,
+        }
+
+    coinalyze_configured = bool(
+        coinalyze_client is not None or (os.getenv("COINALYZE_API_KEY") or "").strip()
+    )
+    if coinalyze_configured:
+        owned_client = coinalyze_client is None
+        client = coinalyze_client or CoinalyzeReadOnlyClient()
+        try:
+            snapshot = client.derivatives_snapshot(
+                start=now - timedelta(hours=1),
+                end=now,
+                interval="5min",
+            )
+            providers["coinalyze"] = {
+                **snapshot,
+                "state": "live_shadow",
+                "checkedAt": now.isoformat(),
+                "liquidationRowCount": len(snapshot.get("liquidations") or []),
+            }
+        except Exception as error:  # pragma: no cover - exact network failures vary
+            providers["coinalyze"] = {
+                "providerId": "coinalyze",
+                "state": "degraded",
+                "checkedAt": now.isoformat(),
+                "errorClass": type(error).__name__,
+                "readOnly": True,
+                "influencesForecast": False,
+            }
+        finally:
+            if owned_client:
+                client.close()
+    else:
+        providers["coinalyze"] = {
+            "providerId": "coinalyze",
+            "state": "not_configured",
+            "checkedAt": now.isoformat(),
+            "readOnly": True,
+            "influencesForecast": False,
+        }
+
+    result = {
+        "schemaVersion": "tagnext-provider-shadow-v1",
+        "checkedAt": now.isoformat(),
+        "collectionMode": "read_only_shadow",
+        "influencesForecast": False,
+        "providers": providers,
+        "summary": {
+            "configured": sum(row["state"] != "not_configured" for row in providers.values()),
+            "live": sum(row["state"] == "live_shadow" for row in providers.values()),
+            "degraded": sum(row["state"] == "degraded" for row in providers.values()),
+        },
+        "secretsIncluded": False,
+    }
+    with _SHADOW_LOCK:
+        _SHADOW_STATE.clear()
+        _SHADOW_STATE.update(deepcopy(result))
+    return result
+
+
+def provider_shadow_payload() -> dict[str, Any]:
+    """Return the latest in-memory snapshot without contacting a provider."""
+
+    with _SHADOW_LOCK:
+        result = deepcopy(_SHADOW_STATE)
+    now = datetime.now(timezone.utc)
+    freshness_counts = {"fresh": 0, "stale": 0, "unavailable": 0}
+    for provider in result.get("providers", {}).values():
+        checked_at = str(provider.get("checkedAt") or "")
+        try:
+            checked = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+            age_seconds = max(
+                0, int((now - checked.astimezone(timezone.utc)).total_seconds())
+            )
+        except (TypeError, ValueError):
+            age_seconds = None
+        if provider.get("state") != "live_shadow" or age_seconds is None:
+            freshness = "unavailable"
+        elif age_seconds <= SHADOW_STALE_AFTER_SECONDS:
+            freshness = "fresh"
+        else:
+            freshness = "stale"
+        provider["ageSeconds"] = age_seconds
+        provider["freshnessState"] = freshness
+        freshness_counts[freshness] += 1
+    result.setdefault("summary", {}).update(freshness_counts)
+    result["freshnessPolicy"] = {
+        "expectedCollectionIntervalSeconds": SHADOW_COLLECTION_INTERVAL_SECONDS,
+        "staleAfterSeconds": SHADOW_STALE_AFTER_SECONDS,
+        "evaluatedAt": now.isoformat(),
+    }
+    return result

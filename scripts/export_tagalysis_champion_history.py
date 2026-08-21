@@ -100,11 +100,20 @@ def _sha(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _sqlalchemy_url(value: str) -> str:
+    """Select the installed psycopg v3 dialect without logging the DSN."""
+    if value.startswith("postgres://"):
+        return "postgresql+psycopg://" + value[len("postgres://"):]
+    if value.startswith("postgresql://"):
+        return "postgresql+psycopg://" + value[len("postgresql://"):]
+    return value
+
+
 def export(destination: Path) -> dict[str, Any]:
     source_url = os.environ.get(SOURCE_ENVIRONMENT_VARIABLE, "").strip()
     if not source_url:
         raise RuntimeError("source_connection_not_configured")
-    engine = create_engine(source_url, pool_pre_ping=True)
+    engine = create_engine(_sqlalchemy_url(source_url), pool_pre_ping=True)
     rows: list[Mapping[str, Any]] = []
     proof: dict[str, Any] = {}
     try:
