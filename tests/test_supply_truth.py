@@ -9,6 +9,8 @@ from app.supply_truth import (
     SupplyTruthError,
     TAG_CONTRACT,
     TAG_TOTAL_SUPPLY,
+    COINGECKO_MARKETS_URL,
+    normalize_coingecko_markets_supply,
     verified_tag_supply_payload,
     verified_tag_supply_payload_from_cmc_and_gecko,
 )
@@ -79,9 +81,45 @@ def test_verified_supply_prefers_validated_nodereal_for_total_supply_only() -> N
     assert 'os.getenv("NODEREAL_BNB_RPC_URL")' in collector
     assert 'rpc_host.endswith(".nodereal.io")' in collector
     assert '"https://api.coingecko.com/api/v3/coins/tagger"' in collector
+    assert '"https://api.coingecko.com/api/v3/coins/markets"' in collector
+    assert "normalize_coingecko_markets_supply" in collector
     assert '"https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger"' in collector
     assert 'http_client.post(\n                supply_rpc_url' in collector
     assert '"totalSupplyRpcProvider": supply_rpc_provider' in collector
+
+
+def test_coingecko_markets_route_is_a_truth_preserving_rate_limit_fallback() -> None:
+    normalized = normalize_coingecko_markets_supply(
+        [
+            {
+                "id": "tagger",
+                "symbol": "tag",
+                "name": "TAGGER",
+                "circulating_supply": 108_864_805_114.17,
+                "total_supply": TAG_TOTAL_SUPPLY,
+                "last_updated": NOW.isoformat(),
+            }
+        ]
+    )
+    assert normalized["platforms"]["binance-smart-chain"] == TAG_CONTRACT
+    assert normalized["market_data"]["circulating_supply"] == pytest.approx(108_864_805_114.17)
+    assert normalized["_supply_source_url"] == COINGECKO_MARKETS_URL
+    payload = verified_tag_supply_payload(
+        coingecko=normalized,
+        coinmarketcap=_coinmarketcap(),
+        bsc_total_supply_hex=_hex_supply(),
+        retrieved_at=NOW,
+    )
+    reference = payload["sourceReference"]
+    assert '"coinGeckoSourceVariant":"coins_markets"' in reference
+    assert COINGECKO_MARKETS_URL in reference
+
+
+def test_coingecko_markets_fallback_rejects_wrong_asset_identity() -> None:
+    with pytest.raises(SupplyTruthError, match="canonical TAGGER"):
+        normalize_coingecko_markets_supply(
+            [{"id": "tagger", "symbol": "tag", "name": "Wrong token"}]
+        )
 
 
 def test_cmc_gecko_market_cap_price_fallback_is_forbidden() -> None:

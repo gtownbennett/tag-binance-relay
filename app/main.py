@@ -139,6 +139,7 @@ from app.tagnext_future_engine import (
 )
 from app.supply_truth import (
     SupplyTruthError,
+    normalize_coingecko_markets_supply,
     verified_tag_supply_payload,
 )
 from app.phase3_learning import (
@@ -2329,6 +2330,10 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
         supply_rpc_provider = "public-binance-bnb-readonly"
 
     async def collect() -> dict[str, Any]:
+        request_headers = {
+            "Accept": "application/json",
+            "User-Agent": "TAGneXt-RC4/1.0 (read-only supply verification)",
+        }
         coin_gecko_response, coin_market_cap_response, bsc_response = await asyncio.gather(
             http_client.get(
                 "https://api.coingecko.com/api/v3/coins/tagger",
@@ -2340,8 +2345,12 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
                     "developer_data": "false",
                     "sparkline": "false",
                 },
+                headers=request_headers,
             ),
-            http_client.get("https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger"),
+            http_client.get(
+                "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger",
+                headers=request_headers,
+            ),
             http_client.post(
                 supply_rpc_url,
                 json={
@@ -2361,13 +2370,24 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
         cmc_payload = cmc_document.get("data") if isinstance(cmc_document, dict) else {}
         bsc_total = (bsc_response.json() or {}).get("result")
         retrieved_at = terminal_utc_now()
-        if not coin_gecko_response.is_success:
-            raise SupplyTruthError(
-                "verified circulating supply unavailable: two compatible current authoritative "
-                f"sources are required; CoinGecko HTTP {coin_gecko_response.status_code}"
+        if coin_gecko_response.is_success:
+            coin_gecko_document = coin_gecko_response.json()
+        else:
+            coin_gecko_markets_response = await http_client.get(
+                "https://api.coingecko.com/api/v3/coins/markets",
+                params={"vs_currency": "usd", "ids": "tagger", "sparkline": "false"},
+                headers=request_headers,
+            )
+            if not coin_gecko_markets_response.is_success:
+                raise SupplyTruthError(
+                    "verified circulating supply unavailable: two compatible current authoritative "
+                    "sources are required; CoinGecko detail and markets routes unavailable"
+                )
+            coin_gecko_document = normalize_coingecko_markets_supply(
+                coin_gecko_markets_response.json()
             )
         payload = verified_tag_supply_payload(
-            coingecko=coin_gecko_response.json(),
+            coingecko=coin_gecko_document,
             coinmarketcap=cmc_payload,
             bsc_total_supply_hex=bsc_total,
             retrieved_at=retrieved_at,

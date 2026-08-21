@@ -10,10 +10,50 @@ TAG_CONTRACT = "0x208bf3e7da9639f1eaefa2de78c23396b0682025"
 TAG_TOTAL_SUPPLY = 405_380_800_000.0
 SUPPLY_SOURCE_MAX_AGE = timedelta(hours=2)
 MAX_CIRCULATING_SOURCE_DIVERGENCE = 0.005
+COINGECKO_DETAIL_URL = "https://api.coingecko.com/api/v3/coins/tagger"
+COINGECKO_MARKETS_URL = (
+    "https://api.coingecko.com/api/v3/coins/markets"
+    "?vs_currency=usd&ids=tagger&sparkline=false"
+)
 
 
 class SupplyTruthError(ValueError):
     pass
+
+
+def normalize_coingecko_markets_supply(document: Any) -> dict[str, Any]:
+    """Convert CoinGecko's lighter markets response into the canonical shape.
+
+    Render's shared egress IP can be rate-limited on the detailed coin route
+    while the provider's separately cached markets route remains available.
+    Both routes are CoinGecko observations; this preserves the independent
+    CoinGecko + CoinMarketCap requirement instead of weakening it.
+    """
+
+    rows = document if isinstance(document, list) else []
+    row = next(
+        (
+            item
+            for item in rows
+            if isinstance(item, Mapping)
+            and str(item.get("id") or "").lower() == "tagger"
+            and str(item.get("symbol") or "").lower() == "tag"
+            and str(item.get("name") or "").lower() == "tagger"
+        ),
+        None,
+    )
+    if row is None:
+        raise SupplyTruthError("CoinGecko markets response does not identify canonical TAGGER")
+    return {
+        "platforms": {"binance-smart-chain": TAG_CONTRACT},
+        "last_updated": row.get("last_updated"),
+        "market_data": {
+            "circulating_supply": row.get("circulating_supply"),
+            "total_supply": row.get("total_supply"),
+        },
+        "_supply_source_url": COINGECKO_MARKETS_URL,
+        "_supply_source_variant": "coins_markets",
+    }
 
 
 def _time(value: Any, field: str) -> datetime:
@@ -86,6 +126,8 @@ def verified_tag_supply_payload(
     if divergence > MAX_CIRCULATING_SOURCE_DIVERGENCE:
         raise SupplyTruthError("circulating-supply sources materially conflict")
 
+    coin_gecko_source_url = str(coingecko.get("_supply_source_url") or COINGECKO_DETAIL_URL)
+    coin_gecko_source_variant = str(coingecko.get("_supply_source_variant") or "coin_detail")
     source_reference = json.dumps(
         {
             "method": "CoinGecko circulating estimate cross-checked against CoinMarketCap and BSC totalSupply",
@@ -95,10 +137,11 @@ def verified_tag_supply_payload(
             "circulatingDivergencePct": round(divergence * 100, 6),
             "bscTotalSupply": on_chain_total,
             "coinGeckoUpdatedAt": cg_timestamp.isoformat(),
+            "coinGeckoSourceVariant": coin_gecko_source_variant,
             "coinMarketCapUpdatedAt": cmc_timestamp.isoformat(),
             "retrievedAt": retrieved.isoformat(),
             "sources": [
-                "https://api.coingecko.com/api/v3/coins/tagger",
+                coin_gecko_source_url,
                 "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger",
                 "https://bsc-dataseed.binance.org/ eth_call totalSupply",
             ],
@@ -122,7 +165,7 @@ def verified_tag_supply_payload(
                 "source": "CoinGecko",
                 "verifiedCirculatingSupplyTokens": cg_circulating,
                 "observedAt": cg_timestamp.isoformat(),
-                "url": "https://api.coingecko.com/api/v3/coins/tagger",
+                "url": coin_gecko_source_url,
             },
             {
                 "source": "CoinMarketCap",
