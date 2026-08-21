@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -58,6 +59,15 @@ def test_cross_checked_current_supply_is_provenance_bearing_and_verified() -> No
     assert payload["verifiedCirculatingSupplyTokens"] == pytest.approx(108_864_805_114.17)
     assert payload["totalSupplyTokens"] == TAG_TOTAL_SUPPLY
     assert "circulatingDivergencePct" in payload["sourceReference"]
+
+
+def test_tagnext_startup_runs_bounded_verified_supply_independently() -> None:
+    source = (Path(__file__).parents[1] / "app" / "main.py").read_text(encoding="utf-8")
+    lifespan = source[source.index("async def lifespan"):source.index("app = FastAPI")]
+    assert 'name="tagnext-startup-verified-supply"' in lifespan
+    assert "collect_verified_tag_supply_once()" in lifespan
+    assert 'SYSTEM_ID == "tagnext"' in lifespan
+    assert "startup_supply_task.cancel()" in lifespan
 
 
 def test_cmc_gecko_market_cap_price_fallback_is_forbidden() -> None:

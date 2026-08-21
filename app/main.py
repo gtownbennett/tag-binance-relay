@@ -2906,6 +2906,17 @@ async def lifespan(_: FastAPI):
         if automatic_live_work and SERVER_JOBS_ENABLED
         else None
     )
+    # Current circulating-supply truth is a prerequisite for owner-facing
+    # market cap.  Run its existing bounded, cross-checked collector independently
+    # of a potentially long durable-job backlog on a newly provisioned challenger.
+    startup_supply_task = (
+        asyncio.create_task(
+            collect_verified_tag_supply_once(),
+            name="tagnext-startup-verified-supply",
+        )
+        if automatic_live_work and SYSTEM_ID == "tagnext"
+        else None
+    )
     cost_usage_task = asyncio.create_task(
         cost_usage_refresh_loop(http_client),
         name="tagalysis-daily-cost-usage-refresh",
@@ -2926,10 +2937,15 @@ async def lifespan(_: FastAPI):
             grader_task.cancel()
         if phase1_task is not None:
             phase1_task.cancel()
+        if startup_supply_task is not None:
+            startup_supply_task.cancel()
         cost_usage_task.cancel()
         tasks = [
             task
-            for task in (market_task, depth_task, grader_task, phase1_task, cost_usage_task)
+            for task in (
+                market_task, depth_task, grader_task, phase1_task,
+                startup_supply_task, cost_usage_task,
+            )
             if task is not None
         ]
         await asyncio.gather(
