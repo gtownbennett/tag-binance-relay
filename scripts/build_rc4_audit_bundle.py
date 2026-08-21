@@ -998,6 +998,7 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
             "render-tagnext-service.json",
             "render-tagnext-deploy-latest.json",
             "render-tagnext-deploy-request.json",
+            "render-inventory-sanitized-latest.json",
         ):
             _add_file(
                 archive,
@@ -1005,6 +1006,28 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
                 backend / "outputs" / "rc4" / deployment_evidence,
                 checksums,
             )
+        legacy_backup_root = (
+            workspace / "work" / "private_backups" / "tag-terminal-v260-test-db"
+            / "20260821T180453Z"
+        )
+        _add_file(
+            archive,
+            "reports/tag-terminal-v260-backup/BACKUP_MANIFEST.json",
+            legacy_backup_root / "BACKUP_MANIFEST.json",
+            checksums,
+        )
+        _add_file(
+            archive,
+            "reports/tag-terminal-v260-backup/FULL_EXTRACTION_VERIFICATION.json",
+            legacy_backup_root / "FULL_EXTRACTION_VERIFICATION.json",
+            checksums,
+        )
+        _add_file(
+            archive,
+            "reports/tag-terminal-v260-backup/SHA256SUMS.txt",
+            legacy_backup_root / "SHA256SUMS.txt",
+            checksums,
+        )
         _add_file(archive, "reports/RC4_RELEASE_AND_PROMOTION_POLICY.md", backend / "RC4_RELEASE_AND_PROMOTION_POLICY.md", checksums)
         _add_file(archive, "reports/CHADTAG_ISOLATION_20260820.md", backend / "outputs/rc4/chadtag-isolation-20260820.md", checksums)
         _add_file(archive, "reports/FINAL_DEVICE_INSTALL_20260820.md", backend / "outputs/rc4/final-device-install-20260820.md", checksums)
