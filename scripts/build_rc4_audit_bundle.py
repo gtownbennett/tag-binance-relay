@@ -358,6 +358,9 @@ def main() -> int:
     counts = _counts()
     health = _health(args.health_json.resolve() if args.health_json else None)
     provider_runtime = json.loads(provider_runtime_path.read_text(encoding="utf-8"))
+    live_validation_root = backend / "outputs" / "rc4" / "render-live-validation"
+    live_validation_summary_path = live_validation_root / "SUMMARY.json"
+    live_validation = json.loads(live_validation_summary_path.read_text(encoding="utf-8"))
     inventory = _inventory()
     provider_registry = _rows("SELECT * FROM tagnext_provider_registry ORDER BY provider_id")
     provider_coverage = _rows("SELECT * FROM tagnext_provider_coverage ORDER BY provider_id")
@@ -383,6 +386,11 @@ def main() -> int:
         and provider_checks.get("readOnly")
         and provider_checks.get("zeroForecastInfluence")
         and provider_checks.get("noSecretsInPayload")
+        and live_validation.get("validationPassed")
+        and (live_validation.get("providers") or {}).get("live") == 2
+        and (live_validation.get("providers") or {}).get("fresh") == 2
+        and (live_validation.get("verifiedSupply") or {}).get("sourceCount", 0) >= 2
+        and (live_validation.get("verifiedSupply") or {}).get("providerReportedMarketCapExcluded") is True
     )
 
     hard_blockers = []
@@ -468,7 +476,7 @@ The final Predictions correction was validated in strict local repair mode with
 background jobs, live collectors, deterministic grading, backfill, paid AI, and
 push disabled. No champion connection was inherited by that validation process.
 
-Backend tests: 308 passed, 4 skipped. The four exact skips are preserved in
+Backend tests: 313 passed, 4 skipped. The four exact skips are preserved in
 `tests/backend/backend-skipped-tests-exact.log`; every skip protects a Phase 6
 warehouse that is an external artifact rather than a Git-tracked CI fixture.
 
@@ -499,11 +507,17 @@ The Android chart is a native interactive candlestick/volume view for the
 canonical TAG/WBNB pool, with 5m/15m/1h/4h/1d timeframes, pan, pinch zoom,
 candle selection, MA20, VWAP, and saved-portfolio valuation.
 
-NodeReal and Coinalyze run through a 15-minute read-only shadow collector. The
+NodeReal and Coinalyze run through a 15-minute read-only shadow collector on the
+isolated deployed challenger. The
 authenticated evidence API reports live and freshness separately; stale success
 cannot appear current. Their live runtime integration proof is
 `providers/provider-runtime-integration-final-20260821.json`. Forecast influence
 remains exactly zero.
+
+Verified supply is live and fail-closed: CoinGecko and CoinMarketCap agree within
+the committed tolerance, NodeReal independently verifies the canonical contract's
+totalSupply, and circulating market cap is computed only as verified circulating
+supply × current USD price. Provider-reported market-cap/FDV fields are excluded.
 
 Device status: {args.device_state}. On-device acceptance covered the outer and
 inner displays, populated decision/intelligence surfaces, portfolio math,
@@ -559,7 +573,7 @@ compression driven primarily by price, not a 24.8% token-OI liquidation.
 - Public popularity coverage: {counts['popularity_complete_sources']}/{counts['valid_source_records']}.
 - Valid nonpositive targets: {counts['accepted_nonpositive_targets']}.
 - Real background scheduler proof: passed.
-- Backend tests: 308 passed; four deliberate external-artifact skips documented.
+- Backend tests: 313 passed; four deliberate external-artifact skips documented.
 - Android tests: 79 Gradle/JVM plus 56 source-contract tests passed; validation APK built.
 - NodeReal and Coinalyze fresh runtime gate: {'passed' if providers_passed else 'not passed'}.
 - Deployed challenger health/app-data gate: {args.deployment_state}.
@@ -757,35 +771,26 @@ or backdate evidence. Archive state: `{gate_state}`.
 Deployment state captured for this archive: `{args.deployment_state}`. No paid
 resource or plan upgrade was created.
 
-## Owner option A — preview only, $0 baseline
+## Current RC4 preview — $0 incremental baseline
 
-Render Free web service plus an existing eligible Neon Free project can cost $0,
-but Render sleeps after 15 minutes idle and therefore is not always-on. Neon Free
-includes 100 CU-hours/project and 0.5 GB storage. Suitable for preview, not the
-always-on gate.
+RC4 uses a new isolated Render Free web service and a new isolated 1 GB Render
+Free Postgres database. TAGalysis's Neon project was not changed, so incremental
+Neon cost is $0. The web service sleeps after 15 minutes idle. The free database
+expires 30 days after creation, has no managed backup/PITR, and then has a 14-day
+upgrade grace period before deletion. This is a validated preview, not durable
+production hosting.
 
-## Owner option B — smallest always-on challenger, about $27.23/month baseline
+## Smallest durable always-on challenger — about $13/month baseline
 
-- Render Starter 0.5 CPU/512 MB web service: $7/month.
-- Neon Launch at a continuously active 0.25 CU minimum: 187.5 CU-hours ×
-  $0.106 = $19.875/month.
-- 1 GB Neon storage: $0.35/month.
-- Baseline total: $27.225/month, rounded to $27.23, before history storage,
-  branch-hours, usage above the assumed compute floor, or bandwidth overages.
-
-Neon can scale to zero after five minutes if always-on database wake latency is
-acceptable, reducing compute below that ceiling. A separate Neon project is
-required for challenger write isolation; TAGalysis remains read-only.
-
-## Owner option C — more application headroom, about $45.23/month baseline
-
-Render Standard 1 CPU/2 GB at $25/month plus the same 0.25-CU always-on Neon
-Launch assumption ($20.225 including 1 GB storage) totals about $45.23/month.
+Render's July 2026 cost snapshot lists an always-on Starter web service plus a
+Basic-256mb Postgres instance at about $13/month before bandwidth, storage growth,
+and build-pipeline overages. No upgrade has been performed. Neon remains unchanged
+and adds $0 unless the owner later chooses a separate Neon challenger database.
 
 Pricing sources checked 2026-08-20:
 - https://render.com/pricing
 - https://render.com/docs/free
-- https://neon.com/pricing
+- https://render.com/articles/how-much-does-cloud-application-hosting-cost-for-small-businesses
 
 Actual billing depends on compute autoscaling, storage/WAL history, extra branches,
 egress, and workspace plan. This RC4 uses only the already-authorized free preview
@@ -821,7 +826,8 @@ was created. Credentials remain excluded.
   only after deployed fresh-state proof. The bounded header-authenticated collector
   found exact TAG/USDT perpetuals and current OI/funding. Missing per-market values
   and liquidation rows remain unavailable and no heatmap is inferred. Funding is
-  converted from provider decimal units to percent exactly once in the UI.
+  exposed by the provider in percentage-point units and displayed without an
+  erroneous second ×100 conversion.
 - Sources: https://coinalyze.net/tagger/funding-rate/,
   https://coinalyze.net/tagger/liquidations/,
   https://api.coinalyze.net/v1/doc/
@@ -963,12 +969,14 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
 
         _add_file(archive, "apk/TAGneXt-0.9.0-rc4-validation.apk", apk, checksums)
         _add_file(archive, "exports/TAGneXt_FULL_BRAIN_RC4.zip", brain, checksums)
-        _add_file(archive, "tests/backend/backend-pytest-final.xml", backend / "outputs/rc4/backend-pytest-provider-final-20260821.xml", checksums)
+        _add_file(archive, "tests/backend/backend-pytest-final.xml", backend / "outputs/rc4/backend-pytest-final-live-20260821.xml", checksums)
+        _add_file(archive, "tests/backend/backend-pytest-final.log", backend / "outputs/rc4/backend-test-final-live.log", checksums)
         _add_file(archive, "tests/backend/backend-skipped-tests-exact.log", backend / "outputs/rc4/backend-skipped-tests-exact-final-authorized.log", checksums)
         _add_file(archive, "tests/backend/rc4-scheduler-proof-final.json", backend / "outputs/rc4/scheduler-proof-final.json", checksums)
         _add_file(archive, "tests/android/android-gradle-final-authorized.log", android / "outputs/rc4/android-gradle-final-authorized.log", checksums)
         _add_file(archive, "tests/android/android-gradle-device-lan-final.log", android / "outputs/rc4/android-gradle-device-lan-final.log", checksums)
         _add_file(archive, "tests/android/android-gradle-stable-signed-final.log", android / "outputs/rc4/android-gradle-stable-signed-final.log", checksums)
+        _add_file(archive, "tests/android/android-gradle-tests-final-live.log", android / "outputs/rc4/android-gradle-tests-final-live.log", checksums)
         _add_file(archive, "tests/android/android-source-contracts-final-authorized.log", android / "outputs/rc4/android-source-contracts-final-authorized.log", checksums)
         _add_file(archive, "tests/android/android-source-contracts-final-authorized.xml", android / "outputs/rc4/android-source-contracts-final-authorized.xml", checksums)
         _add_file(archive, "tests/android/android-test-summary-final-authorized.json", android / "outputs/rc4/android-test-summary-final-authorized.json", checksums)
@@ -979,6 +987,24 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
         _add_file(archive, "providers/credential-validation-final-20260821.json", backend / "outputs/rc4/provider-credential-validation-final-20260821.json", checksums)
         _add_file(archive, "providers/provider-runtime-live-final-20260821.json", backend / "outputs/rc4/provider-runtime-live-final-20260821.json", checksums)
         _add_file(archive, "providers/provider-runtime-integration-final-20260821.json", provider_runtime_path, checksums)
+        for live_path in sorted(live_validation_root.glob("*.json")):
+            _add_file(
+                archive,
+                f"runtime/render-live-validation/{live_path.name}",
+                live_path,
+                checksums,
+            )
+        for deployment_evidence in (
+            "render-tagnext-service.json",
+            "render-tagnext-deploy-latest.json",
+            "render-tagnext-deploy-request.json",
+        ):
+            _add_file(
+                archive,
+                f"runtime/render-deployment/{deployment_evidence}",
+                backend / "outputs" / "rc4" / deployment_evidence,
+                checksums,
+            )
         _add_file(archive, "reports/RC4_RELEASE_AND_PROMOTION_POLICY.md", backend / "RC4_RELEASE_AND_PROMOTION_POLICY.md", checksums)
         _add_file(archive, "reports/CHADTAG_ISOLATION_20260820.md", backend / "outputs/rc4/chadtag-isolation-20260820.md", checksums)
         _add_file(archive, "reports/FINAL_DEVICE_INSTALL_20260820.md", backend / "outputs/rc4/final-device-install-20260820.md", checksums)
@@ -1008,6 +1034,15 @@ The immutable RC3 archive itself remains outside this RC4 archive at SHA-256:
                         )
                     elif device_passed:
                         raise FileNotFoundError(evidence_path)
+        final_device_root = android / "outputs" / "rc4" / "device-final"
+        for evidence_path in sorted(final_device_root.glob("*")):
+            if evidence_path.is_file():
+                _add_file(
+                    archive,
+                    f"device/final-live/{evidence_path.name}",
+                    evidence_path,
+                    checksums,
+                )
         _add_file(archive, "forensics/TAGNEXT_AUGUST15_FORENSIC_CORRECTED.json", workspace / "work/final_validation/forensics/TAGNEXT_AUGUST15_FORENSIC_CORRECTED.json", checksums)
         _add_file(archive, "forensics/TAGUSDT-metrics-2026-08-15.zip", workspace / "work/final_validation/forensics/TAGUSDT-metrics-2026-08-15.zip", checksums)
         _add_file(archive, "grading/champion-import-pairing-comparison.json", champion_gate, checksums)
