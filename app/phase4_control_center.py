@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 
 from app.canonical_forecast import (
     ForecastValidationError,
@@ -182,25 +182,87 @@ def _canonical_market_truth() -> dict[str, Any]:
     }
 
 
-def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[str, Any]:
-    """One read-only Phase 4 payload; it never creates forecasts, grades, alerts, or levels."""
+def canonical_control_center_snapshot(
+    *,
+    now: datetime | None = None,
+    detail: bool = False,
+) -> dict[str, Any]:
+    """Read-only Phase 4 payload with a compact-by-default phone contract.
+
+    The ordinary refresh returns only the active forecast envelope and ten
+    active alerts. The bounded detail form is available only when a user opens
+    the Forecast screen; neither form creates forecasts, grades, alerts, or
+    levels.
+    """
     observed_now = _aware(now or utc_now())
     with session_scope() as session:
-        forecast_rows = session.scalars(
-            select(CanonicalForecastRow)
+        ranked_forecasts = (
+            select(
+                CanonicalForecastRow.forecast_id.label("forecast_id"),
+                func.row_number()
+                .over(
+                    partition_by=(
+                        CanonicalForecastRow.producer,
+                        CanonicalForecastRow.horizon,
+                    ),
+                    order_by=CanonicalForecastRow.issued_at.desc(),
+                )
+                .label("recency_rank"),
+            )
             .where(
                 CanonicalForecastRow.producer.in_(CONTROL_CENTER_PRODUCERS),
                 CanonicalForecastRow.horizon.in_(CONTROL_CENTER_HORIZONS),
                 CanonicalForecastRow.status.not_in(("invalid", "rejected")),
             )
+            .subquery()
+        )
+        forecast_rows = session.scalars(
+            select(CanonicalForecastRow)
+            .join(
+                ranked_forecasts,
+                ranked_forecasts.c.forecast_id == CanonicalForecastRow.forecast_id,
+            )
+            .where(ranked_forecasts.c.recency_rank <= (2 if detail else 1))
             .order_by(
                 CanonicalForecastRow.producer,
                 CanonicalForecastRow.horizon,
                 CanonicalForecastRow.issued_at.desc(),
             )
         ).all()
-        grade_rows = session.scalars(
-            select(CanonicalForecastGradeRow).where(
+        forecast_ids = [row.forecast_id for row in forecast_rows]
+        live_grade_rows = (
+            session.scalars(
+                select(CanonicalForecastGradeRow).where(
+                    CanonicalForecastGradeRow.evaluation_kind == "live",
+                    CanonicalForecastGradeRow.forecast_id.in_(forecast_ids),
+                )
+            ).all()
+            if forecast_ids
+            else []
+        )
+        grade_report_rows = session.execute(
+            select(
+                CanonicalForecastGradeRow.producer,
+                CanonicalForecastGradeRow.horizon,
+                CanonicalForecastGradeRow.evaluation_kind,
+                func.count(CanonicalForecastGradeRow.grade_id).label("total_grades"),
+                func.sum(
+                    case(
+                        (CanonicalForecastGradeRow.independent_sample.is_(True), 1),
+                        else_=0,
+                    )
+                ).label("independent_samples"),
+                func.avg(
+                    case(
+                        (
+                            CanonicalForecastGradeRow.independent_sample.is_(True),
+                            CanonicalForecastGradeRow.composite_score,
+                        ),
+                        else_=None,
+                    )
+                ).label("composite_mean"),
+            )
+            .where(
                 CanonicalForecastGradeRow.producer.in_(
                     (
                         FORECAST_PRODUCER,
@@ -213,6 +275,16 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
                     )
                 )
             )
+            .group_by(
+                CanonicalForecastGradeRow.producer,
+                CanonicalForecastGradeRow.horizon,
+                CanonicalForecastGradeRow.evaluation_kind,
+            )
+            .order_by(
+                CanonicalForecastGradeRow.producer,
+                CanonicalForecastGradeRow.horizon,
+                CanonicalForecastGradeRow.evaluation_kind,
+            )
         ).all()
 
     by_key: dict[tuple[str, str], list[CanonicalForecastRow]] = defaultdict(list)
@@ -220,8 +292,8 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
         by_key[(row.producer, row.horizon)].append(row)
     live_grade_by_forecast = {
         row.forecast_id: row
-        for row in grade_rows
-        if row.evaluation_kind == "live" and row.forecast_id
+        for row in live_grade_rows
+        if row.forecast_id
     }
     forecasts: list[dict[str, Any]] = []
     invalid_forecast_count = 0
@@ -292,6 +364,7 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
         == "deterministic-final-call"
     )
     active = final_call if final_call_valid else tagalysis
+    response_forecasts = forecasts if detail else ([active] if active else [])
     message = None
     if tagalysis and chad is None:
         message = CHAD_PENDING_MESSAGE
@@ -308,9 +381,29 @@ def canonical_control_center_snapshot(*, now: datetime | None = None) -> dict[st
             "message": message,
             "finalCallEligible": final_call_valid,
         },
-        "forecasts": forecasts,
-        "gradeReports": _grade_reports(grade_rows),
-        "alerts": active_alerts(limit=50),
+        "forecasts": response_forecasts,
+        "gradeReports": [
+            {
+                "producer": row.producer,
+                "horizon": row.horizon,
+                "evaluationKind": row.evaluation_kind,
+                "totalGrades": int(row.total_grades or 0),
+                "independentSamples": int(row.independent_samples or 0),
+                "minimumIndependentSamples": HORIZON_MINIMUM_SAMPLES[row.horizon],
+                "state": (
+                    "STILL LEARNING"
+                    if int(row.independent_samples or 0) < HORIZON_MINIMUM_SAMPLES[row.horizon]
+                    else "REPORT READY"
+                ),
+                "compositeMean": (
+                    round(float(row.composite_mean), 4)
+                    if row.composite_mean is not None
+                    else None
+                ),
+            }
+            for row in grade_report_rows
+        ],
+        "alerts": active_alerts(limit=50 if detail else 10),
         "marketCapLevels": current_user_levels(seed_defaults=False),
         "marketTruth": _canonical_market_truth(),
         "historicalProduction": historical_production_summary(),

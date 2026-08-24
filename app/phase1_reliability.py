@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import case, or_, select
+from sqlalchemy import case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .terminal_database import (
@@ -48,6 +48,112 @@ SOURCE_PRIORITY_NUMBER = {
 FRESH_SECONDS = 90
 STALE_SECONDS = 300
 VALID_HELPER_ORIGINS = {"android", "windows"}
+MAX_PERSISTED_SERVER_JOB_RESULT_BYTES = 32_768
+
+
+def _job_summary_select():
+    """Select only queue metadata; never hydrate payload/result TOAST columns."""
+
+    return select(
+        ServerJobRow.job_id,
+        ServerJobRow.job_type,
+        ServerJobRow.idempotency_key,
+        ServerJobRow.origin,
+        ServerJobRow.status,
+        ServerJobRow.attempts,
+        ServerJobRow.max_attempts,
+        ServerJobRow.available_at,
+    )
+
+
+def _job_summary_values(row: Any, *, deduplicated: bool) -> dict[str, Any]:
+    return {
+        "jobId": row.job_id,
+        "jobType": row.job_type,
+        "idempotencyKey": row.idempotency_key,
+        "origin": row.origin,
+        "status": row.status,
+        "attempts": row.attempts,
+        "maxAttempts": row.max_attempts,
+        "availableAt": row.available_at.isoformat(),
+        "deduplicated": deduplicated,
+    }
+
+
+def _persisted_job_result(job_type: str, result: dict[str, Any]) -> str:
+    """Keep queue observability without duplicating multi-megabyte durable data.
+
+    Historical maintenance persists its authoritative artifacts in dedicated
+    tables. Repeating the same complete episode payload in ``server_jobs``
+    created a multi-megabyte TOAST value which the old idempotency lookup then
+    transferred every five seconds. Preserve a hash and operational summary;
+    never rewrite earlier queue history.
+    """
+
+    serialized = json_dumps(result)
+    encoded = serialized.encode("utf-8")
+    if (
+        job_type != "maintain_historical_memory"
+        or len(encoded) <= MAX_PERSISTED_SERVER_JOB_RESULT_BYTES
+    ):
+        return serialized
+    automatic = result.get("automaticDetection")
+    known = result.get("knownEpisodes")
+    event_report = result.get("eventReport")
+    archive_catch_up = result.get("archiveCatchUp")
+    compact = {
+        "schemaVersion": "server-job-result-summary-v1",
+        "jobType": job_type,
+        "fullResultPersistedElsewhere": True,
+        "originalBytes": len(encoded),
+        "originalSha256": hashlib.sha256(encoded).hexdigest(),
+        "coverageReportId": result.get("coverageReportId"),
+        "totalHistoricalRows": result.get("totalHistoricalRows"),
+        "automaticDetection": (
+            {
+                key: automatic.get(key)
+                for key in (
+                    "detected",
+                    "stored",
+                    "deduplicated",
+                    "skipped",
+                    "sourceDataThrough",
+                    "detectionCheckpointEnd",
+                )
+                if key in automatic
+            }
+            if isinstance(automatic, dict)
+            else None
+        ),
+        "knownEpisodeCount": len(known) if isinstance(known, list) else 0,
+        "eventReport": (
+            {
+                key: event_report.get(key)
+                for key in (
+                    "totalEvents",
+                    "familyCounts",
+                    "breakouts",
+                    "breakdowns",
+                    "panicCapitulation",
+                    "athLocalHigh",
+                )
+                if key in event_report
+            }
+            if isinstance(event_report, dict)
+            else None
+        ),
+        "archiveCatchUp": (
+            {
+                key: archive_catch_up.get(key)
+                for key in ("enabled", "paidAiCalls")
+                if key in archive_catch_up
+            }
+            if isinstance(archive_catch_up, dict)
+            else None
+        ),
+        "paidAiCalls": result.get("paidAiCalls", 0),
+    }
+    return json_dumps(compact)
 
 
 def _stable_json(value: Any) -> str:
@@ -627,11 +733,11 @@ def enqueue_job(
 ) -> dict[str, Any]:
     now = utc_now()
     with session_scope() as session:
-        existing = session.scalar(
-            select(ServerJobRow).where(ServerJobRow.idempotency_key == idempotency_key)
-        )
+        existing = session.execute(
+            _job_summary_select().where(ServerJobRow.idempotency_key == idempotency_key)
+        ).one_or_none()
         if existing is not None:
-            return _job_summary(existing, deduplicated=True)
+            return _job_summary_values(existing, deduplicated=True)
         row = ServerJobRow(
             job_id=f"job_{uuid.uuid4().hex}",
             job_type=job_type,
@@ -652,12 +758,12 @@ def enqueue_job(
             session.flush()
         except IntegrityError:
             session.rollback()
-            existing = session.scalar(
-                select(ServerJobRow).where(ServerJobRow.idempotency_key == idempotency_key)
-            )
+            existing = session.execute(
+                _job_summary_select().where(ServerJobRow.idempotency_key == idempotency_key)
+            ).one_or_none()
             if existing is None:
                 raise
-            return _job_summary(existing, deduplicated=True)
+            return _job_summary_values(existing, deduplicated=True)
         return _job_summary(row, deduplicated=False)
 
 
@@ -775,15 +881,23 @@ def claim_due_job(*, worker_id: str, lock_seconds: int = 120) -> dict[str, Any] 
 def complete_job(job_id: str, result: dict[str, Any]) -> None:
     now = utc_now()
     with session_scope() as session:
-        row = session.get(ServerJobRow, job_id)
-        if row is None:
+        job_type = session.scalar(
+            select(ServerJobRow.job_type).where(ServerJobRow.job_id == job_id)
+        )
+        if job_type is None:
             return
-        row.status = "completed"
-        row.updated_at = now
-        row.locked_by = None
-        row.locked_until = None
-        row.result_json = json_dumps(result)
-        row.last_error = None
+        session.execute(
+            update(ServerJobRow)
+            .where(ServerJobRow.job_id == job_id)
+            .values(
+                status="completed",
+                updated_at=now,
+                locked_by=None,
+                locked_until=None,
+                result_json=_persisted_job_result(str(job_type), result),
+                last_error=None,
+            )
+        )
 
 
 def fail_job(job_id: str, error: BaseException) -> None:

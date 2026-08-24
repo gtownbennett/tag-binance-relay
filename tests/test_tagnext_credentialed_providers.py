@@ -220,11 +220,11 @@ def test_runtime_shadow_payload_marks_old_success_stale() -> None:
     )
 
 
-def test_authenticated_provider_route_has_bounded_first_read_refresh() -> None:
+def test_authenticated_provider_route_never_turns_an_ordinary_read_into_collection() -> None:
     source = (Path(__file__).parents[1] / "app" / "main.py").read_text(encoding="utf-8")
     route = source[source.index('@app.get("/v1/tagnext/providers/live")'):]
     route = route[:route.index('@app.get("/v1/tagnext/discovery/inventory")')]
     assert 'require_relay_key(x_relay_key)' in route
-    assert 'if not latest.get("checkedAt")' in route
-    assert 'await asyncio.to_thread(collect_provider_shadow_snapshot)' in route
-    assert 'provider_shadow_payload()' in route
+    assert 'cached_thread_read(' in route
+    assert 'provider_shadow_payload' in route
+    assert 'collect_provider_shadow_snapshot' not in route

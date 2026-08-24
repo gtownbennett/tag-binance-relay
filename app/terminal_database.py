@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -2385,6 +2386,28 @@ class TagNextExportRunRow(Base):
 connect_args: dict[str, Any] = {}
 if DATABASE_URL.startswith("sqlite"):
     connect_args["check_same_thread"] = False
+else:
+    statement_timeout_ms = min(
+        120_000,
+        max(5_000, int(os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "30000"))),
+    )
+    lock_timeout_ms = min(
+        30_000,
+        max(1_000, int(os.getenv("DATABASE_LOCK_TIMEOUT_MS", "5000"))),
+    )
+    connect_args.update(
+        {
+            "application_name": os.getenv(
+                "DATABASE_APPLICATION_NAME",
+                "tag-market-relay",
+            )[:63],
+            "options": (
+                f"-c statement_timeout={statement_timeout_ms} "
+                f"-c lock_timeout={lock_timeout_ms} "
+                "-c idle_in_transaction_session_timeout=60000"
+            ),
+        }
+    )
 
 engine_options: dict[str, Any] = {
     "pool_pre_ping": True,

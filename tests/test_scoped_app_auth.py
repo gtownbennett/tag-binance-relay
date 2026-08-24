@@ -21,6 +21,31 @@ def test_scoped_app_token_can_read_authenticated_tagnext_routes() -> None:
     assert response.json()["ok"] is True
 
 
+def test_authenticated_read_supports_etag_and_zero_body_refresh() -> None:
+    with (
+        patch.object(main, "RELAY_TOKEN", "full-relay-token"),
+        patch.object(main, "TAGNEXT_APP_READ_TOKEN", "phone-read-token"),
+        TestClient(main.app) as client,
+    ):
+        first = client.get(
+            "/v1/tagnext/identity",
+            headers={"X-Relay-Key": "phone-read-token"},
+        )
+        etag = first.headers.get("etag")
+        second = client.get(
+            "/v1/tagnext/identity",
+            headers={
+                "X-Relay-Key": "phone-read-token",
+                "If-None-Match": etag or "",
+            },
+        )
+    assert first.status_code == 200
+    assert etag and first.headers.get("last-modified")
+    assert first.headers.get("x-response-uncompressed-bytes") == str(len(first.content))
+    assert second.status_code == 304
+    assert second.content == b""
+
+
 def test_scoped_app_token_is_denied_before_every_mutation_route() -> None:
     with (
         patch.object(main, "RELAY_TOKEN", "full-relay-token"),

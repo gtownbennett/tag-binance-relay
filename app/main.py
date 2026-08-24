@@ -10,6 +10,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from email.utils import formatdate
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -166,11 +167,11 @@ from app.phase3_learning import (
 )
 from app.phase4_control_center import canonical_control_center_snapshot
 from app.historical_memory import (
-    build_coverage_report,
     chad_history_evidence_package,
     historical_event_report,
     historical_maintenance,
     historical_production_summary,
+    latest_persisted_coverage_report,
 )
 from app.forecast_research import production_research_watermark, run_bounded_production_research
 from app.predictive_tournament import persist_bounded_predictive_study
@@ -232,7 +233,8 @@ import httpx
 import websockets
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
 SERVICE_VERSION = "tagnext-0.9.0-rc4"
@@ -319,6 +321,7 @@ phase1_state: dict[str, Any] = {
     "coalescedRequests": 0,
 }
 phase1_coalescer = AsyncCoalescingCache()
+conditional_last_modified: dict[str, str] = {}
 prediction_ledger = PredictionLedger(
     LEDGER_DB_PATH,
     database_url=TERMINAL_DATABASE_URL,
@@ -590,6 +593,27 @@ stream_state: dict[str, Any] = {
 def utc_iso(ms: int | None = None) -> str:
     timestamp = (ms / 1000) if ms is not None else time.time()
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+async def cached_thread_read(
+    cache_key: str,
+    ttl_seconds: float,
+    operation: Any,
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Coalesce identical read models and retain bounded in-memory snapshots."""
+
+    async def run() -> Any:
+        return await asyncio.to_thread(operation, *args, **kwargs)
+
+    value, _ = await phase1_coalescer.run(
+        f"read-model:{cache_key}",
+        run,
+        ttl_seconds=ttl_seconds,
+    )
+    return value
 
 
 def _parse_time_for_api(value: Any) -> datetime | None:
@@ -2723,16 +2747,60 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"Unsupported server job type: {job_type}")
 
 
+async def _drain_due_phase1_jobs(worker_id: str) -> None:
+    """Claim due work frequently without rebuilding the durable schedule."""
+
+    processed = 0
+    while processed < 20:
+        job = await asyncio.to_thread(
+            claim_due_job,
+            worker_id=worker_id,
+            lock_seconds=max(120, COLLECT_SECONDS),
+        )
+        if job is None:
+            break
+        try:
+            phase1_state["activeJob"] = {
+                "jobId": job["jobId"], "jobType": job["jobType"], "startedAt": utc_iso(),
+            }
+            result = await _run_claimed_phase1_job(job)
+            await asyncio.to_thread(complete_job, job["jobId"], result)
+            phase1_state["lastCompletedJob"] = {
+                "jobId": job["jobId"],
+                "jobType": job["jobType"],
+                "completedAt": utc_iso(),
+            }
+            phase1_state["lastError"] = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await asyncio.to_thread(fail_job, job["jobId"], exc)
+            phase1_state["lastError"] = f"{type(exc).__name__}: {str(exc)[:500]}"
+        finally:
+            phase1_state["activeJob"] = None
+        processed += 1
+
+
 async def phase1_job_loop() -> None:
     """Run persistent, idempotent jobs and catch up expired work after wake."""
 
     worker_id = f"render:{BUILD_ID}:{uuid.uuid4().hex[:12]}"
+    last_schedule_bucket: int | None = None
     phase1_state["running"] = True
     try:
         await asyncio.sleep(2)
         while True:
             phase1_state["lastRunAt"] = utc_iso()
             try:
+                # Exact-deadline jobs are already durable. Claim them at the
+                # short worker cadence, but rebuild periodic bucket keys only
+                # once per five-minute scheduling window. The previous loop
+                # repeated every idempotency lookup every five seconds.
+                schedule_bucket = int(time.time()) // 300
+                if schedule_bucket == last_schedule_bucket:
+                    await _drain_due_phase1_jobs(worker_id)
+                    await asyncio.sleep(SERVER_JOB_POLL_SECONDS)
+                    continue
                 await asyncio.to_thread(
                     schedule_current_evidence_job,
                     interval_seconds=COLLECT_SECONDS,
@@ -2889,35 +2957,8 @@ async def phase1_job_loop() -> None:
                     payload={"bucket": prospective_bucket, "priority": "after-live-grading"},
                     max_attempts=2,
                 )
-                processed = 0
-                while processed < 20:
-                    job = await asyncio.to_thread(
-                        claim_due_job,
-                        worker_id=worker_id,
-                        lock_seconds=max(120, COLLECT_SECONDS),
-                    )
-                    if job is None:
-                        break
-                    try:
-                        phase1_state["activeJob"] = {
-                            "jobId": job["jobId"], "jobType": job["jobType"], "startedAt": utc_iso(),
-                        }
-                        result = await _run_claimed_phase1_job(job)
-                        await asyncio.to_thread(complete_job, job["jobId"], result)
-                        phase1_state["lastCompletedJob"] = {
-                            "jobId": job["jobId"],
-                            "jobType": job["jobType"],
-                            "completedAt": utc_iso(),
-                        }
-                        phase1_state["lastError"] = None
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        await asyncio.to_thread(fail_job, job["jobId"], exc)
-                        phase1_state["lastError"] = f"{type(exc).__name__}: {str(exc)[:500]}"
-                    finally:
-                        phase1_state["activeJob"] = None
-                    processed += 1
+                last_schedule_bucket = schedule_bucket
+                await _drain_due_phase1_jobs(worker_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -3062,6 +3103,95 @@ async def enforce_scoped_app_read_token(request: Request, call_next: Any) -> Any
             content={"detail": "TAGneXt app token is read-only; mutation endpoints are forbidden."},
         )
     return await call_next(request)
+
+
+def _client_cache_seconds(path: str) -> int:
+    if path.startswith("/v1/tag/history"):
+        return 900
+    if path.startswith("/v1/tagnext/predictions"):
+        return 300
+    if path.startswith("/v1/tagnext/providers"):
+        return 300
+    if path.startswith("/v1/tagnext/onchain") or path.startswith("/v1/tagnext/heatmap"):
+        return 300
+    if path.startswith("/v1/tagnext/future-paths") or path.startswith("/v1/tagnext/event-ledger"):
+        return 300
+    if path.startswith("/v1/tagnext/chart"):
+        return 60
+    if path.startswith("/v1/tag/control-center"):
+        return 60
+    return 30
+
+
+@app.middleware("http")
+async def bound_and_condition_read_responses(request: Request, call_next: Any) -> Any:
+    """Bound ordinary GET payloads and support zero-body conditional refreshes."""
+
+    response = await call_next(request)
+    if (
+        request.method.upper() not in {"GET", "HEAD"}
+        or response.status_code != 200
+        or request.url.path in {"/health", "/openapi.json"}
+        or "attachment" in response.headers.get("content-disposition", "").lower()
+    ):
+        return response
+    content_type = response.headers.get("content-type", "").lower()
+    if "application/json" not in content_type and "text/plain" not in content_type:
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    detail_route = request.url.path.startswith(
+        (
+            "/v1/tag/history/",
+            "/v1/tag/evidence/",
+            "/v1/tagnext/event-ledger",
+        )
+    )
+    maximum = 8_000_000 if detail_route else 2_000_000
+    if len(body) > maximum:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "detail": "Response exceeds the bounded read limit; request a smaller page or open a detail endpoint.",
+                "maximumBytes": maximum,
+            },
+        )
+    etag = f'"{hashlib.sha256(body).hexdigest()}"'
+    if len(conditional_last_modified) >= 2_048:
+        conditional_last_modified.clear()
+    last_modified = conditional_last_modified.setdefault(
+        etag,
+        formatdate(time.time(), usegmt=True),
+    )
+    cache_seconds = _client_cache_seconds(request.url.path)
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+    headers["etag"] = etag
+    headers["last-modified"] = last_modified
+    headers["cache-control"] = f"private, max-age={cache_seconds}, must-revalidate"
+    headers["x-response-uncompressed-bytes"] = str(len(body))
+    not_modified = request.headers.get("if-none-match", "").strip() == etag
+    if not not_modified:
+        not_modified = (
+            request.headers.get("if-modified-since", "").strip() == last_modified
+        )
+    if not_modified:
+        return Response(
+            status_code=304,
+            headers={
+                "etag": etag,
+                "last-modified": last_modified,
+                "cache-control": headers["cache-control"],
+            },
+        )
+    return Response(
+        content=body,
+        status_code=response.status_code,
+        headers=headers,
+        background=response.background,
+    )
+
+
+app.add_middleware(GZipMiddleware, minimum_size=1_024, compresslevel=6)
 
 
 @app.get("/")
@@ -3284,7 +3414,12 @@ async def tagnext_predictions(
     selected = horizon.strip().lower()
     if selected not in supported:
         raise HTTPException(status_code=422, detail="unsupported TAGneXt prediction horizon")
-    payload = await asyncio.to_thread(predictions_payload, horizon=selected)
+    payload = await cached_thread_read(
+        f"tagnext-predictions:{selected}",
+        300,
+        predictions_payload,
+        horizon=selected,
+    )
     converted = await asyncio.to_thread(apply_usd_display_conversions, payload)
     return {"ok": True, **converted}
 
@@ -3296,7 +3431,12 @@ async def tagnext_chart(
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
     try:
-        payload = await asyncio.to_thread(chart_payload, timeframe=timeframe)
+        payload = await cached_thread_read(
+            f"tagnext-chart:{timeframe.lower()}",
+            60,
+            chart_payload,
+            timeframe=timeframe,
+        )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except ChartDataError as error:
@@ -3312,14 +3452,11 @@ async def tagnext_provider_shadows(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    latest = provider_shadow_payload()
-    # A newly started free instance can have a long durable-job backlog.  Do one
-    # bounded, read-only provider refresh on the first authenticated request so
-    # the app never reports configured providers as absent merely because that
-    # background job has not yet reached the head of the queue.
-    if not latest.get("checkedAt"):
-        latest = await asyncio.to_thread(collect_provider_shadow_snapshot)
-        latest = provider_shadow_payload()
+    latest = await cached_thread_read(
+        "tagnext-provider-shadows",
+        300,
+        provider_shadow_payload,
+    )
     return {"ok": True, **latest}
 
 
@@ -3337,7 +3474,15 @@ async def tagnext_onchain(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    return {"ok": True, **await asyncio.to_thread(tagnext_onchain_payload, limit=limit)}
+    return {
+        "ok": True,
+        **await cached_thread_read(
+            f"tagnext-onchain:{limit}",
+            300,
+            tagnext_onchain_payload,
+            limit=limit,
+        ),
+    }
 
 
 @app.get("/v1/tagnext/heatmaps")
@@ -3346,7 +3491,15 @@ async def tagnext_heatmaps(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    return {"ok": True, **await asyncio.to_thread(tagnext_heatmap_payload, limit=limit)}
+    return {
+        "ok": True,
+        **await cached_thread_read(
+            f"tagnext-heatmap:{limit}",
+            300,
+            tagnext_heatmap_payload,
+            limit=limit,
+        ),
+    }
 
 
 @app.get("/v1/tagnext/comparisons")
@@ -3354,7 +3507,14 @@ async def tagnext_comparisons(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    return {"ok": True, **await asyncio.to_thread(rolling_comparison_report)}
+    return {
+        "ok": True,
+        **await cached_thread_read(
+            "tagnext-comparisons",
+            900,
+            rolling_comparison_report,
+        ),
+    }
 
 
 @app.post("/v1/tagnext/exports/full-brain")
@@ -3391,7 +3551,15 @@ async def tagnext_server_future_paths(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    return {"ok": True, **await asyncio.to_thread(server_future_paths_payload, horizon=horizon)}
+    return {
+        "ok": True,
+        **await cached_thread_read(
+            f"tagnext-future-paths:{horizon.lower()}",
+            300,
+            server_future_paths_payload,
+            horizon=horizon,
+        ),
+    }
 
 
 @app.post("/v1/tagnext/future-paths/build")
@@ -3410,7 +3578,15 @@ async def tagnext_event_ledger(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    return {"ok": True, **await asyncio.to_thread(tagnext_event_ledger_payload, limit=limit)}
+    return {
+        "ok": True,
+        **await cached_thread_read(
+            f"tagnext-event-ledger:{limit}",
+            300,
+            tagnext_event_ledger_payload,
+            limit=limit,
+        ),
+    }
 
 
 @app.post("/v1/tagnext/position/exit-simulation")
@@ -3595,7 +3771,11 @@ async def tag_current_evidence(
     require_relay_key(x_relay_key)
     read_error: str | None = None
     try:
-        packet = await asyncio.to_thread(latest_evidence_packet)
+        packet = await cached_thread_read(
+            "canonical-evidence-current",
+            60,
+            latest_evidence_packet,
+        )
     except Exception as exc:
         packet = phase1_state.get("lastPacket")
         read_error = f"{type(exc).__name__}: {str(exc)[:300]}"
@@ -3735,13 +3915,19 @@ async def tag_canonical_forecast_latest(
 
 @app.get("/v1/tag/control-center")
 async def tag_control_center(
+    detail: bool = Query(False),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """One authenticated, side-effect-free payload for the Phase 4 Android UI."""
+    """Authenticated compact state, with bounded detail only on explicit open."""
     require_relay_key(x_relay_key)
     return {
         "ok": True,
-        **await asyncio.to_thread(canonical_control_center_snapshot),
+        **await cached_thread_read(
+            f"canonical-control-center:{'detail' if detail else 'compact'}",
+            60,
+            canonical_control_center_snapshot,
+            detail=detail,
+        ),
     }
 
 
@@ -3751,7 +3937,15 @@ async def tag_history_coverage(
 ) -> dict[str, Any]:
     """Authenticated read-only history coverage; missing fields remain explicit."""
     require_relay_key(x_relay_key)
-    return {"ok": True, "authoritative": True, **await asyncio.to_thread(build_coverage_report)}
+    return {
+        "ok": True,
+        "authoritative": True,
+        **await cached_thread_read(
+            "history-coverage-persisted",
+            900,
+            latest_persisted_coverage_report,
+        ),
+    }
 
 
 @app.get("/v1/tag/history/events")
@@ -3759,7 +3953,15 @@ async def tag_history_events(
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_relay_key(x_relay_key)
-    return {"ok": True, "authoritative": True, **await asyncio.to_thread(historical_event_report)}
+    return {
+        "ok": True,
+        "authoritative": True,
+        **await cached_thread_read(
+            "history-events",
+            900,
+            historical_event_report,
+        ),
+    }
 
 
 @app.get("/v1/tag/history/summary")
@@ -3768,7 +3970,15 @@ async def tag_history_summary(
 ) -> dict[str, Any]:
     """Authenticated compact production-history status; raw warehouse rows remain server-only."""
     require_relay_key(x_relay_key)
-    return {"ok": True, "authoritative": True, **await asyncio.to_thread(historical_production_summary)}
+    return {
+        "ok": True,
+        "authoritative": True,
+        **await cached_thread_read(
+            "history-summary",
+            900,
+            historical_production_summary,
+        ),
+    }
 
 
 @app.get("/v1/chad/usage")

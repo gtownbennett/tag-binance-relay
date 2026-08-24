@@ -1078,7 +1078,7 @@ def test_phase4_control_center_uses_newest_issue_and_same_producer_revision() ->
     newer = _forecast(issued_at=NOW + timedelta(minutes=31), point=0.00115)
     persist_canonical_forecast(older)
     persist_canonical_forecast(newer)
-    snapshot = canonical_control_center_snapshot(now=NOW + timedelta(minutes=32))
+    snapshot = canonical_control_center_snapshot(now=NOW + timedelta(minutes=32), detail=True)
     envelope = next(
         row for row in snapshot["forecasts"]
         if row["record"]["producer"] == FORECAST_PRODUCER and row["record"]["horizon"] == "24h"
@@ -1086,6 +1086,19 @@ def test_phase4_control_center_uses_newest_issue_and_same_producer_revision() ->
     assert envelope["record"]["forecastId"] == newer["forecastId"]
     assert envelope["previousRecord"]["forecastId"] == older["forecastId"]
     assert envelope["record"]["issuedAt"] > envelope["previousRecord"]["issuedAt"]
+
+
+def test_phase4_control_center_is_compact_by_default_and_detail_is_explicit() -> None:
+    for horizon in ("1h", "4h", "24h"):
+        persist_canonical_forecast(_forecast(horizon=horizon))
+    compact = canonical_control_center_snapshot(now=NOW + timedelta(minutes=2))
+    detailed = canonical_control_center_snapshot(
+        now=NOW + timedelta(minutes=2),
+        detail=True,
+    )
+    assert len(compact["forecasts"]) == 1
+    assert len(detailed["forecasts"]) == 3
+    assert len(compact["alerts"]) <= 10
 
 
 def test_phase4_current_call_falls_back_to_a_fresh_shorter_horizon() -> None:
@@ -1110,7 +1123,8 @@ def test_phase4_control_center_is_honest_when_exact_deadline_grade_is_missing() 
     forecast = _forecast(horizon="1h")
     persist_canonical_forecast(forecast)
     snapshot = canonical_control_center_snapshot(
-        now=datetime.fromisoformat(forecast["deadline"]) + timedelta(seconds=1)
+        now=datetime.fromisoformat(forecast["deadline"]) + timedelta(seconds=1),
+        detail=True,
     )
     envelope = next(row for row in snapshot["forecasts"] if row["record"]["forecastId"] == forecast["forecastId"])
     assert envelope["grade"] == {"state": "GRADE_PENDING", "message": GRADE_PENDING_MESSAGE}

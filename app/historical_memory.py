@@ -1719,6 +1719,79 @@ def build_coverage_report(*, persist: bool = False) -> dict[str, Any]:
     }
 
 
+def latest_persisted_coverage_report() -> dict[str, Any]:
+    """Read the hourly durable coverage snapshot without regrouping history."""
+
+    with session_scope() as session:
+        report_id = session.scalar(
+            select(HistoricalCoverageSnapshotRow.report_id)
+            .order_by(HistoricalCoverageSnapshotRow.generated_at.desc())
+            .limit(1)
+        )
+        rows = (
+            list(
+                session.execute(
+                    select(
+                        HistoricalCoverageSnapshotRow.generated_at,
+                        HistoricalCoverageSnapshotRow.first_observed_at,
+                        HistoricalCoverageSnapshotRow.last_observed_at,
+                        HistoricalCoverageSnapshotRow.row_count,
+                        HistoricalCoverageSnapshotRow.source,
+                        HistoricalCoverageSnapshotRow.resolutions_json,
+                        HistoricalCoverageSnapshotRow.payload_json,
+                    )
+                    .where(HistoricalCoverageSnapshotRow.report_id == report_id)
+                    .order_by(
+                        HistoricalCoverageSnapshotRow.source,
+                        HistoricalCoverageSnapshotRow.month,
+                    )
+                )
+            )
+            if report_id
+            else []
+        )
+    cells = [_json(row.payload_json, {}) for row in rows]
+    source_counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        source_counts[str(row.source)] += int(row.row_count)
+    return {
+        "reportId": report_id,
+        "generatedAt": (
+            max(_aware(row.generated_at) for row in rows).isoformat()
+            if rows
+            else None
+        ),
+        "earliestTimestamp": min(
+            (
+                _aware(row.first_observed_at).isoformat()
+                for row in rows
+                if row.first_observed_at
+            ),
+            default=None,
+        ),
+        "latestTimestamp": max(
+            (
+                _aware(row.last_observed_at).isoformat()
+                for row in rows
+                if row.last_observed_at
+            ),
+            default=None,
+        ),
+        "totalRows": sum(source_counts.values()),
+        "sourceRowCounts": dict(sorted(source_counts.items())),
+        "resolutions": sorted(
+            {
+                str(resolution)
+                for row in rows
+                for resolution in _json(row.resolutions_json, [])
+            }
+        ),
+        "matrix": cells,
+        "snapshotSource": "hourly_persisted_coverage",
+        "sideEffects": "none",
+    }
+
+
 def historical_event_report() -> dict[str, Any]:
     with session_scope() as session:
         latest = (
@@ -1781,8 +1854,14 @@ def historical_production_summary() -> dict[str, Any]:
         )
         cells = (
             list(
-                session.scalars(
-                    select(HistoricalCoverageSnapshotRow)
+                session.execute(
+                    select(
+                        HistoricalCoverageSnapshotRow.source,
+                        HistoricalCoverageSnapshotRow.row_count,
+                        HistoricalCoverageSnapshotRow.coverage_status,
+                        HistoricalCoverageSnapshotRow.first_observed_at,
+                        HistoricalCoverageSnapshotRow.last_observed_at,
+                    )
                     .where(HistoricalCoverageSnapshotRow.report_id == report_id)
                     .order_by(
                         HistoricalCoverageSnapshotRow.source,
@@ -1794,22 +1873,41 @@ def historical_production_summary() -> dict[str, Any]:
             else []
         )
         replay_rows = list(
-            session.scalars(
-                select(HistoricalReplayRunRow)
+            session.execute(
+                select(
+                    HistoricalReplayRunRow.run_id,
+                    HistoricalReplayRunRow.model_version,
+                    HistoricalReplayRunRow.evaluation_kind,
+                    HistoricalReplayRunRow.training_end_at,
+                    HistoricalReplayRunRow.evaluation_start_at,
+                    HistoricalReplayRunRow.evaluation_end_at,
+                )
                 .order_by(HistoricalReplayRunRow.created_at.desc())
                 .limit(10)
             )
         )
         research_rows = list(
-            session.scalars(
-                select(ForecastResearchRunRow)
+            session.execute(
+                select(
+                    ForecastResearchRunRow.run_kind,
+                    ForecastResearchRunRow.horizon,
+                    ForecastResearchRunRow.raw_case_count,
+                    ForecastResearchRunRow.effective_sample_count,
+                    ForecastResearchRunRow.no_lookahead,
+                )
                 .order_by(ForecastResearchRunRow.evaluation_end_at.desc())
                 .limit(20)
             )
         )
         reliability_rows = list(
-            session.scalars(
-                select(FeatureReliabilityProfileRow)
+            session.execute(
+                select(
+                    FeatureReliabilityProfileRow.feature_family,
+                    FeatureReliabilityProfileRow.horizon,
+                    FeatureReliabilityProfileRow.effective_sample_count,
+                    FeatureReliabilityProfileRow.skill_delta,
+                    FeatureReliabilityProfileRow.status,
+                )
                 .order_by(FeatureReliabilityProfileRow.created_at.desc())
                 .limit(40)
             )

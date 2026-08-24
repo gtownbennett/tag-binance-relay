@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from sqlalchemy import func, select
 from app import main
 from app.phase1_reliability import (
     AsyncCoalescingCache,
+    _job_summary_select,
     authorize_persistent_usage,
     bounded_retry,
     build_canonical_evidence_packet,
@@ -260,6 +262,50 @@ def test_jobs_are_idempotent_locked_and_completed_exactly_once() -> None:
         assert row is not None
         assert row.status == "completed"
         assert row.attempts == 1
+
+
+def test_job_deduplication_query_never_selects_wide_payload_or_result_columns() -> None:
+    compiled = str(
+        _job_summary_select()
+        .where(ServerJobRow.idempotency_key == "history:wide-result")
+        .compile()
+    ).lower()
+    selected_columns = compiled.split(" from ", 1)[0]
+    assert "result_json" not in selected_columns
+    assert "payload_json" not in selected_columns
+    assert "last_error" not in selected_columns
+
+
+def test_large_historical_job_result_is_hashed_and_compacted_for_future_rows() -> None:
+    job = enqueue_job(
+        job_type="maintain_historical_memory",
+        idempotency_key="history:large-result-compaction",
+    )
+    complete_job(
+        job["jobId"],
+        {
+            "coverageReportId": "coverage-fixture",
+            "totalHistoricalRows": 123,
+            "knownEpisodes": [{"blob": "x" * 40_000}],
+            "paidAiCalls": 0,
+        },
+    )
+    with session_scope() as session:
+        row = session.get(ServerJobRow, job["jobId"])
+        assert row is not None
+        stored = json.loads(row.result_json)
+    assert stored["schemaVersion"] == "server-job-result-summary-v1"
+    assert stored["fullResultPersistedElsewhere"] is True
+    assert stored["originalBytes"] > 32_768
+    assert len(stored["originalSha256"]) == 64
+    assert len(row.result_json.encode("utf-8")) < 2_000
+
+
+def test_periodic_schedule_is_built_per_five_minute_bucket_but_due_jobs_stay_frequent() -> None:
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    assert "schedule_bucket = int(time.time()) // 300" in source
+    assert "await _drain_due_phase1_jobs(worker_id)" in source
+    assert "await asyncio.sleep(SERVER_JOB_POLL_SECONDS)" in source
 
 
 def test_due_exact_deadline_capture_preempts_older_periodic_work() -> None:
