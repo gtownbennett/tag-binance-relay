@@ -2571,16 +2571,56 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"Unsupported server job type: {job_type}")
 
 
+async def _drain_due_phase1_jobs(worker_id: str) -> None:
+    """Claim due work frequently without rebuilding the durable schedule."""
+
+    processed = 0
+    while processed < 20:
+        job = await asyncio.to_thread(
+            claim_due_job,
+            worker_id=worker_id,
+            lock_seconds=max(120, COLLECT_SECONDS),
+        )
+        if job is None:
+            break
+        try:
+            phase1_state["activeJob"] = {
+                "jobId": job["jobId"], "jobType": job["jobType"], "startedAt": utc_iso(),
+            }
+            result = await _run_claimed_phase1_job(job)
+            await asyncio.to_thread(complete_job, job["jobId"], result)
+            phase1_state["lastCompletedJob"] = {
+                "jobId": job["jobId"],
+                "jobType": job["jobType"],
+                "completedAt": utc_iso(),
+            }
+            phase1_state["lastError"] = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await asyncio.to_thread(fail_job, job["jobId"], exc)
+            phase1_state["lastError"] = f"{type(exc).__name__}: {str(exc)[:500]}"
+        finally:
+            phase1_state["activeJob"] = None
+        processed += 1
+
+
 async def phase1_job_loop() -> None:
     """Run persistent, idempotent jobs and catch up expired work after wake."""
 
     worker_id = f"render:{BUILD_ID}:{uuid.uuid4().hex[:12]}"
+    last_schedule_bucket: int | None = None
     phase1_state["running"] = True
     try:
         await asyncio.sleep(2)
         while True:
             phase1_state["lastRunAt"] = utc_iso()
             try:
+                schedule_bucket = int(time.time()) // 300
+                if schedule_bucket == last_schedule_bucket:
+                    await _drain_due_phase1_jobs(worker_id)
+                    await asyncio.sleep(SERVER_JOB_POLL_SECONDS)
+                    continue
                 await asyncio.to_thread(
                     schedule_current_evidence_job,
                     interval_seconds=COLLECT_SECONDS,
@@ -2664,35 +2704,8 @@ async def phase1_job_loop() -> None:
                     payload={"bucket": prospective_bucket, "priority": "after-live-grading"},
                     max_attempts=2,
                 )
-                processed = 0
-                while processed < 20:
-                    job = await asyncio.to_thread(
-                        claim_due_job,
-                        worker_id=worker_id,
-                        lock_seconds=max(120, COLLECT_SECONDS),
-                    )
-                    if job is None:
-                        break
-                    try:
-                        phase1_state["activeJob"] = {
-                            "jobId": job["jobId"], "jobType": job["jobType"], "startedAt": utc_iso(),
-                        }
-                        result = await _run_claimed_phase1_job(job)
-                        await asyncio.to_thread(complete_job, job["jobId"], result)
-                        phase1_state["lastCompletedJob"] = {
-                            "jobId": job["jobId"],
-                            "jobType": job["jobType"],
-                            "completedAt": utc_iso(),
-                        }
-                        phase1_state["lastError"] = None
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        await asyncio.to_thread(fail_job, job["jobId"], exc)
-                        phase1_state["lastError"] = f"{type(exc).__name__}: {str(exc)[:500]}"
-                    finally:
-                        phase1_state["activeJob"] = None
-                    processed += 1
+                last_schedule_bucket = schedule_bucket
+                await _drain_due_phase1_jobs(worker_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
