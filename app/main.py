@@ -3254,16 +3254,21 @@ async def tag_canonical_forecast_latest(
 
 @app.get("/v1/tag/control-center")
 async def tag_control_center(
-    portfolio_quantity_tokens: float | None = Query(default=None, ge=0.0, le=1_000_000_000_000_000.0),
+    x_portfolio_quantity_tokens: float | None = Header(
+        default=None,
+        alias="X-Portfolio-Quantity-Tokens",
+        ge=0.0,
+        le=1_000_000_000_000_000.0,
+    ),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """One authenticated, versioned, side-effect-free payload for TAGalysis."""
+    """One authenticated snapshot; private portfolio input never enters the URL."""
     require_relay_key(x_relay_key)
     return {
         "ok": True,
         **await asyncio.to_thread(
             canonical_control_center_snapshot,
-            portfolio_quantity_tokens=portfolio_quantity_tokens,
+            portfolio_quantity_tokens=x_portfolio_quantity_tokens,
         ),
     }
 

@@ -73,6 +73,30 @@ def test_minimum_live_status_never_implies_optional_ai_is_required() -> None:
     assert response.json()["minimumLiveServicesReady"] is False
 
 
+def test_control_center_accepts_portfolio_quantity_only_in_private_header() -> None:
+    captured: dict[str, float | None] = {}
+
+    def fake_snapshot(*, portfolio_quantity_tokens: float | None = None) -> dict[str, object]:
+        captured["quantity"] = portfolio_quantity_tokens
+        return {"authoritative": True, "sideEffects": "none"}
+
+    with (
+        patch.object(main, "RELAY_TOKEN", "test-relay-token"),
+        patch.object(main, "canonical_control_center_snapshot", side_effect=fake_snapshot),
+    ):
+        response = client.get(
+            "/v1/tag/control-center",
+            headers={
+                "X-Relay-Key": "test-relay-token",
+                "X-Portfolio-Quantity-Tokens": "100812406",
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured["quantity"] == 100_812_406.0
+    assert "portfolio_quantity_tokens" not in str(response.request.url)
+
+
 def test_grader_item_errors_mark_connection_degraded() -> None:
     degraded = {
         "running": True,
