@@ -104,7 +104,7 @@ from app.phase3_learning import (
     process_level_alerts_from_latest_evidence,
     rollback_learning_version,
 )
-from app.phase4_control_center import canonical_control_center_snapshot
+from app.phase4_control_center_v2 import canonical_control_center_snapshot
 from app.historical_memory import (
     build_coverage_report,
     chad_history_evidence_package,
@@ -174,7 +174,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.11.0-phase3"
+SERVICE_VERSION = "2.12.0-production-reconciliation"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -3254,13 +3254,17 @@ async def tag_canonical_forecast_latest(
 
 @app.get("/v1/tag/control-center")
 async def tag_control_center(
+    portfolio_quantity_tokens: float | None = Query(default=None, ge=0.0, le=1_000_000_000_000_000.0),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """One authenticated, side-effect-free payload for the Phase 4 Android UI."""
+    """One authenticated, versioned, side-effect-free payload for TAGalysis."""
     require_relay_key(x_relay_key)
     return {
         "ok": True,
-        **await asyncio.to_thread(canonical_control_center_snapshot),
+        **await asyncio.to_thread(
+            canonical_control_center_snapshot,
+            portfolio_quantity_tokens=portfolio_quantity_tokens,
+        ),
     }
 
 

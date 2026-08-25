@@ -49,6 +49,13 @@ from app.phase4_control_center import (
     GRADE_PENDING_MESSAGE,
     canonical_control_center_snapshot,
 )
+from app.phase4_control_center_v2 import (
+    CONTROL_CENTER_CONTRACT_VERSION,
+    _evidence_completeness as evidence_completeness_v2,
+    _portfolio_impact as portfolio_impact_v2,
+    _price_verification as price_verification_v2,
+    canonical_control_center_snapshot as canonical_control_center_snapshot_v2,
+)
 from app.prospective_learning import (
     evaluate_prospective_thresholds,
     record_forecast_evidence,
@@ -1082,3 +1089,85 @@ def test_phase4_control_center_market_truth_uses_verified_supply_not_provider_fd
     assert truth["fdvUsd"] == pytest.approx(405_380_800.0)
     assert truth["circulatingMarketCapUsd"] != truth["fdvUsd"]
     assert truth["supplySnapshotId"] == persisted["snapshotId"]
+
+
+def test_control_center_v2_price_requires_fresh_cross_source_agreement() -> None:
+    market = _market_fixture()
+    market["cexSpot"] = [
+        {
+            "exchange": "Gate", "available": True, "priceUsd": 0.001000,
+            "volumeUsd24h": 100_000.0, "updatedAt": NOW.isoformat(),
+        },
+        {
+            "exchange": "MEXC", "available": True, "priceUsd": 0.001001,
+            "volumeUsd24h": 90_000.0, "updatedAt": NOW.isoformat(),
+        },
+    ]
+    packet = build_canonical_evidence_packet(market, server_now=NOW)
+    verified = price_verification_v2(packet, NOW, None)
+    assert verified["state"] == "VERIFIED"
+    assert verified["reasonCode"] == "FRESH_CROSS_SOURCE_AGREEMENT"
+    assert verified["crossSourceVariancePct"] == pytest.approx(0.09995, rel=1e-3)
+    assert len(verified["sourcesUsed"]) == 3
+
+    one_source = copy.deepcopy(packet)
+    for item in one_source["items"]:
+        if item.get("category") != "cex_spot" or item.get("sourceId", "").startswith("cex-spot:mexc"):
+            item["freshness"] = "stale"
+    rejected = price_verification_v2(one_source, NOW, None)
+    assert rejected["state"] == "UNVERIFIED"
+    assert rejected["reasonCode"] == "INSUFFICIENT_INDEPENDENT_SOURCES"
+
+
+def test_control_center_v2_separates_required_and_optional_evidence() -> None:
+    forecast = _forecast(horizon="24h")
+    packet = build_canonical_evidence_packet(_market_fixture(), server_now=NOW)
+    result = evidence_completeness_v2(forecast, packet)
+    assert result["required"]["state"] == "COMPLETE"
+    assert result["optional"]["state"] == "UPDATING"
+    assert result["state"] == "COMPLETE"
+    assert "optional sources updating" in result["summary"].lower()
+
+
+def test_control_center_v2_portfolio_math_labels_issue_and_current_returns() -> None:
+    forecast = _forecast(horizon="24h", point=0.001052)
+    verification = {
+        "verified": True,
+        "priceUsd": 0.000995,
+        "lastVerifiedPriceUsd": 0.001,
+        "sourcesUsed": [{"observedAt": NOW.isoformat()}],
+    }
+    result = portfolio_impact_v2(forecast, verification, 100_812_406.0)
+    assert result["forecastPositionValueUsd"] == pytest.approx(
+        result["quantityTokens"] * result["expectedPriceUsd"]
+    )
+    assert result["expectedDollarChangeFromCurrentUsd"] == pytest.approx(
+        result["forecastPositionValueUsd"] - result["currentPositionValueUsd"]
+    )
+    assert result["originalForecastMoveFromIssuePct"] == pytest.approx(
+        (result["expectedPriceUsd"] / result["issuePriceUsd"] - 1.0) * 100.0
+    )
+    assert result["remainingMoveFromCurrentPct"] == pytest.approx(
+        (result["expectedPriceUsd"] / result["currentPriceUsd"] - 1.0) * 100.0
+    )
+    assert result["originalForecastMoveFromIssuePct"] != pytest.approx(
+        result["remainingMoveFromCurrentPct"]
+    )
+
+
+def test_control_center_v2_is_versioned_server_selected_and_not_locally_ambiguous() -> None:
+    forecast = _forecast(horizon="24h")
+    persist_canonical_forecast(forecast)
+    snapshot = canonical_control_center_snapshot_v2(
+        now=NOW + timedelta(minutes=2),
+        portfolio_quantity_tokens=100_812_406.0,
+    )
+    assert snapshot["contractVersion"] == CONTROL_CENTER_CONTRACT_VERSION
+    assert snapshot["snapshotId"].startswith("control_")
+    assert snapshot["currentCall"]["productName"] == "TAGalysis"
+    assert snapshot["currentCall"]["horizon"] == "24h"
+    assert snapshot["currentCall"]["forecastId"] == forecast["forecastId"]
+    assert snapshot["selections"][0]["authoritative"] is True
+    assert snapshot["aiReview"]["automaticPaidCallMadeByThisRequest"] is False
+    assert snapshot["portfolioImpact"]["quantityTokens"] == 100_812_406.0
+    assert snapshot["grading"]["gradesOverdue"] == 0
