@@ -1171,3 +1171,30 @@ def test_control_center_v2_is_versioned_server_selected_and_not_locally_ambiguou
     assert snapshot["aiReview"]["automaticPaidCallMadeByThisRequest"] is False
     assert snapshot["portfolioImpact"]["quantityTokens"] == 100_812_406.0
     assert snapshot["grading"]["gradesOverdue"] == 0
+
+
+def test_control_center_v2_keeps_stale_but_unexpired_forecast_selectable() -> None:
+    forecast = _forecast(horizon="24h")
+    persist_canonical_forecast(forecast)
+
+    snapshot = canonical_control_center_snapshot_v2(
+        now=NOW + timedelta(hours=7),
+    )
+
+    assert snapshot["forecasts"][0]["record"]["freshnessState"]["status"] == "stale"
+    assert snapshot["currentCall"]["forecastId"] == forecast["forecastId"]
+    assert snapshot["selections"][0]["forecastId"] == forecast["forecastId"]
+    assert "freshness is stale" in snapshot["selections"][0]["selectionReason"]
+
+
+def test_control_center_v2_never_selects_expired_forecast() -> None:
+    forecast = _forecast(horizon="1h")
+    persist_canonical_forecast(forecast)
+
+    snapshot = canonical_control_center_snapshot_v2(
+        now=NOW + timedelta(hours=2),
+    )
+
+    assert snapshot["forecasts"][0]["record"]["freshnessState"]["status"] == "expired"
+    assert snapshot["currentCall"]["forecastId"] is None
+    assert snapshot["selections"] == []

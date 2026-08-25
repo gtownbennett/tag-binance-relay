@@ -569,18 +569,24 @@ def canonical_control_center_snapshot(
             ),
         })
 
-    def fresh(producer: str, horizon: str) -> dict[str, Any] | None:
+    def selectable(producer: str, horizon: str) -> dict[str, Any] | None:
         items = [
             value for value in forecasts
             if value["record"]["producer"] == producer
             and value["record"]["horizon"] == horizon
-            and value["record"]["freshnessState"]["status"] == "fresh"
+            # Freshness describes how old the issued call is; deadline validity
+            # determines whether it remains the active immutable forecast.  A
+            # stale-but-unexpired call must stay visible (with its stale label)
+            # until a newer call replaces it or its exact deadline passes.
+            and value["record"]["freshnessState"]["status"] in {"fresh", "stale"}
         ]
         return max(items, key=lambda item: item["record"]["issuedAt"], default=None)
 
     selections: list[dict[str, Any]] = []
     for horizon in CONTROL_CENTER_HORIZONS:
-        tagalysis, chad, final_call = fresh("tagalysis", horizon), fresh("chad", horizon), fresh("final_call", horizon)
+        tagalysis = selectable("tagalysis", horizon)
+        chad = selectable("chad", horizon)
+        final_call = selectable("final_call", horizon)
         final_valid = bool(
             tagalysis and final_call
             and tagalysis["record"]["evidenceSnapshotId"] == final_call["record"]["evidenceSnapshotId"]
@@ -596,7 +602,10 @@ def canonical_control_center_snapshot(
                 "engine": selected["record"].get("modelVersion"),
                 "selectionReason": (
                     "Server-selected deterministic Final Call with identical frozen TAGalysis evidence."
-                    if final_valid else "Server-selected canonical TAGalysis champion for this horizon."
+                    if final_valid else (
+                        "Server-selected canonical TAGalysis champion for this horizon; "
+                        f"freshness is {selected['record']['freshnessState']['status']}."
+                    )
                 ),
                 "chadAvailable": chad is not None,
                 "authoritative": True,
