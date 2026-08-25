@@ -11,16 +11,17 @@ TEST_WORKFLOW = (ROOT / ".github/workflows/relay-tests.yml").read_text(
 IMAGE_WORKFLOW = (ROOT / ".github/workflows/publish-image.yml").read_text(
     encoding="utf-8"
 )
+EXPECTED_PRODUCTION_VERSION = "2.12.0-production-reconciliation"
 
 
 class FullForecastContractTests(unittest.TestCase):
     def test_version_and_workflows_cover_current_production_lineage(self):
         self.assertIn(
-            'SERVICE_VERSION = "2.12.0-production-reconciliation"',
+            f'SERVICE_VERSION = "{EXPECTED_PRODUCTION_VERSION}"',
             MAIN,
         )
         self.assertIn(
-            'APP_VERSION = "2.12.0-production-reconciliation"',
+            f'APP_VERSION = "{EXPECTED_PRODUCTION_VERSION}"',
             CONFIG,
         )
         for workflow in (TEST_WORKFLOW, IMAGE_WORKFLOW):
