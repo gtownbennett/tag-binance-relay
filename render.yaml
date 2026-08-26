@@ -35,6 +35,10 @@ services:
         value: "5200"
       - key: EXTERNAL_REQUEST_MONTHLY_LIMIT
         value: "180000"
+      - key: DATABASE_DAILY_QUERY_LIMIT
+        value: "200000"
+      - key: DATABASE_MONTHLY_QUERY_LIMIT
+        value: "6200000"
       - key: DETERMINISTIC_GRADING_ENABLED
         value: "true"
       - key: PAID_AI_ENABLED
