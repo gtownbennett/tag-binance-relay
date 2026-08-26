@@ -19,6 +19,7 @@ from app.phase1_reliability import (
     claim_due_job,
     complete_job,
     enqueue_job,
+    expire_exhausted_jobs,
     latest_evidence_packet,
     persist_evidence_packet,
     persist_helper_candidate,
@@ -335,6 +336,7 @@ def test_exhausted_expired_job_cannot_starve_later_due_work() -> None:
         idempotency_key="collect:after-expired-history",
     )
 
+    assert expire_exhausted_jobs() == 1
     next_claim = claim_due_job(worker_id="second-worker", lock_seconds=60)
     assert next_claim is not None and next_claim["jobId"] == later["jobId"]
     with session_scope() as session:

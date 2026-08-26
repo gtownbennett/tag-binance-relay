@@ -11,7 +11,7 @@ TEST_WORKFLOW = (ROOT / ".github/workflows/relay-tests.yml").read_text(
 IMAGE_WORKFLOW = (ROOT / ".github/workflows/publish-image.yml").read_text(
     encoding="utf-8"
 )
-EXPECTED_PRODUCTION_VERSION = "2.12.0-production-reconciliation"
+EXPECTED_PRODUCTION_VERSION = "2.12.1-reliability-repair"
 
 
 class FullForecastContractTests(unittest.TestCase):

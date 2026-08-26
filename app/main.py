@@ -10,6 +10,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from email.utils import formatdate
 from typing import Any
 
 from app.ledger import PredictionLedger
@@ -60,6 +61,7 @@ from app.phase1_reliability import (
     claim_due_job,
     complete_job,
     enqueue_job,
+    expire_exhausted_jobs,
     fail_job,
     latest_evidence_packet,
     persist_evidence_packet,
@@ -165,16 +167,22 @@ from app.terminal_usage import (
     request_budget_scope,
     usage_governor,
 )
+from app.outbound_requests import (
+    OutboundUnavailable,
+    classify_failure,
+    governed_async_request,
+)
 
 
 import httpx
 import websockets
-from fastapi import Body, FastAPI, Header, HTTPException, Query
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
-SERVICE_VERSION = "2.12.0-production-reconciliation"
+SERVICE_VERSION = "2.12.1-reliability-repair"
 
 SYMBOL = os.getenv("BINANCE_SYMBOL", "TAGUSDT").upper()
 REST_BASE = os.getenv("BINANCE_REST_BASE", "https://fapi.binance.com").rstrip("/")
@@ -256,6 +264,7 @@ phase1_state: dict[str, Any] = {
     "lastError": None,
     "coalescedRequests": 0,
 }
+conditional_last_modified: dict[str, str] = {}
 phase1_coalescer = AsyncCoalescingCache()
 prediction_ledger = PredictionLedger(
     LEDGER_DB_PATH,
@@ -766,39 +775,30 @@ def require_repair_writes_unlocked(action: str) -> None:
 async def get_json(path: str, params: dict[str, Any] | None = None) -> Any:
     if http_client is None:
         raise RuntimeError("HTTP client has not started.")
-    consume_request_budget("external_request")
-    allowed, reason = usage_governor.authorize("external_request")
-    if not allowed:
-        raise RuntimeError(f"External request circuit is open ({reason}).")
-
-    response = await http_client.get(f"{REST_BASE}{path}", params=params)
-
-    if response.status_code == 451:
-        raise RuntimeError(
-            "Binance returned HTTP 451. The relay region cannot access this endpoint."
-        )
-
-    response.raise_for_status()
+    response = await governed_async_request(
+        http_client, "GET", f"{REST_BASE}{path}", provider="binance",
+        job="canonical_evidence", params=params,
+        cache_ttl_seconds=max(15, min(60, COLLECT_SECONDS // 4)),
+        last_good_max_age_seconds=1_800, attempts=2,
+    )
     try:
         return response.json()
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Binance returned non-JSON data for {path}.") from exc
+        raise OutboundUnavailable("binance", "unavailable") from exc
 
 
 async def get_dex_json(path: str) -> Any:
     if http_client is None:
         raise RuntimeError("HTTP client has not started.")
-    consume_request_budget("external_request")
-    allowed, reason = usage_governor.authorize("external_request")
-    if not allowed:
-        raise RuntimeError(f"External request circuit is open ({reason}).")
-
-    response = await http_client.get(f"{DEXSCREENER_BASE}{path}")
-    response.raise_for_status()
+    response = await governed_async_request(
+        http_client, "GET", f"{DEXSCREENER_BASE}{path}", provider="dexscreener",
+        job="canonical_evidence", cache_ttl_seconds=120,
+        last_good_max_age_seconds=1_800, attempts=2,
+    )
     try:
         return response.json()
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"DEX Screener returned non-JSON data for {path}.") from exc
+        raise OutboundUnavailable("dexscreener", "unavailable") from exc
 
 
 def _window_value(container: Any, window: str, field: str | None = None) -> Any:
@@ -1578,10 +1578,6 @@ async def collect_snapshot(*, include_rest_state: bool = False) -> dict[str, Any
             "/futures/data/topLongShortPositionRatio",
             {"symbol": SYMBOL, "period": "5m", "limit": 2},
         ),
-        "taker": get_json(
-            "/futures/data/takerlongshortRatio",
-            {"symbol": SYMBOL, "period": "5m", "limit": 2},
-        ),
         "taker_1h": get_json(
             "/futures/data/takerlongshortRatio",
             {"symbol": SYMBOL, "period": "5m", "limit": 12},
@@ -1658,9 +1654,9 @@ async def collect_snapshot(*, include_rest_state: bool = False) -> dict[str, Any
     global_ratio = latest_item(data.get("global_ratio")) or {}
     top_account = latest_item(data.get("top_account")) or {}
     top_position = latest_item(data.get("top_position")) or {}
-    taker = latest_item(data.get("taker")) or {}
     rolling_taker = await rolling_taker_1h()
     taker_history = data.get("taker_1h") if isinstance(data.get("taker_1h"), list) else []
+    taker = latest_item(taker_history) or {}
     fallback_buy_contracts = sum(as_float(row.get("buyVol")) or 0.0 for row in taker_history if isinstance(row, dict))
     fallback_sell_contracts = sum(as_float(row.get("sellVol")) or 0.0 for row in taker_history if isinstance(row, dict))
     fallback_buy_usd = fallback_buy_contracts * mark_price if mark_price is not None and fallback_buy_contracts > 0 else None
@@ -2215,24 +2211,31 @@ async def collect_verified_cex_spot_once() -> list[dict[str, Any]]:
 
     async def gate() -> dict[str, Any]:
         try:
-            response = await http_client.get("https://api.gateio.ws/api/v4/spot/tickers", params={"currency_pair": "TAG_USDT"})
-            response.raise_for_status()
+            response = await governed_async_request(
+                http_client, "GET", "https://api.gateio.ws/api/v4/spot/tickers",
+                provider="gate", job="canonical_evidence",
+                params={"currency_pair": "TAG_USDT"}, cache_ttl_seconds=120,
+                last_good_max_age_seconds=1_800,
+            )
             rows = response.json()
             row = rows[0] if isinstance(rows, list) and rows else {}
             observed_at = terminal_utc_now().isoformat()
             return {"exchange": "Gate", "available": True, "priceUsd": as_float(row.get("last")), "volumeUsd24h": as_float(row.get("quote_volume")), "priceChange24hPct": as_float(row.get("change_percentage")), "observedAt": observed_at, "updatedAt": observed_at, "marketType": "spot"}
         except Exception as exc:
-            return {"exchange": "Gate", "available": False, "failureReason": f"{type(exc).__name__}: {exc}"}
+            return {"exchange": "Gate", "available": False, "failureReason": classify_failure(exc)}
 
     async def mexc() -> dict[str, Any]:
         try:
-            response = await http_client.get("https://api.mexc.com/api/v3/ticker/24hr", params={"symbol": "TAGUSDT"})
-            response.raise_for_status()
+            response = await governed_async_request(
+                http_client, "GET", "https://api.mexc.com/api/v3/ticker/24hr",
+                provider="mexc", job="canonical_evidence", params={"symbol": "TAGUSDT"},
+                cache_ttl_seconds=120, last_good_max_age_seconds=1_800,
+            )
             row = response.json() if isinstance(response.json(), dict) else {}
             observed_at = terminal_utc_now().isoformat()
             return {"exchange": "MEXC", "available": True, "priceUsd": as_float(row.get("lastPrice")), "volumeUsd24h": as_float(row.get("quoteVolume")), "priceChange24hPct": as_float(row.get("priceChangePercent")), "observedAt": observed_at, "updatedAt": observed_at, "marketType": "spot"}
         except Exception as exc:
-            return {"exchange": "MEXC", "available": False, "failureReason": f"{type(exc).__name__}: {exc}"}
+            return {"exchange": "MEXC", "available": False, "failureReason": classify_failure(exc)}
 
     return list(await asyncio.gather(gate(), mexc()))
 
@@ -2245,8 +2248,10 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
 
     async def collect() -> dict[str, Any]:
         coin_gecko_response, coin_market_cap_response, bsc_response, gecko_response = await asyncio.gather(
-            http_client.get(
+            governed_async_request(
+                http_client, "GET",
                 "https://api.coingecko.com/api/v3/coins/tagger",
+                provider="coingecko", job="verified_supply",
                 params={
                     "localization": "false",
                     "tickers": "false",
@@ -2255,11 +2260,18 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
                     "developer_data": "false",
                     "sparkline": "false",
                 },
+                cache_ttl_seconds=1_800, last_good_max_age_seconds=21_600,
             ),
-            http_client.get("https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger"),
-            http_client.post(
+            governed_async_request(
+                http_client, "GET", "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger",
+                provider="coinmarketcap", job="verified_supply",
+                cache_ttl_seconds=1_800, last_good_max_age_seconds=21_600,
+            ),
+            governed_async_request(
+                http_client, "POST",
                 "https://bsc-dataseed.binance.org/",
-                json={
+                provider="bnb_rpc", job="verified_supply",
+                json_body={
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "eth_call",
@@ -2268,10 +2280,14 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
                         "latest",
                     ],
                 },
+                cache_ttl_seconds=1_800, last_good_max_age_seconds=21_600,
             ),
-            http_client.get(
+            governed_async_request(
+                http_client, "GET",
                 f"https://api.geckoterminal.com/api/v2/networks/{DEX_CHAIN_ID}/pools/{DEX_PAIR_ADDRESS}",
+                provider="geckoterminal", job="verified_supply",
                 headers={"Accept": "application/json;version=20230302"},
+                cache_ttl_seconds=1_800, last_good_max_age_seconds=21_600,
             ),
         )
         for response in (coin_market_cap_response, bsc_response, gecko_response):
@@ -2571,7 +2587,7 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"Unsupported server job type: {job_type}")
 
 
-async def _drain_due_phase1_jobs(worker_id: str) -> None:
+async def _drain_due_phase1_jobs(worker_id: str) -> int:
     """Claim due work frequently without rebuilding the durable schedule."""
 
     processed = 0
@@ -2593,6 +2609,15 @@ async def _drain_due_phase1_jobs(worker_id: str) -> None:
                 "jobId": job["jobId"],
                 "jobType": job["jobType"],
                 "completedAt": utc_iso(),
+                "completionState": (
+                    "completed_with_warnings"
+                    if (
+                        (isinstance(result.get("packet"), dict) and result["packet"].get("status") in {"degraded", "unavailable"})
+                        or result.get("sourceErrors")
+                        or result.get("maintenanceErrors")
+                        or result.get("errors")
+                    ) else "completed"
+                ),
             }
             phase1_state["lastError"] = None
         except asyncio.CancelledError:
@@ -2603,6 +2628,7 @@ async def _drain_due_phase1_jobs(worker_id: str) -> None:
         finally:
             phase1_state["activeJob"] = None
         processed += 1
+    return processed
 
 
 async def phase1_job_loop() -> None:
@@ -2610,17 +2636,23 @@ async def phase1_job_loop() -> None:
 
     worker_id = f"render:{BUILD_ID}:{uuid.uuid4().hex[:12]}"
     last_schedule_bucket: int | None = None
+    idle_poll_seconds = SERVER_JOB_POLL_SECONDS
     phase1_state["running"] = True
     try:
         await asyncio.sleep(2)
         while True:
             phase1_state["lastRunAt"] = utc_iso()
             try:
-                schedule_bucket = int(time.time()) // 300
+                schedule_bucket = int(time.time()) // COLLECT_SECONDS
                 if schedule_bucket == last_schedule_bucket:
-                    await _drain_due_phase1_jobs(worker_id)
-                    await asyncio.sleep(SERVER_JOB_POLL_SECONDS)
+                    processed = await _drain_due_phase1_jobs(worker_id)
+                    idle_poll_seconds = (
+                        SERVER_JOB_POLL_SECONDS if processed
+                        else min(120, max(SERVER_JOB_POLL_SECONDS, idle_poll_seconds * 2))
+                    )
+                    await asyncio.sleep(idle_poll_seconds)
                     continue
+                await asyncio.to_thread(expire_exhausted_jobs)
                 await asyncio.to_thread(
                     schedule_current_evidence_job,
                     interval_seconds=COLLECT_SECONDS,
@@ -2705,12 +2737,13 @@ async def phase1_job_loop() -> None:
                     max_attempts=2,
                 )
                 last_schedule_bucket = schedule_bucket
-                await _drain_due_phase1_jobs(worker_id)
+                processed = await _drain_due_phase1_jobs(worker_id)
+                idle_poll_seconds = SERVER_JOB_POLL_SECONDS if processed else min(120, SERVER_JOB_POLL_SECONDS * 2)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 phase1_state["lastError"] = f"{type(exc).__name__}: {str(exc)[:500]}"
-            await asyncio.sleep(SERVER_JOB_POLL_SECONDS)
+            await asyncio.sleep(idle_poll_seconds)
     finally:
         phase1_state["running"] = False
 
@@ -2816,6 +2849,85 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+def _client_cache_seconds(path: str) -> int:
+    if path.startswith("/v1/tag/history"):
+        return 900
+    if path.startswith("/v1/tag/evidence"):
+        return 300
+    if path.startswith("/v1/tag/control-center"):
+        return 60
+    return 30
+
+
+@app.middleware("http")
+async def bound_and_condition_read_responses(request: Request, call_next: Any) -> Any:
+    """Bound ordinary reads and avoid retransmitting unchanged responses."""
+
+    response = await call_next(request)
+    if (
+        request.method.upper() not in {"GET", "HEAD"}
+        or response.status_code != 200
+        or request.url.path in {"/health", "/openapi.json"}
+        or "attachment" in response.headers.get("content-disposition", "").lower()
+    ):
+        return response
+    content_type = response.headers.get("content-type", "").lower()
+    if "application/json" not in content_type and "text/plain" not in content_type:
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    detail_route = request.url.path.startswith(("/v1/tag/history/", "/v1/tag/evidence/"))
+    maximum = 8_000_000 if detail_route else 2_000_000
+    if len(body) > maximum:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "detail": "Response exceeds the bounded read limit; request a smaller page or open a detail endpoint.",
+                "maximumBytes": maximum,
+            },
+        )
+    etag = f'"{hashlib.sha256(body).hexdigest()}"'
+    if len(conditional_last_modified) >= 2_048:
+        conditional_last_modified.clear()
+    last_modified = conditional_last_modified.setdefault(
+        etag,
+        formatdate(time.time(), usegmt=True),
+    )
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+    headers["etag"] = etag
+    headers["last-modified"] = last_modified
+    headers["cache-control"] = (
+        f"private, max-age={_client_cache_seconds(request.url.path)}, must-revalidate"
+    )
+    headers["x-response-uncompressed-bytes"] = str(len(body))
+    supplied_etag = request.headers.get("if-none-match", "").strip()
+    if supplied_etag.startswith("W/"):
+        supplied_etag = supplied_etag[2:]
+    not_modified = supplied_etag == etag
+    if not not_modified:
+        not_modified = (
+            request.headers.get("if-modified-since", "").strip() == last_modified
+        )
+    if not_modified:
+        return Response(
+            status_code=304,
+            headers={
+                "etag": etag,
+                "last-modified": last_modified,
+                "cache-control": headers["cache-control"],
+            },
+        )
+    return Response(
+        content=body,
+        status_code=response.status_code,
+        headers=headers,
+        background=response.background,
+    )
+
+
+app.add_middleware(GZipMiddleware, minimum_size=1_024, compresslevel=6)
 
 
 @app.get("/")
@@ -2992,6 +3104,35 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         if str(value).strip()
     ]
     grader_healthy = grader_running and not grader_errors
+    packet = phase1_state.get("lastPacket") if isinstance(phase1_state.get("lastPacket"), dict) else {}
+    packet_items = packet.get("items") if isinstance(packet.get("items"), list) else []
+    evidence_status = str(packet.get("status") or "unavailable").lower()
+    item_warnings: list[dict[str, Any]] = []
+    evidence_sources: list[dict[str, Any]] = []
+    for item in packet_items:
+        if not isinstance(item, dict):
+            continue
+        validation = str(item.get("validationStatus") or "unavailable").lower()
+        freshness = str(item.get("freshness") or "unavailable").lower()
+        degradation = str(item.get("degradationStatus") or "none").lower()
+        state = (
+            "unavailable" if validation in {"unavailable", "invalid"}
+            else "stale" if freshness == "stale"
+            else "partial" if degradation != "none"
+            else "current"
+        )
+        source_id = str(item.get("sourceId") or "unknown")[:100]
+        evidence_sources.append({
+            "id": source_id, "status": state,
+            "observedAt": item.get("observedAt"),
+            "provenance": {
+                "collector": (item.get("provenance") or {}).get("collector")
+                if isinstance(item.get("provenance"), dict) else None,
+                "contentHash": item.get("contentHash"),
+            },
+        })
+        if state != "current":
+            item_warnings.append({"sourceId": source_id, "state": state})
     flags = operating_status(SERVICE_VERSION)["usage"]["flags"]
     minimum_ready = bool(
         authenticated
@@ -3001,6 +3142,7 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         and flags["deterministicGradingEnabled"]
         and grader_healthy
         and storage_persistent
+        and evidence_status == "current"
     )
     blockers: list[str] = []
     if not authenticated:
@@ -3021,6 +3163,11 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         )
     if not storage_persistent:
         blockers.append("Persistent database storage is not configured")
+    if evidence_status != "current":
+        blockers.append(
+            "Evidence packet is unavailable" if not packet
+            else f"Evidence packet is {evidence_status} ({len(item_warnings)} source warning(s))"
+        )
 
     return {
         "ok": True,
@@ -3030,6 +3177,19 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         "authenticated": authenticated,
         "sideEffects": "none",
         "repairMode": REPAIR_MODE,
+        "status": "healthy" if evidence_status == "current" and not grader_errors else "degraded",
+        "evidence": {
+            "status": evidence_status,
+            "snapshotId": packet.get("snapshotId"),
+            "dataAsOf": packet.get("dataAsOf"),
+            "sourceSummary": packet.get("sourceSummary") or {"total": 0, "available": 0, "degraded": 0},
+            "warnings": item_warnings[:12],
+            "lastVerified": {
+                "observation": packet.get("dataAsOf"),
+                "evidenceHash": packet.get("evidenceHash"),
+                "provenance": "canonical-evidence-packet",
+            } if packet else None,
+        },
         "minimumLiveServicesReady": minimum_ready,
         "blockers": blockers,
         "services": {
@@ -3078,6 +3238,7 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
                 "connected": depth_connected,
                 "lastObservedAt": depth_last_message,
             },
+            *evidence_sources,
         ],
         "storage": {
             "persistent": storage_persistent,

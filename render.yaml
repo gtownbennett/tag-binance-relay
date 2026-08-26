@@ -14,7 +14,13 @@ services:
       - key: SERVER_JOBS_ENABLED
         value: "true"
       - key: SERVER_JOB_POLL_SECONDS
-        value: "5"
+        value: "30"
+      - key: COLLECT_SECONDS
+        value: "600"
+      - key: EXTERNAL_REQUEST_DAILY_LIMIT
+        value: "5200"
+      - key: EXTERNAL_REQUEST_MONTHLY_LIMIT
+        value: "180000"
       - key: DETERMINISTIC_GRADING_ENABLED
         value: "true"
       - key: PAID_AI_ENABLED

@@ -8,6 +8,8 @@ from typing import Any, Mapping, Sequence
 
 import httpx
 
+from app.outbound_requests import governed_async_request
+
 from app.historical_memory import (
     TAG_CONTRACT,
     begin_backfill_range,
@@ -53,8 +55,10 @@ async def _get_json(
     for attempt in range(max(1, min(int(attempts), 3))):
         try:
             async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-                response = await client.get(url, params=params)
-                response.raise_for_status()
+                response = await governed_async_request(
+                    client, "GET", url, job="historical_backfill", params=params,
+                    cache_ttl_seconds=86_400, last_good_max_age_seconds=604_800,
+                )
                 payload = response.json()
                 return payload, str(response.request.url)
         except (httpx.HTTPError, ValueError) as exc:
