@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -30,8 +29,9 @@ def _public_error(value: Any) -> str:
         return "Secure connection validation failed; this metric is excluded."
     if "timeout" in lowered or "timed out" in lowered:
         return "Source timed out; this metric is temporarily excluded."
-    text = re.sub(r"https?://\S+", "source endpoint", text)
-    return text[:180] if text else "Source metric unavailable."
+    # Unknown transport/parser failures belong in the server-side audit log,
+    # never in an app-facing evidence note.
+    return "Source metric unavailable."
 
 
 def _finite(value: Any) -> float | None:

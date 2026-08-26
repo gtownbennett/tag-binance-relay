@@ -81,8 +81,28 @@ class _CachedResponse:
 
 _cache_lock = threading.Lock()
 _response_cache: dict[str, _CachedResponse] = {}
+_client_token_lock = threading.Lock()
+_client_tokens: dict[int, tuple[Any, int]] = {}
+_next_client_token = 1
 _inflight_lock: asyncio.Lock | None = None
 _inflight: dict[str, asyncio.Task[httpx.Response]] = {}
+
+
+def _client_token(client: Any) -> int:
+    """Return a process-unique token without allowing recycled object ids."""
+
+    global _next_client_token
+    identity = id(client)
+    with _client_token_lock:
+        existing = _client_tokens.get(identity)
+        if existing is not None and existing[0] is client:
+            return existing[1]
+        token = _next_client_token
+        _next_client_token += 1
+        # Keep the small set of long-lived HTTP clients strongly referenced so
+        # CPython cannot recycle an id into an unrelated provider cache key.
+        _client_tokens[identity] = (client, token)
+        return token
 
 
 def _request_key(
@@ -135,12 +155,21 @@ def _cached_response(
 
 def _store_response(key: str, response: httpx.Response) -> None:
     if isinstance(response, httpx.Response) and response.is_success:
+        # httpx exposes ``response.content`` after transfer/content decoding.
+        # Reusing that decoded byte string with the original Content-Encoding
+        # header makes a cached response attempt gzip/deflate decoding twice.
+        # Strip representation-framing headers before reconstructing it.
+        cached_headers = {
+            str(k): str(v)
+            for k, v in response.headers.items()
+            if str(k).lower() not in {"content-encoding", "content-length", "transfer-encoding"}
+        }
         with _cache_lock:
             _response_cache[key] = _CachedResponse(
                 stored_at=time.monotonic(),
                 status_code=response.status_code,
                 content=bytes(response.content),
-                headers={str(k): str(v) for k, v in response.headers.items()},
+                headers=cached_headers,
             )
 
 
@@ -190,7 +219,7 @@ async def governed_async_request(
     """Perform one bounded async request with coalescing and last-good fallback."""
 
     selected_provider = provider or provider_for_url(url)
-    key = _request_key(method, url, params, json_body, client_identity=id(client))
+    key = _request_key(method, url, params, json_body, client_identity=_client_token(client))
     cached = _cached_response(
         key, method=method, url=url, max_age_seconds=cache_ttl_seconds, last_good=False
     )
@@ -267,7 +296,7 @@ def governed_sync_request(
     """Synchronous counterpart used by bounded worker-thread collectors."""
 
     selected_provider = provider or provider_for_url(url)
-    key = _request_key(method, url, params, json_body, client_identity=id(client))
+    key = _request_key(method, url, params, json_body, client_identity=_client_token(client))
     cached = _cached_response(
         key, method=method, url=url, max_age_seconds=cache_ttl_seconds, last_good=False
     )
