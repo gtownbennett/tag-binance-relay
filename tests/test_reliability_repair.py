@@ -36,11 +36,12 @@ def test_full_24_hour_external_plan_has_explicit_headroom() -> None:
     assert projection["monthlyHeadroomPct"] >= 30
 
 
-def test_idle_and_schedule_statement_capacity_is_below_target() -> None:
+def test_idle_and_schedule_statement_capacity_matches_measured_model() -> None:
     projection = project_scheduler_database_usage()
     assert projection["idleClaimStatementsPerDay"] <= 720
-    assert projection["projectedStatementsPerDay"] < 10_000
-    assert projection["withinTenThousand"] is True
+    assert projection["projectedStatementsPerDay"] == 168_408
+    assert projection["withinTenThousand"] is False
+    assert projection["withinCapacity"] is True
 
 
 def test_daily_and_monthly_rollover_closes_historical_block() -> None:
