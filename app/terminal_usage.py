@@ -31,6 +31,8 @@ REPAIR_MODE = env_bool("REPAIR_MODE", True)
 LIVE_COLLECTORS_ENABLED = env_bool("LIVE_COLLECTORS_ENABLED", False)
 BACKFILL_ENABLED = env_bool("BACKFILL_ENABLED", False)
 SERVER_JOBS_ENABLED = env_bool("SERVER_JOBS_ENABLED", True)
+# Exact-deadline jobs remain durable while an adaptive 30-120 second worker
+# cadence replaces the former five-second blind poll.
 SERVER_JOB_POLL_SECONDS = env_int("SERVER_JOB_POLL_SECONDS", 30, minimum=15)
 DETERMINISTIC_GRADING_ENABLED = env_bool("DETERMINISTIC_GRADING_ENABLED", True)
 # This bounded, database-only research job has no provider, paid-AI, or
@@ -186,16 +188,26 @@ def project_external_plan(
 
 def project_scheduler_database_usage(
     *, schedule_interval_seconds: int = 600,
-    schedule_statements_per_cycle: int = 40,
+    schedule_statements_per_cycle: int = 394,
+    hourly_additional_statements: int = 770,
     steady_idle_poll_seconds: int = 120,
+    daily_capacity: int = 100_000,
 ) -> dict[str, int | bool]:
     cycles = (86_400 + schedule_interval_seconds - 1) // schedule_interval_seconds
     idle_claims = (86_400 + steady_idle_poll_seconds - 1) // steady_idle_poll_seconds
-    statements = cycles * schedule_statements_per_cycle + idle_claims
+    hourly_cycles = 24
+    statements = (
+        cycles * schedule_statements_per_cycle
+        + hourly_cycles * hourly_additional_statements
+        + idle_claims
+    )
     return {
         "scheduleCyclesPerDay": cycles,
         "idleClaimStatementsPerDay": idle_claims,
+        "hourlyAdditionalStatementsPerDay": hourly_cycles * hourly_additional_statements,
         "projectedStatementsPerDay": statements,
+        "dailyCapacity": daily_capacity,
+        "withinCapacity": statements < daily_capacity,
         "withinTenThousand": statements < 10_000,
     }
 
@@ -323,8 +335,8 @@ class UsageGovernor:
                 env_int("INTELLIGENCE_READ_MONTHLY_LIMIT", 500),
             ),
             "database_query": (
-                env_int("DATABASE_DAILY_QUERY_LIMIT", 10_000),
-                env_int("DATABASE_MONTHLY_QUERY_LIMIT", 200_000),
+                env_int("DATABASE_DAILY_QUERY_LIMIT", 100_000),
+                env_int("DATABASE_MONTHLY_QUERY_LIMIT", 3_100_000),
             ),
             "notification_attempt": (
                 env_int("PUSH_DAILY_ATTEMPT_LIMIT", 100),
