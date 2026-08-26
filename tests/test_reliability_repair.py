@@ -192,6 +192,7 @@ def test_unchanged_read_uses_etag_without_retransmitting_body() -> None:
     client = TestClient(main.app)
     first = client.get("/")
     etag = first.headers["etag"]
-    unchanged = client.get("/", headers={"If-None-Match": etag})
+    weak_etag = etag if etag.startswith("W/") else f"W/{etag}"
+    unchanged = client.get("/", headers={"If-None-Match": weak_etag})
     assert unchanged.status_code == 304
     assert unchanged.content == b""
