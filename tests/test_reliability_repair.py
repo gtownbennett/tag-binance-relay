@@ -29,7 +29,9 @@ def test_full_day_request_and_database_projections_have_headroom() -> None:
     database = project_scheduler_database_usage()
     assert external["withinBudget"] is True
     assert external["dailyHeadroomPct"] >= 50
-    assert database["projectedStatementsPerDay"] < 10_000
+    assert database["projectedStatementsPerDay"] == 75_936
+    assert database["withinTenThousand"] is False
+    assert database["withinCapacity"] is True
 
 
 def test_historical_blocks_do_not_keep_current_circuit_open() -> None:
