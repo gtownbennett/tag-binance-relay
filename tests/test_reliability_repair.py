@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import re
 from collections import defaultdict
@@ -80,6 +81,44 @@ def test_retry_attempts_are_each_accounted(monkeypatch) -> None:
     assert response.status_code == 200
     assert client.calls == 2
     assert governor.summary()["providers"]["today"]["binance"] == 2
+
+
+def test_cached_decoded_body_drops_transfer_encoding(monkeypatch) -> None:
+    governor = UsageGovernor()
+    monkeypatch.setattr(outbound_requests, "usage_governor", governor)
+    outbound_requests._response_cache.clear()
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get(self, url: str, **_kwargs) -> httpx.Response:
+            self.calls += 1
+            return httpx.Response(
+                200,
+                content=gzip.compress(b'{"ok":true}'),
+                headers={"Content-Encoding": "gzip"},
+                request=httpx.Request("GET", url),
+            )
+
+    client = Client()
+
+    async def run() -> tuple[httpx.Response, httpx.Response]:
+        first = await governed_async_request(
+            client, "GET", "https://cache.test/encoded", provider="other",
+            cache_ttl_seconds=60,
+        )
+        second = await governed_async_request(
+            client, "GET", "https://cache.test/encoded", provider="other",
+            cache_ttl_seconds=60,
+        )
+        return first, second
+
+    first, second = asyncio.run(run())
+    assert first.json() == {"ok": True}
+    assert second.json() == {"ok": True}
+    assert "content-encoding" not in second.headers
+    assert client.calls == 1
 
 
 def test_outbound_failures_never_echo_endpoint_or_secret() -> None:
