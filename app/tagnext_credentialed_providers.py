@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .outbound_requests import governed_sync_request
 from .tagnext_intelligence import TAG_CONTRACT
 from .tagnext_onchain import BnbRpc, DECIMALS_SELECTOR, TOTAL_SUPPLY_SELECTOR
 
@@ -126,10 +127,14 @@ class CoinalyzeReadOnlyClient:
     def _get(self, path: str, *, params: Mapping[str, Any] | None = None) -> Any:
         # Header authentication prevents the key from entering request URLs,
         # reverse-proxy URL logs, exception strings, and audit provenance.
-        response = self._client.get(
+        response = governed_sync_request(
+            self._client, "GET",
             f"{COINALYZE_BASE_URL}/{path.lstrip('/')}",
+            provider="coinalyze", job="credentialed_provider",
             params=dict(params or {}),
             headers={"api_key": self._api_key, "Accept": "application/json"},
+            cache_ttl_seconds=900,
+            last_good_max_age_seconds=3_600,
         )
         if response.status_code != 200:
             raise ProviderResponseError(

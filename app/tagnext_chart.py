@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 import httpx
 
+from .outbound_requests import governed_sync_request
 from .tagnext_intelligence import PRIMARY_POOL, TAG_CONTRACT, WBNB_CONTRACT
 
 
@@ -158,14 +159,18 @@ def chart_payload(
         headers={"User-Agent": "TAGneXt-canonical-chart/1.0"},
     )
     try:
-        response = http.get(
+        response = governed_sync_request(
+            http, "GET",
             endpoint,
+            provider="geckoterminal", job="app_chart",
             params={
                 "aggregate": aggregate,
                 "limit": limit,
                 "currency": "usd",
                 "token": "base",
             },
+            cache_ttl_seconds=300,
+            last_good_max_age_seconds=3_600,
         )
         if response.status_code != 200:
             raise ChartDataError(f"chart provider returned HTTP {response.status_code}")

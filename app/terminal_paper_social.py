@@ -27,6 +27,7 @@ from .terminal_database import (
     session_scope,
     utc_now,
 )
+from .outbound_requests import governed_async_request
 
 PAPER_ACCOUNT_KEY = "tag-paper-futures"
 PAPER_STARTING_BALANCE = float(os.getenv("PAPER_STARTING_BALANCE", "10000"))
@@ -430,8 +431,11 @@ async def poll_cmc_social_calls(force: bool = False) -> dict[str, Any]:
     _last_cmc_poll_monotonic = now_mono
     headers = {"X-CMC_PRO_API_KEY": CMC_PRO_API_KEY, "Accept": "application/json"}
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=headers) as client:
-        response = await client.get(CMC_POSTS_URL, params={"symbol": "TAG"})
-        response.raise_for_status()
+        response = await governed_async_request(
+            client, "GET", CMC_POSTS_URL, provider="coinmarketcap",
+            job="social_poll", params={"symbol": "TAG"},
+            cache_ttl_seconds=1_800, last_good_max_age_seconds=21_600,
+        )
         result = ingest_cmc_posts_response(response.json())
         return {"configured": True, "status": "CMC Community posts imported from the official Content API.", **result}
 
@@ -467,8 +471,9 @@ async def enrich_social_calls_with_cmc_quotes(limit: int = 5) -> dict[str, Any]:
                 continue
             checked += 1
             try:
-                response = await client.get(
-                    CMC_QUOTES_URL,
+                response = await governed_async_request(
+                    client, "GET", CMC_QUOTES_URL,
+                    provider="coinmarketcap", job="social_enrichment",
                     params={
                         "id": CMC_TAG_ID,
                         "time_start": (posted_at - timedelta(minutes=10)).isoformat(),
@@ -477,8 +482,9 @@ async def enrich_social_calls_with_cmc_quotes(limit: int = 5) -> dict[str, Any]:
                         "convert": "USD",
                         "skip_invalid": "true",
                     },
+                    cache_ttl_seconds=86_400,
+                    last_good_max_age_seconds=604_800,
                 )
-                response.raise_for_status()
                 root = response.json()
                 data = root.get("data") if isinstance(root, dict) else {}
                 asset = data.get(str(CMC_TAG_ID)) if isinstance(data, dict) else None

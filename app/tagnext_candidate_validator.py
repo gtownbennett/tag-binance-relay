@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 from sqlalchemy import func, select
 
+from .outbound_requests import governed_sync_request
 from .tagnext_discovery import SOURCE_SEEDS
 from .tagnext_external_adapters import TAG_CONTRACT, adapter_for_url, parse_document
 from .tagnext_pipeline import store_external_snapshot
@@ -413,7 +414,11 @@ def validate_candidate_batch(*, limit: int = 12, timeout_seconds: int = 20) -> d
                 continue
 
             try:
-                response = client.get(normalized)
+                response = governed_sync_request(
+                    client, "GET", normalized, provider="other",
+                    job="candidate_validation", cache_ttl_seconds=21_600,
+                    last_good_max_age_seconds=86_400,
+                )
                 resolved = normalize_candidate_url(str(response.url))
                 response_hash = hashlib.sha256(response.content).hexdigest()
                 source = _source_for_url(resolved)

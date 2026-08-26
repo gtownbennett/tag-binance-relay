@@ -17,6 +17,7 @@ from xml.etree import ElementTree
 import httpx
 from sqlalchemy import select
 
+from .outbound_requests import governed_sync_request
 from .tagnext_intelligence import TAG_CONTRACT
 from .terminal_database import (
     TagNextDiscoveryCandidateRow,
@@ -211,8 +212,11 @@ def public_discovery_worker_run(
             engine = item["engine"]
             query = item["query"]
             try:
-                response = client.get(SEARCH_ENGINES[engine].format(query=quote_plus(query)))
-                response.raise_for_status()
+                response = governed_sync_request(
+                    client, "GET", SEARCH_ENGINES[engine].format(query=quote_plus(query)),
+                    provider="other", job="tagnext_discovery",
+                    cache_ttl_seconds=21_600, last_good_max_age_seconds=86_400,
+                )
                 urls = parse_search_results(engine, response.text)
                 status = "ok"
             except Exception as exc:

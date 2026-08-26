@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 import httpx
 from eth_hash.auto import keccak
 
+from .outbound_requests import classify_failure, governed_sync_request
 from .tagnext_intelligence import PRIMARY_POOL, TAG_CONTRACT, WBNB_CONTRACT, simulate_orderbook_exit
 from .tagnext_onchain import BnbRpc
 from .terminal_database import (
@@ -156,7 +157,11 @@ def collect_live_orderbooks(
     try:
         for request in BOOK_REQUESTS:
             try:
-                response = http.get(request.url, params=request.params)
+                response = governed_sync_request(
+                    http, "GET", request.url, job="live_orderbooks",
+                    params=request.params, cache_ttl_seconds=900,
+                    last_good_max_age_seconds=3_600,
+                )
                 payload = response.json()
                 error = _book_error(response, payload)
                 if error:
@@ -209,7 +214,7 @@ def collect_live_orderbooks(
                 failures.append({
                     "providerId": request.provider_id, "venue": request.venue,
                     "symbol": request.symbol, "marketClass": request.market_class,
-                    "sourceUrl": request.url, "reason": f"{type(exc).__name__}: {exc}",
+                    "reason": classify_failure(exc),
                     "observedAt": stamp.isoformat(),
                 })
     finally:
@@ -347,15 +352,17 @@ def _public_wbnb_usd(http: httpx.Client) -> tuple[float, str]:
     errors: list[str] = []
     for url, params, extractor in probes:
         try:
-            response = http.get(url, params=params)
-            response.raise_for_status()
+            response = governed_sync_request(
+                http, "GET", url, job="bnb_usd_reference", params=params,
+                cache_ttl_seconds=300, last_good_max_age_seconds=3_600,
+            )
             value = float(extractor(response.json()))
             if value > 0 and math.isfinite(value):
                 return value, str(response.url)
             raise ValueError("non-positive price")
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
-            errors.append(f"{url}: {type(exc).__name__}: {exc}")
-    raise RuntimeError("all public BNB/USDT price probes failed: " + " | ".join(errors))
+            errors.append(classify_failure(exc))
+    raise RuntimeError("public BNB/USDT price is temporarily unavailable")
 
 
 def collect_pancake_exit_ladder(
