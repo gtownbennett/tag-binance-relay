@@ -3218,7 +3218,10 @@ async def bound_and_condition_read_responses(request: Request, call_next: Any) -
     headers["last-modified"] = last_modified
     headers["cache-control"] = f"private, max-age={cache_seconds}, must-revalidate"
     headers["x-response-uncompressed-bytes"] = str(len(body))
-    not_modified = request.headers.get("if-none-match", "").strip() == etag
+    supplied_etag = request.headers.get("if-none-match", "").strip()
+    if supplied_etag.startswith("W/"):
+        supplied_etag = supplied_etag[2:]
+    not_modified = supplied_etag == etag
     if not not_modified:
         not_modified = (
             request.headers.get("if-modified-since", "").strip() == last_modified
