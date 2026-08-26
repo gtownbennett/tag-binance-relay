@@ -84,7 +84,8 @@ def test_verified_supply_prefers_validated_nodereal_for_total_supply_only() -> N
     assert '"https://api.coingecko.com/api/v3/coins/markets"' in collector
     assert "normalize_coingecko_markets_supply" in collector
     assert '"https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger"' in collector
-    assert 'http_client.post(\n                supply_rpc_url' in collector
+    assert 'http_client, "POST",\n                supply_rpc_url' in collector
+    assert 'provider="bnb_rpc", job="verified_supply"' in collector
     assert '"totalSupplyRpcProvider": supply_rpc_provider' in collector
 
 

@@ -68,6 +68,7 @@ from app.phase1_reliability import (
     claim_due_job,
     complete_job,
     enqueue_job,
+    expire_exhausted_jobs,
     fail_job,
     latest_evidence_packet,
     persist_evidence_packet,
@@ -226,6 +227,11 @@ from app.terminal_usage import (
     operating_status,
     request_budget_scope,
     usage_governor,
+)
+from app.outbound_requests import (
+    OutboundUnavailable,
+    classify_failure,
+    governed_async_request,
 )
 
 
@@ -859,39 +865,40 @@ def require_repair_writes_unlocked(action: str) -> None:
 async def get_json(path: str, params: dict[str, Any] | None = None) -> Any:
     if http_client is None:
         raise RuntimeError("HTTP client has not started.")
-    consume_request_budget("external_request")
-    allowed, reason = usage_governor.authorize("external_request")
-    if not allowed:
-        raise RuntimeError(f"External request circuit is open ({reason}).")
-
-    response = await http_client.get(f"{REST_BASE}{path}", params=params)
-
-    if response.status_code == 451:
-        raise RuntimeError(
-            "Binance returned HTTP 451. The relay region cannot access this endpoint."
-        )
-
-    response.raise_for_status()
+    response = await governed_async_request(
+        http_client,
+        "GET",
+        f"{REST_BASE}{path}",
+        provider="binance",
+        job="canonical_evidence",
+        params=params,
+        cache_ttl_seconds=max(15, min(60, COLLECT_SECONDS // 4)),
+        last_good_max_age_seconds=1_800,
+        attempts=2,
+    )
     try:
         return response.json()
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Binance returned non-JSON data for {path}.") from exc
+        raise OutboundUnavailable("binance", "unavailable") from exc
 
 
 async def get_dex_json(path: str) -> Any:
     if http_client is None:
         raise RuntimeError("HTTP client has not started.")
-    consume_request_budget("external_request")
-    allowed, reason = usage_governor.authorize("external_request")
-    if not allowed:
-        raise RuntimeError(f"External request circuit is open ({reason}).")
-
-    response = await http_client.get(f"{DEXSCREENER_BASE}{path}")
-    response.raise_for_status()
+    response = await governed_async_request(
+        http_client,
+        "GET",
+        f"{DEXSCREENER_BASE}{path}",
+        provider="dexscreener",
+        job="canonical_evidence",
+        cache_ttl_seconds=max(30, min(120, COLLECT_SECONDS // 2)),
+        last_good_max_age_seconds=1_800,
+        attempts=2,
+    )
     try:
         return response.json()
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"DEX Screener returned non-JSON data for {path}.") from exc
+        raise OutboundUnavailable("dexscreener", "unavailable") from exc
 
 
 def _window_value(container: Any, window: str, field: str | None = None) -> Any:
@@ -1668,10 +1675,6 @@ async def collect_snapshot(*, include_rest_state: bool = False) -> dict[str, Any
             "/futures/data/topLongShortPositionRatio",
             {"symbol": SYMBOL, "period": "5m", "limit": 2},
         ),
-        "taker": get_json(
-            "/futures/data/takerlongshortRatio",
-            {"symbol": SYMBOL, "period": "5m", "limit": 2},
-        ),
         "taker_1h": get_json(
             "/futures/data/takerlongshortRatio",
             {"symbol": SYMBOL, "period": "5m", "limit": 12},
@@ -1751,9 +1754,11 @@ async def collect_snapshot(*, include_rest_state: bool = False) -> dict[str, Any
     global_ratio = latest_item(data.get("global_ratio")) or {}
     top_account = latest_item(data.get("top_account")) or {}
     top_position = latest_item(data.get("top_position")) or {}
-    taker = latest_item(data.get("taker")) or {}
     rolling_taker = await rolling_taker_1h()
     taker_history = data.get("taker_1h") if isinstance(data.get("taker_1h"), list) else []
+    # The one-hour series already contains the newest five-minute observation;
+    # a second request with limit=2 was identical provider traffic.
+    taker = latest_item(taker_history) or {}
     fallback_buy_contracts = sum(as_float(row.get("buyVol")) or 0.0 for row in taker_history if isinstance(row, dict))
     fallback_sell_contracts = sum(as_float(row.get("sellVol")) or 0.0 for row in taker_history if isinstance(row, dict))
     fallback_buy_usd = fallback_buy_contracts * mark_price if mark_price is not None and fallback_buy_contracts > 0 else None
@@ -2309,24 +2314,31 @@ async def collect_verified_cex_spot_once() -> list[dict[str, Any]]:
 
     async def gate() -> dict[str, Any]:
         try:
-            response = await http_client.get("https://api.gateio.ws/api/v4/spot/tickers", params={"currency_pair": "TAG_USDT"})
-            response.raise_for_status()
+            response = await governed_async_request(
+                http_client, "GET", "https://api.gateio.ws/api/v4/spot/tickers",
+                provider="gate", job="canonical_evidence",
+                params={"currency_pair": "TAG_USDT"}, cache_ttl_seconds=120,
+                last_good_max_age_seconds=1_800,
+            )
             rows = response.json()
             row = rows[0] if isinstance(rows, list) and rows else {}
             observed_at = terminal_utc_now().isoformat()
             return {"exchange": "Gate", "available": True, "priceUsd": as_float(row.get("last")), "volumeUsd24h": as_float(row.get("quote_volume")), "priceChange24hPct": as_float(row.get("change_percentage")), "observedAt": observed_at, "updatedAt": observed_at, "marketType": "spot"}
         except Exception as exc:
-            return {"exchange": "Gate", "available": False, "failureReason": f"{type(exc).__name__}: {exc}"}
+            return {"exchange": "Gate", "available": False, "failureReason": classify_failure(exc)}
 
     async def mexc() -> dict[str, Any]:
         try:
-            response = await http_client.get("https://api.mexc.com/api/v3/ticker/24hr", params={"symbol": "TAGUSDT"})
-            response.raise_for_status()
+            response = await governed_async_request(
+                http_client, "GET", "https://api.mexc.com/api/v3/ticker/24hr",
+                provider="mexc", job="canonical_evidence", params={"symbol": "TAGUSDT"},
+                cache_ttl_seconds=120, last_good_max_age_seconds=1_800,
+            )
             row = response.json() if isinstance(response.json(), dict) else {}
             observed_at = terminal_utc_now().isoformat()
             return {"exchange": "MEXC", "available": True, "priceUsd": as_float(row.get("lastPrice")), "volumeUsd24h": as_float(row.get("quoteVolume")), "priceChange24hPct": as_float(row.get("priceChangePercent")), "observedAt": observed_at, "updatedAt": observed_at, "marketType": "spot"}
         except Exception as exc:
-            return {"exchange": "MEXC", "available": False, "failureReason": f"{type(exc).__name__}: {exc}"}
+            return {"exchange": "MEXC", "available": False, "failureReason": classify_failure(exc)}
 
     return list(await asyncio.gather(gate(), mexc()))
 
@@ -2359,8 +2371,10 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
             "User-Agent": "TAGneXt-RC4/1.0 (read-only supply verification)",
         }
         coin_gecko_response, coin_market_cap_response, bsc_response = await asyncio.gather(
-            http_client.get(
+            governed_async_request(
+                http_client, "GET",
                 "https://api.coingecko.com/api/v3/coins/tagger",
+                provider="coingecko", job="verified_supply",
                 params={
                     "localization": "false",
                     "tickers": "false",
@@ -2370,14 +2384,22 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
                     "sparkline": "false",
                 },
                 headers=request_headers,
+                cache_ttl_seconds=1_800,
+                last_good_max_age_seconds=21_600,
             ),
-            http_client.get(
+            governed_async_request(
+                http_client, "GET",
                 "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=tagger",
+                provider="coinmarketcap", job="verified_supply",
                 headers=request_headers,
+                cache_ttl_seconds=1_800,
+                last_good_max_age_seconds=21_600,
             ),
-            http_client.post(
+            governed_async_request(
+                http_client, "POST",
                 supply_rpc_url,
-                json={
+                provider="bnb_rpc", job="verified_supply",
+                json_body={
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "eth_call",
@@ -2386,6 +2408,8 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
                         "latest",
                     ],
                 },
+                cache_ttl_seconds=1_800,
+                last_good_max_age_seconds=21_600,
             ),
         )
         for response in (coin_market_cap_response, bsc_response):
@@ -2397,10 +2421,14 @@ async def collect_verified_tag_supply_once() -> dict[str, Any]:
         if coin_gecko_response.is_success:
             coin_gecko_document = coin_gecko_response.json()
         else:
-            coin_gecko_markets_response = await http_client.get(
+            coin_gecko_markets_response = await governed_async_request(
+                http_client, "GET",
                 "https://api.coingecko.com/api/v3/coins/markets",
+                provider="coingecko", job="verified_supply",
                 params={"vs_currency": "usd", "ids": "tagger", "sparkline": "false"},
                 headers=request_headers,
+                cache_ttl_seconds=1_800,
+                last_good_max_age_seconds=21_600,
             )
             if not coin_gecko_markets_response.is_success:
                 raise SupplyTruthError(
@@ -2747,7 +2775,7 @@ async def _run_claimed_phase1_job(job: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"Unsupported server job type: {job_type}")
 
 
-async def _drain_due_phase1_jobs(worker_id: str) -> None:
+async def _drain_due_phase1_jobs(worker_id: str) -> int:
     """Claim due work frequently without rebuilding the durable schedule."""
 
     processed = 0
@@ -2769,6 +2797,16 @@ async def _drain_due_phase1_jobs(worker_id: str) -> None:
                 "jobId": job["jobId"],
                 "jobType": job["jobType"],
                 "completedAt": utc_iso(),
+                "completionState": (
+                    "completed_with_warnings"
+                    if (
+                        (isinstance(result.get("packet"), dict) and result["packet"].get("status") in {"degraded", "unavailable"})
+                        or result.get("sourceErrors")
+                        or result.get("maintenanceErrors")
+                        or result.get("errors")
+                    )
+                    else "completed"
+                ),
             }
             phase1_state["lastError"] = None
         except asyncio.CancelledError:
@@ -2779,6 +2817,7 @@ async def _drain_due_phase1_jobs(worker_id: str) -> None:
         finally:
             phase1_state["activeJob"] = None
         processed += 1
+    return processed
 
 
 async def phase1_job_loop() -> None:
@@ -2786,6 +2825,7 @@ async def phase1_job_loop() -> None:
 
     worker_id = f"render:{BUILD_ID}:{uuid.uuid4().hex[:12]}"
     last_schedule_bucket: int | None = None
+    idle_poll_seconds = SERVER_JOB_POLL_SECONDS
     phase1_state["running"] = True
     try:
         await asyncio.sleep(2)
@@ -2796,11 +2836,17 @@ async def phase1_job_loop() -> None:
                 # short worker cadence, but rebuild periodic bucket keys only
                 # once per five-minute scheduling window. The previous loop
                 # repeated every idempotency lookup every five seconds.
-                schedule_bucket = int(time.time()) // 300
+                schedule_bucket = int(time.time()) // COLLECT_SECONDS
                 if schedule_bucket == last_schedule_bucket:
-                    await _drain_due_phase1_jobs(worker_id)
-                    await asyncio.sleep(SERVER_JOB_POLL_SECONDS)
+                    processed = await _drain_due_phase1_jobs(worker_id)
+                    idle_poll_seconds = (
+                        SERVER_JOB_POLL_SECONDS
+                        if processed
+                        else min(120, max(SERVER_JOB_POLL_SECONDS, idle_poll_seconds * 2))
+                    )
+                    await asyncio.sleep(idle_poll_seconds)
                     continue
+                await asyncio.to_thread(expire_exhausted_jobs)
                 await asyncio.to_thread(
                     schedule_current_evidence_job,
                     interval_seconds=COLLECT_SECONDS,
@@ -2842,7 +2888,9 @@ async def phase1_job_loop() -> None:
                         payload={"bucket": discovery_bucket, "frequency": "low"},
                         max_attempts=2,
                     )
-                    chain_bucket = int(time.time()) // 300 * 300
+                    # Bounded hourly cursor catch-up avoids continuously
+                    # hammering free RPC endpoints while preserving durable progress.
+                    chain_bucket = int(time.time()) // 3_600 * 3_600
                     await asyncio.to_thread(
                         enqueue_job,
                         job_type="collect_tagnext_bnb_chain",
@@ -2851,7 +2899,7 @@ async def phase1_job_loop() -> None:
                         payload={"bucket": chain_bucket, "access": "free_direct_readonly"},
                         max_attempts=2,
                     )
-                    provider_bucket = int(time.time()) // 900 * 900
+                    provider_bucket = int(time.time()) // 3_600 * 3_600
                     await asyncio.to_thread(
                         enqueue_job,
                         job_type="collect_tagnext_provider_shadows",
@@ -2958,12 +3006,13 @@ async def phase1_job_loop() -> None:
                     max_attempts=2,
                 )
                 last_schedule_bucket = schedule_bucket
-                await _drain_due_phase1_jobs(worker_id)
+                processed = await _drain_due_phase1_jobs(worker_id)
+                idle_poll_seconds = SERVER_JOB_POLL_SECONDS if processed else min(120, SERVER_JOB_POLL_SECONDS * 2)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 phase1_state["lastError"] = f"{type(exc).__name__}: {str(exc)[:500]}"
-            await asyncio.sleep(SERVER_JOB_POLL_SECONDS)
+            await asyncio.sleep(idle_poll_seconds)
     finally:
         phase1_state["running"] = False
 
@@ -3350,6 +3399,85 @@ async def tagnext_identity(x_relay_key: str | None = Header(default=None)) -> di
     }
 
 
+@app.get("/v1/tagnext/app-snapshot")
+async def tagnext_app_snapshot(
+    horizon: str = Query("24h"),
+    timeframe: str = Query("1h"),
+    x_relay_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """One bounded, read-only phone refresh with independent section states."""
+
+    require_relay_key(x_relay_key)
+
+    async def section(name: str, operation: Any) -> tuple[str, dict[str, Any]]:
+        try:
+            value = await operation
+            return name, {"status": "current", "data": value}
+        except Exception as exc:
+            return name, {
+                "status": classify_failure(exc),
+                "warning": f"{name.replace('_', ' ').title()} is temporarily unavailable; cached verified data remains valid.",
+            }
+
+    rows = await asyncio.gather(
+        section("control_center", cached_thread_read(
+            "canonical-control-center:detail", 60,
+            canonical_control_center_snapshot, detail=True,
+        )),
+        section("predictions", cached_thread_read(
+            f"tagnext-predictions:{horizon.lower()}", 300,
+            predictions_payload, horizon=horizon.lower(),
+        )),
+        section("chart", cached_thread_read(
+            f"tagnext-chart:{timeframe.lower()}", 60,
+            chart_payload, timeframe=timeframe,
+        )),
+        section("providers", cached_thread_read(
+            "tagnext-provider-shadows", 300, provider_shadow_payload,
+        )),
+        section("onchain", cached_thread_read(
+            "tagnext-onchain:50", 300, tagnext_onchain_payload, limit=50,
+        )),
+        section("heatmaps", cached_thread_read(
+            "tagnext-heatmap:25", 300, tagnext_heatmap_payload, limit=25,
+        )),
+        section("future_paths", cached_thread_read(
+            f"tagnext-future-paths:{horizon.lower()}", 300,
+            server_future_paths_payload, horizon=horizon,
+        )),
+        section("events", cached_thread_read(
+            "tagnext-event-ledger:50", 300, tagnext_event_ledger_payload, limit=50,
+        )),
+    )
+    sections = dict(rows)
+    maximum_bytes = 1_000_000
+    result = {
+        "ok": True,
+        "schemaVersion": "tagnext-app-snapshot-v1",
+        "generatedAt": utc_iso(),
+        "overallStatus": (
+            "current" if all(value["status"] == "current" for value in sections.values())
+            else "partial"
+        ),
+        "sections": sections,
+        "maximumBytes": maximum_bytes,
+        "readOnly": True,
+    }
+    # Preserve the most important control/prediction sections and explicitly
+    # mark bulky optional sections unavailable if the hard envelope is reached.
+    for name in ("events", "onchain", "heatmaps", "chart"):
+        if len(terminal_json_dumps(result).encode("utf-8")) <= maximum_bytes:
+            break
+        result["sections"][name] = {
+            "status": "partial",
+            "warning": "Section omitted from this bounded refresh; open its detail screen to load it.",
+        }
+        result["overallStatus"] = "partial"
+    if len(terminal_json_dumps(result).encode("utf-8")) > maximum_bytes:
+        raise HTTPException(status_code=413, detail="TAGneXt app snapshot exceeded its bounded response limit")
+    return result
+
+
 @app.get("/v1/tagnext/providers")
 async def tagnext_providers(x_relay_key: str | None = Header(default=None)) -> dict[str, Any]:
     require_relay_key(x_relay_key)
@@ -3649,6 +3777,36 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         if str(value).strip()
     ]
     grader_healthy = grader_running and not grader_errors
+    packet = phase1_state.get("lastPacket") if isinstance(phase1_state.get("lastPacket"), dict) else {}
+    packet_items = packet.get("items") if isinstance(packet.get("items"), list) else []
+    evidence_status = str(packet.get("status") or "unavailable").lower()
+    item_warnings: list[dict[str, Any]] = []
+    evidence_sources: list[dict[str, Any]] = []
+    for item in packet_items:
+        if not isinstance(item, dict):
+            continue
+        validation = str(item.get("validationStatus") or "unavailable").lower()
+        freshness = str(item.get("freshness") or "unavailable").lower()
+        degradation = str(item.get("degradationStatus") or "none").lower()
+        state = (
+            "unavailable" if validation in {"unavailable", "invalid"}
+            else "stale" if freshness == "stale"
+            else "partial" if degradation != "none"
+            else "current"
+        )
+        source_id = str(item.get("sourceId") or "unknown")[:100]
+        evidence_sources.append({
+            "id": source_id,
+            "status": state,
+            "observedAt": item.get("observedAt"),
+            "provenance": {
+                "collector": (item.get("provenance") or {}).get("collector")
+                if isinstance(item.get("provenance"), dict) else None,
+                "contentHash": item.get("contentHash"),
+            },
+        })
+        if state != "current":
+            item_warnings.append({"sourceId": source_id, "state": state})
     flags = operating_status(SERVICE_VERSION)["usage"]["flags"]
     minimum_ready = bool(
         authenticated
@@ -3658,6 +3816,7 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         and flags["deterministicGradingEnabled"]
         and grader_healthy
         and storage_persistent
+        and evidence_status == "current"
     )
     blockers: list[str] = []
     if not authenticated:
@@ -3678,6 +3837,12 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         )
     if not storage_persistent:
         blockers.append("Persistent database storage is not configured")
+    if evidence_status != "current":
+        blockers.append(
+            "Evidence packet is unavailable"
+            if not packet
+            else f"Evidence packet is {evidence_status} ({len(item_warnings)} source warning(s))"
+        )
 
     return {
         "ok": True,
@@ -3687,6 +3852,21 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
         "authenticated": authenticated,
         "sideEffects": "none",
         "repairMode": REPAIR_MODE,
+        "status": "healthy" if evidence_status == "current" and not grader_errors else "degraded",
+        "evidence": {
+            "status": evidence_status,
+            "snapshotId": packet.get("snapshotId"),
+            "dataAsOf": packet.get("dataAsOf"),
+            "sourceSummary": packet.get("sourceSummary") or {
+                "total": 0, "available": 0, "degraded": 0,
+            },
+            "warnings": item_warnings[:12],
+            "lastVerified": {
+                "observation": packet.get("dataAsOf"),
+                "evidenceHash": packet.get("evidenceHash"),
+                "provenance": "canonical-evidence-packet",
+            } if packet else None,
+        },
         "minimumLiveServicesReady": minimum_ready,
         "blockers": blockers,
         "services": {
@@ -3735,6 +3915,7 @@ async def source_health_payload(*, authenticated: bool) -> dict[str, Any]:
                 "connected": depth_connected,
                 "lastObservedAt": depth_last_message,
             },
+            *evidence_sources,
         ],
         "storage": {
             "persistent": storage_persistent,
@@ -3915,7 +4096,7 @@ async def tag_canonical_forecast_latest(
 
 @app.get("/v1/tag/control-center")
 async def tag_control_center(
-    detail: bool = Query(False),
+    detail: bool = Query(SYSTEM_ID == "tagnext"),
     x_relay_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Authenticated compact state, with bounded detail only on explicit open."""

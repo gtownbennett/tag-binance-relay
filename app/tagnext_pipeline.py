@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import load_only
 
 from .canonical_forecast import TAGNEXT_BASELINE
+from .outbound_requests import governed_sync_request
 from .tagnext_external_adapters import (
     PARSER_FRAMEWORK_VERSION,
     TARGET_SEMANTICS,
@@ -1290,7 +1291,11 @@ def external_discovery_worker_run(*, limit: int = 8, timeout_seconds: int = 15) 
                     headers["If-None-Match"] = str(source["etag"])
                 if source["lastModified"]:
                     headers["If-Modified-Since"] = str(source["lastModified"])
-                response = client.get(str(source["url"]), headers=headers)
+                response = governed_sync_request(
+                    client, "GET", str(source["url"]), provider="other",
+                    job="external_forecast_monitor", headers=headers,
+                    cache_ttl_seconds=900, last_good_max_age_seconds=21_600,
+                )
                 response_etag = response.headers.get("etag") or response_etag
                 response_last_modified = response.headers.get("last-modified") or response_last_modified
                 if response.status_code == 304:
@@ -1498,8 +1503,10 @@ def _geckoterminal_ohlcv(
         "https://api.geckoterminal.com/api/v2/networks/bsc/pools/"
         f"{TAGGER_CANONICAL_POOL}/ohlcv/{interval_label}"
     )
-    response = httpx.get(
+    response = governed_sync_request(
+        httpx, "GET",
         endpoint,
+        provider="geckoterminal", job="historical_outcome",
         params={
             "aggregate": 1,
             "before_timestamp": int(_time(period_end).timestamp()) + interval_seconds,
@@ -1540,8 +1547,10 @@ def _coingecko_range(
     timeout_seconds: int,
 ) -> tuple[list[dict[str, Any]], str]:
     endpoint = f"https://api.coingecko.com/api/v3/coins/{TAGGER_CG_ID}/market_chart/range"
-    response = httpx.get(
+    response = governed_sync_request(
+        httpx, "GET",
         endpoint,
+        provider="coingecko", job="historical_outcome",
         params={
             "vs_currency": "usd",
             "from": int(_time(period_start).timestamp()),
@@ -2088,8 +2097,10 @@ def capture_due_external_outcomes(
     if not observation:
         try:
             endpoint = "https://api.coingecko.com/api/v3/simple/price"
-            response = httpx.get(
+            response = governed_sync_request(
+                httpx, "GET",
                 endpoint,
+                provider="coingecko", job="external_outcome_capture",
                 params={"ids": "tagger", "vs_currencies": "usd", "include_last_updated_at": "true"},
                 timeout=timeout_seconds,
                 headers={"User-Agent": "TAGneXt-outcome-capture/3.0"},
@@ -2114,8 +2125,10 @@ def capture_due_external_outcomes(
             provider_failures.append(f"CoinGecko: {type(exc).__name__}: {exc}")
             try:
                 endpoint = f"https://api.dexscreener.com/latest/dex/tokens/{TAG_CONTRACT}"
-                response = httpx.get(
+                response = governed_sync_request(
+                    httpx, "GET",
                     endpoint,
+                    provider="dexscreener", job="external_outcome_capture",
                     timeout=timeout_seconds,
                     headers={"User-Agent": "TAGneXt-outcome-capture/3.0"},
                 )

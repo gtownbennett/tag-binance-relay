@@ -10,6 +10,8 @@ from typing import Any, Mapping
 
 import httpx
 
+from .outbound_requests import governed_sync_request
+
 
 _CACHE_TTL_SECONDS = 21_600.0
 _CACHE_LOCK = Lock()
@@ -42,9 +44,13 @@ def _usd_rate(currency: str, *, client: httpx.Client) -> tuple[float, str]:
         cached = _USD_RATE_CACHE.get(normalized)
         if cached and now - cached[0] <= _CACHE_TTL_SECONDS:
             return cached[1], cached[2]
-    response = client.get(
+    response = governed_sync_request(
+        client, "GET",
         "https://api.frankfurter.app/latest",
+        provider="fx", job="fx_conversion",
         params={"from": normalized, "to": "USD"},
+        cache_ttl_seconds=_CACHE_TTL_SECONDS,
+        last_good_max_age_seconds=86_400,
     )
     if response.status_code != 200:
         raise FxConversionError(f"FX provider returned HTTP {response.status_code}")

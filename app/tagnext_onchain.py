@@ -15,6 +15,7 @@ import httpx
 from eth_hash.auto import keccak
 from sqlalchemy import select
 
+from .outbound_requests import classify_failure, governed_sync_request
 from .tagnext_intelligence import PRIMARY_POOL, TAG_CONTRACT, WBNB_CONTRACT
 from .terminal_database import (
     TagNextChainCursorRow,
@@ -171,6 +172,21 @@ class BnbRpc:
 
     def call(self, method: str, params: Sequence[Any]) -> Any:
         self._request_id += 1
+        if method == "eth_getLogs" and params and isinstance(params[0], Mapping):
+            request = dict(params[0])
+            try:
+                start = _hex_int(request.get("fromBlock"))
+                end = _hex_int(request.get("toBlock"))
+            except (TypeError, ValueError):
+                start = end = 0
+            if end >= start and end - start + 1 > 250:
+                rows: list[Any] = []
+                for window_start in range(start, end + 1, 250):
+                    window = dict(request)
+                    window["fromBlock"] = hex(window_start)
+                    window["toBlock"] = hex(min(end, window_start + 249))
+                    rows.extend(self.call(method, [window]) or [])
+                return rows
         last_error: Exception | None = None
         endpoints = (
             [DEFAULT_LOG_RPC_URL, *self.urls]
@@ -179,11 +195,19 @@ class BnbRpc:
         )
         for endpoint in dict.fromkeys(endpoints):
             try:
-                response = self.client.post(endpoint, json={
-                    "jsonrpc": "2.0", "id": self._request_id,
-                    "method": method, "params": list(params),
-                })
-                response.raise_for_status()
+                response = governed_sync_request(
+                    self.client,
+                    "POST",
+                    endpoint,
+                    provider="bnb_rpc",
+                    job="tagnext_onchain",
+                    json_body={
+                        "jsonrpc": "2.0", "id": self._request_id,
+                        "method": method, "params": list(params),
+                    },
+                    cache_ttl_seconds=30 if method != "eth_blockNumber" else 5,
+                    last_good_max_age_seconds=900,
+                )
                 body = response.json()
                 if body.get("error"):
                     error = body["error"]
@@ -196,8 +220,8 @@ class BnbRpc:
             except (httpx.HTTPError, ValueError, RuntimeError) as exc:
                 last_error = exc
         raise RuntimeError(
-            f"all configured BNB RPC endpoints failed for {method}: "
-            f"{type(last_error).__name__ if last_error is not None else 'unknown_error'}"
+            f"BNB RPC {method} is temporarily "
+            f"{classify_failure(last_error or 'unavailable').replace('_', ' ')}"
         )
 
     def eth_call(self, to: str, data: str, block: str = "latest") -> str:
@@ -338,7 +362,7 @@ def collect_bnb_chain_once(
         # Point-in-time holder balances only for addresses directly observed in
         # this bounded range. This is not claimed as a complete holder census.
         total_supply = _hex_int(client.eth_call(TAG_CONTRACT, "0x" + TOTAL_SUPPLY_SELECTOR, hex(end)))
-        for address in sorted(holder_addresses)[:100]:
+        for address in sorted(holder_addresses)[:10]:
             if address == "0x" + "0" * 40:
                 continue
             raw_balance = _balance_of(client, TAG_CONTRACT, address, block=hex(end))

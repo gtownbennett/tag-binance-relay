@@ -33,7 +33,7 @@ BACKFILL_ENABLED = env_bool("BACKFILL_ENABLED", False)
 SERVER_JOBS_ENABLED = env_bool("SERVER_JOBS_ENABLED", True)
 # A five-second heartbeat is required for direct exact-deadline outcome
 # captures.  Collection itself remains separately bucketed at five minutes.
-SERVER_JOB_POLL_SECONDS = env_int("SERVER_JOB_POLL_SECONDS", 5, minimum=5)
+SERVER_JOB_POLL_SECONDS = env_int("SERVER_JOB_POLL_SECONDS", 30, minimum=15)
 # External outcome work remains five-minute by default. A shorter bounded
 # interval is supported for local scheduler acceptance so the same production
 # queue/claim path can be proven without waiting for a cloud cadence.
@@ -101,6 +101,109 @@ OPENAI_AUTO_EVENT_COOLDOWN_SECONDS = env_int(
 OPENAI_AUTO_MIN_CONFIRMATIONS = env_int(
     "OPENAI_AUTO_MIN_CONFIRMATIONS", 2, minimum=2
 )
+
+EXTERNAL_DAILY_REQUEST_LIMIT = env_int("EXTERNAL_DAILY_REQUEST_LIMIT", 5_200)
+EXTERNAL_MONTHLY_REQUEST_LIMIT = env_int("EXTERNAL_MONTHLY_REQUEST_LIMIT", 180_000)
+
+
+def _provider_limit(provider: str, window: str, default: int) -> int:
+    name = f"PROVIDER_{provider.upper()}_{window}_REQUEST_LIMIT"
+    return env_int(name, default)
+
+
+PROVIDER_REQUEST_LIMITS: dict[str, tuple[int, int]] = {
+    "binance": (
+        _provider_limit("binance", "DAILY", 1_850),
+        _provider_limit("binance", "MONTHLY", 56_000),
+    ),
+    "dexscreener": (
+        _provider_limit("dexscreener", "DAILY", 360),
+        _provider_limit("dexscreener", "MONTHLY", 11_000),
+    ),
+    "bnb_rpc": (
+        _provider_limit("bnb_rpc", "DAILY", 900),
+        _provider_limit("bnb_rpc", "MONTHLY", 28_000),
+    ),
+    "gate": (_provider_limit("gate", "DAILY", 800), _provider_limit("gate", "MONTHLY", 25_000)),
+    "mexc": (_provider_limit("mexc", "DAILY", 800), _provider_limit("mexc", "MONTHLY", 25_000)),
+    "bitget": (_provider_limit("bitget", "DAILY", 500), _provider_limit("bitget", "MONTHLY", 15_000)),
+    "bingx": (_provider_limit("bingx", "DAILY", 500), _provider_limit("bingx", "MONTHLY", 15_000)),
+    "coingecko": (_provider_limit("coingecko", "DAILY", 120), _provider_limit("coingecko", "MONTHLY", 3_600)),
+    "coinmarketcap": (_provider_limit("coinmarketcap", "DAILY", 120), _provider_limit("coinmarketcap", "MONTHLY", 3_600)),
+    "geckoterminal": (_provider_limit("geckoterminal", "DAILY", 240), _provider_limit("geckoterminal", "MONTHLY", 7_200)),
+    "fx": (_provider_limit("fx", "DAILY", 24), _provider_limit("fx", "MONTHLY", 750)),
+    "coinalyze": (_provider_limit("coinalyze", "DAILY", 120), _provider_limit("coinalyze", "MONTHLY", 3_750)),
+    "kucoin": (_provider_limit("kucoin", "DAILY", 120), _provider_limit("kucoin", "MONTHLY", 3_750)),
+    "bybit": (_provider_limit("bybit", "DAILY", 120), _provider_limit("bybit", "MONTHLY", 3_750)),
+    "okx": (_provider_limit("okx", "DAILY", 120), _provider_limit("okx", "MONTHLY", 3_750)),
+    "other": (_provider_limit("other", "DAILY", 500), _provider_limit("other", "MONTHLY", 15_000)),
+}
+
+
+def project_external_schedule(
+    *, calls_per_cycle: int, interval_seconds: int,
+    daily_limit: int = EXTERNAL_DAILY_REQUEST_LIMIT,
+    monthly_limit: int = EXTERNAL_MONTHLY_REQUEST_LIMIT,
+    month_days: int = 31,
+) -> dict[str, Any]:
+    safe_interval = max(1, int(interval_seconds))
+    cycles_per_day = (86_400 + safe_interval - 1) // safe_interval
+    daily = max(0, int(calls_per_cycle)) * cycles_per_day
+    monthly = daily * max(28, min(31, int(month_days)))
+    return {
+        "cyclesPerDay": cycles_per_day,
+        "projectedDaily": daily,
+        "projectedMonthly": monthly,
+        "dailyLimit": int(daily_limit),
+        "monthlyLimit": int(monthly_limit),
+        "withinBudget": daily < int(daily_limit) and monthly < int(monthly_limit),
+        "dailyHeadroom": int(daily_limit) - daily,
+        "monthlyHeadroom": int(monthly_limit) - monthly,
+    }
+
+
+def project_external_plan(
+    jobs: list[dict[str, int]], *, daily_limit: int = EXTERNAL_DAILY_REQUEST_LIMIT,
+    monthly_limit: int = EXTERNAL_MONTHLY_REQUEST_LIMIT, month_days: int = 31,
+) -> dict[str, Any]:
+    rows = []
+    for job in jobs:
+        projection = project_external_schedule(
+            calls_per_cycle=job["callsPerCycle"],
+            interval_seconds=job["intervalSeconds"],
+            daily_limit=daily_limit,
+            monthly_limit=monthly_limit,
+            month_days=month_days,
+        )
+        rows.append({"job": str(job.get("job") or "unknown"), **projection})
+    daily = sum(row["projectedDaily"] for row in rows)
+    monthly = daily * month_days
+    return {
+        "jobs": rows,
+        "projectedDaily": daily,
+        "projectedMonthly": monthly,
+        "dailyLimit": daily_limit,
+        "monthlyLimit": monthly_limit,
+        "dailyHeadroomPct": round((daily_limit - daily) / daily_limit * 100, 1),
+        "monthlyHeadroomPct": round((monthly_limit - monthly) / monthly_limit * 100, 1),
+        "withinBudget": daily < daily_limit and monthly < monthly_limit,
+    }
+
+
+def project_scheduler_database_usage(
+    *, schedule_interval_seconds: int = 600,
+    schedule_statements_per_cycle: int = 40,
+    steady_idle_poll_seconds: int = 120,
+) -> dict[str, int | bool]:
+    cycles = (86_400 + schedule_interval_seconds - 1) // schedule_interval_seconds
+    idle_claims = (86_400 + steady_idle_poll_seconds - 1) // steady_idle_poll_seconds
+    statements = cycles * schedule_statements_per_cycle + idle_claims
+    return {
+        "scheduleCyclesPerDay": cycles,
+        "idleClaimStatementsPerDay": idle_claims,
+        "projectedStatementsPerDay": statements,
+        "withinTenThousand": statements < 10_000,
+    }
 
 
 class RequestBudgetExceeded(RuntimeError):
@@ -190,6 +293,11 @@ class UsageGovernor:
         self._cache_hits = 0
         self._cache_misses = 0
         self._blocked: dict[str, int] = defaultdict(int)
+        self._blocked_lifetime: dict[str, int] = defaultdict(int)
+        self._provider_daily: dict[str, int] = defaultdict(int)
+        self._provider_monthly: dict[str, int] = defaultdict(int)
+        self._provider_blocked: dict[str, int] = defaultdict(int)
+        self._provider_jobs: dict[str, int] = defaultdict(int)
         self._last_bounded_test_at: str | None = None
         self._limits = {
             "openai_call": (
@@ -205,8 +313,8 @@ class UsageGovernor:
                 env_int("CHAD_GRADE_MONTHLY_BATCH_LIMIT", 80),
             ),
             "external_request": (
-                env_int("EXTERNAL_DAILY_REQUEST_LIMIT", 250),
-                env_int("EXTERNAL_MONTHLY_REQUEST_LIMIT", 5_000),
+                EXTERNAL_DAILY_REQUEST_LIMIT,
+                EXTERNAL_MONTHLY_REQUEST_LIMIT,
             ),
             "expensive_route": (
                 env_int("EXPENSIVE_ROUTE_DAILY_LIMIT", 250),
@@ -237,38 +345,79 @@ class UsageGovernor:
         if day != self._day:
             self._day = day
             self._daily = defaultdict(int)
+            self._blocked = defaultdict(int)
+            self._provider_daily = defaultdict(int)
+            self._provider_blocked = defaultdict(int)
         if month != self._month:
             self._month = month
             self._monthly = defaultdict(int)
+            self._provider_monthly = defaultdict(int)
+
+    def _block(self, category: str) -> None:
+        self._blocked[category] += 1
+        self._blocked_lifetime[category] += 1
 
     def authorize(self, category: str, *, automatic: bool = False) -> tuple[bool, str | None]:
         with self._lock:
             self._roll_windows()
             if automatic and REPAIR_MODE:
-                self._blocked[category] += 1
+                self._block(category)
                 return False, "repair_mode"
             if automatic and category == "collector" and not LIVE_COLLECTORS_ENABLED:
-                self._blocked[category] += 1
+                self._block(category)
                 return False, "collectors_disabled"
             if automatic and category == "openai_call" and not OPENAI_AUTOMATIC_ENABLED:
-                self._blocked[category] += 1
+                self._block(category)
                 return False, "automatic_openai_disabled"
             if category in {"openai_call", "chad_request"} and not PAID_AI_ENABLED:
-                self._blocked[category] += 1
+                self._block(category)
                 return False, "paid_ai_disabled"
             if automatic and category == "notification_attempt" and not PUSH_ENABLED:
-                self._blocked[category] += 1
+                self._block(category)
                 return False, "push_disabled"
 
             daily_limit, monthly_limit = self._limits.get(category, (0, 0))
             if daily_limit and self._daily[category] >= daily_limit:
-                self._blocked[category] += 1
+                self._block(category)
                 return False, "daily_limit"
             if monthly_limit and self._monthly[category] >= monthly_limit:
-                self._blocked[category] += 1
+                self._block(category)
                 return False, "monthly_limit"
             self._daily[category] += 1
             self._monthly[category] += 1
+            return True, None
+
+    def authorize_external(self, *, provider: str, job: str) -> tuple[bool, str | None]:
+        """Charge one real outbound attempt to global, provider and job counters."""
+
+        normalized = str(provider or "other").strip().lower() or "other"
+        with self._lock:
+            self._roll_windows()
+            daily_limit, monthly_limit = self._limits["external_request"]
+            if daily_limit and self._daily["external_request"] >= daily_limit:
+                self._block("external_request")
+                self._provider_blocked[normalized] += 1
+                return False, "rate_limited"
+            if monthly_limit and self._monthly["external_request"] >= monthly_limit:
+                self._block("external_request")
+                self._provider_blocked[normalized] += 1
+                return False, "rate_limited"
+            provider_limits = PROVIDER_REQUEST_LIMITS.get(
+                normalized, PROVIDER_REQUEST_LIMITS["other"]
+            )
+            if provider_limits[0] and self._provider_daily[normalized] >= provider_limits[0]:
+                self._provider_blocked[normalized] += 1
+                self._block("external_request")
+                return False, "rate_limited"
+            if provider_limits[1] and self._provider_monthly[normalized] >= provider_limits[1]:
+                self._provider_blocked[normalized] += 1
+                self._block("external_request")
+                return False, "rate_limited"
+            self._daily["external_request"] += 1
+            self._monthly["external_request"] += 1
+            self._provider_daily[normalized] += 1
+            self._provider_monthly[normalized] += 1
+            self._provider_jobs[f"{str(job or 'unspecified')[:80]}:{normalized}"] += 1
             return True, None
 
     def record(self, category: str, amount: int = 1, *, byte_count: int = 0) -> None:
@@ -294,11 +443,18 @@ class UsageGovernor:
         with self._lock:
             self._roll_windows()
             total_cache = self._cache_hits + self._cache_misses
-            circuit_open = any(
-                reason_count > 0
-                for category, reason_count in self._blocked.items()
-                if category in self._limits
-            )
+            open_reasons: list[str] = []
+            for category, (daily_limit, monthly_limit) in self._limits.items():
+                if daily_limit and self._daily[category] >= daily_limit:
+                    open_reasons.append(f"{category}:daily")
+                if monthly_limit and self._monthly[category] >= monthly_limit:
+                    open_reasons.append(f"{category}:monthly")
+            for provider, (daily_limit, monthly_limit) in PROVIDER_REQUEST_LIMITS.items():
+                if daily_limit and self._provider_daily[provider] >= daily_limit:
+                    open_reasons.append(f"provider:{provider}:daily")
+                if monthly_limit and self._provider_monthly[provider] >= monthly_limit:
+                    open_reasons.append(f"provider:{provider}:monthly")
+            circuit_open = bool(open_reasons)
             return {
                 "repairMode": REPAIR_MODE,
                 "circuitOpen": circuit_open,
@@ -323,6 +479,18 @@ class UsageGovernor:
                 "month": dict(self._monthly),
                 "bytes": dict(self._bytes),
                 "blocked": dict(self._blocked),
+                "blockedLifetime": dict(self._blocked_lifetime),
+                "circuitReasons": open_reasons,
+                "providers": {
+                    "today": dict(self._provider_daily),
+                    "month": dict(self._provider_monthly),
+                    "blocked": dict(self._provider_blocked),
+                    "limits": {
+                        key: {"daily": value[0], "monthly": value[1]}
+                        for key, value in PROVIDER_REQUEST_LIMITS.items()
+                    },
+                    "jobs": dict(self._provider_jobs),
+                },
                 "cache": {
                     "hits": self._cache_hits,
                     "misses": self._cache_misses,
