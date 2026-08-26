@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .terminal_config import SYMBOL
+from .outbound_requests import governed_async_request
 from .terminal_database import BinanceSnapshot, VisionRow, json_dumps, session_scope
 from .historical_memory import (
     begin_backfill_range,
@@ -309,8 +310,10 @@ async def _download_archive_csv(
 ) -> tuple[str, list[list[str]], str]:
     url = archive_url(dataset, key, interval, period)
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-        response = await client.get(url)
-        response.raise_for_status()
+        response = await governed_async_request(
+            client, "GET", url, provider="binance", job="historical_archive",
+            cache_ttl_seconds=86_400, last_good_max_age_seconds=604_800,
+        )
     archive_bytes = response.content
     archive_hash = hashlib.sha256(archive_bytes).hexdigest()
     archive = zipfile.ZipFile(io.BytesIO(archive_bytes))

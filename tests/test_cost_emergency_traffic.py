@@ -52,8 +52,9 @@ def test_large_history_result_is_compacted_and_hashed() -> None:
     assert len(row.result_json.encode("utf-8")) < 2_000
 
 
-def test_schedule_build_is_five_minute_bounded_and_due_claim_stays_frequent() -> None:
+def test_schedule_build_is_collection_bounded_and_idle_claims_back_off() -> None:
     source = Path("app/main.py").read_text(encoding="utf-8")
-    assert "schedule_bucket = int(time.time()) // 300" in source
+    assert "schedule_bucket = int(time.time()) // COLLECT_SECONDS" in source
     assert "await _drain_due_phase1_jobs(worker_id)" in source
-    assert "await asyncio.sleep(SERVER_JOB_POLL_SECONDS)" in source
+    assert "idle_poll_seconds * 2" in source
+    assert "await asyncio.sleep(idle_poll_seconds)" in source

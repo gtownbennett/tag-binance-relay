@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from .outbound_requests import governed_async_request
+
 from .terminal_common import as_float, as_int
 from .terminal_database import AggregateSnapshotRow, ExchangeSnapshotRow, json_dumps, session_scope, utc_now
 
@@ -117,8 +119,16 @@ class MultiExchangeService:
     async def _json(self, base: str, path: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> Any:
         if self.http is None:
             raise RuntimeError("Multi-exchange HTTP client is not running")
-        response = await self.http.get(f"{base}{path}", params=params, headers=headers)
-        response.raise_for_status()
+        response = await governed_async_request(
+            self.http,
+            "GET",
+            f"{base}{path}",
+            job="multi_exchange",
+            params=params,
+            headers=headers,
+            cache_ttl_seconds=900,
+            last_good_max_age_seconds=3_600,
+        )
         return response.json()
 
     async def _gate_json(self, path: str, params: dict[str, Any] | None = None) -> Any:

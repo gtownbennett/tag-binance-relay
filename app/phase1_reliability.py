@@ -83,11 +83,20 @@ def _job_summary_values(row: Any, *, deduplicated: bool) -> dict[str, Any]:
 def _persisted_job_result(job_type: str, result: dict[str, Any]) -> str:
     """Keep queue observability without duplicating multi-megabyte history."""
 
+    completion_state = "completed"
+    packet = result.get("packet") if isinstance(result.get("packet"), dict) else {}
+    if (
+        packet.get("status") in {"degraded", "unavailable"}
+        or result.get("sourceErrors")
+        or result.get("maintenanceErrors")
+        or result.get("errors")
+    ):
+        completion_state = "completed_with_warnings"
+    result = {**result, "completionState": completion_state}
     serialized = json_dumps(result)
     encoded = serialized.encode("utf-8")
     if (
-        job_type != "maintain_historical_memory"
-        or len(encoded) <= MAX_PERSISTED_SERVER_JOB_RESULT_BYTES
+        len(encoded) <= MAX_PERSISTED_SERVER_JOB_RESULT_BYTES
     ):
         return serialized
     automatic = result.get("automaticDetection")
@@ -97,6 +106,7 @@ def _persisted_job_result(job_type: str, result: dict[str, Any]) -> str:
     compact = {
         "schemaVersion": "server-job-result-summary-v1",
         "jobType": job_type,
+        "completionState": completion_state,
         "fullResultPersistedElsewhere": True,
         "originalBytes": len(encoded),
         "originalSha256": hashlib.sha256(encoded).hexdigest(),
@@ -779,30 +789,21 @@ def schedule_current_evidence_job(*, interval_seconds: int = 300) -> dict[str, A
 def claim_due_job(*, worker_id: str, lock_seconds: int = 120) -> dict[str, Any] | None:
     now = utc_now()
     with session_scope() as session:
-        # Do not let one expired, exhausted job starve every later job in the
-        # queue.  This is especially important for the deliberately long
-        # historical-maintenance lease: an interrupted worker must become a
-        # visible terminal failure and the scheduler must keep moving.
-        exhausted_query = select(ServerJobRow).where(
-            (ServerJobRow.status.in_(("pending", "retry")))
-            & (ServerJobRow.attempts >= ServerJobRow.max_attempts)
-            | (
-                (ServerJobRow.status == "running")
-                & (ServerJobRow.locked_until.is_not(None))
-                & (ServerJobRow.locked_until <= now)
-                & (ServerJobRow.attempts >= ServerJobRow.max_attempts)
-            )
-        )
-        if session.bind is not None and session.bind.dialect.name == "postgresql":
-            exhausted_query = exhausted_query.with_for_update(skip_locked=True)
-        for exhausted in session.scalars(exhausted_query):
-            exhausted.status = "failed"
-            exhausted.locked_by = None
-            exhausted.locked_until = None
-            exhausted.updated_at = now
-            exhausted.last_error = exhausted.last_error or "Maximum attempts exhausted before claim."
+        # Read only claim metadata plus the one payload needed to execute.
+        # Never hydrate result_json/last_error TOAST values in the hot loop.
         query = (
-            select(ServerJobRow)
+            select(
+                ServerJobRow.job_id,
+                ServerJobRow.job_type,
+                ServerJobRow.idempotency_key,
+                ServerJobRow.origin,
+                ServerJobRow.status,
+                ServerJobRow.attempts,
+                ServerJobRow.max_attempts,
+                ServerJobRow.available_at,
+                ServerJobRow.payload_json,
+                ServerJobRow.evidence_hash,
+            )
             .where(
                 or_(
                     (ServerJobRow.status.in_(("pending", "retry")))
@@ -829,16 +830,20 @@ def claim_due_job(*, worker_id: str, lock_seconds: int = 120) -> dict[str, Any] 
         )
         if session.bind is not None and session.bind.dialect.name == "postgresql":
             query = query.with_for_update(skip_locked=True)
-        row = session.scalar(query)
+        row = session.execute(query).one_or_none()
         if row is None:
             return None
         if row.attempts >= row.max_attempts:
-            row.status = "failed"
-            row.updated_at = now
-            row.last_error = row.last_error or "Maximum attempts exhausted before claim."
+            session.execute(
+                update(ServerJobRow)
+                .where(ServerJobRow.job_id == row.job_id)
+                .values(
+                    status="failed", updated_at=now, locked_by=None,
+                    locked_until=None,
+                    last_error="Maximum attempts exhausted before claim.",
+                )
+            )
             return None
-        row.status = "running"
-        row.locked_by = worker_id
         # Low-priority history and research both scan the immutable warehouse
         # on one worker.  Their leases must outlast a bounded pass, otherwise a
         # Render restart can leave a job visible as an exhausted orphan even
@@ -848,15 +853,54 @@ def claim_due_job(*, worker_id: str, lock_seconds: int = 120) -> dict[str, Any] 
         effective_lock_seconds = max(30, int(lock_seconds))
         if row.job_type in {"maintain_historical_memory", "run_bounded_forecast_research", "run_bounded_predictive_tournament"}:
             effective_lock_seconds = max(effective_lock_seconds, 1_200)
-        row.locked_until = now + timedelta(seconds=effective_lock_seconds)
-        row.attempts += 1
-        row.updated_at = now
-        session.flush()
+        next_attempts = row.attempts + 1
+        session.execute(
+            update(ServerJobRow)
+            .where(ServerJobRow.job_id == row.job_id)
+            .values(
+                status="running", locked_by=worker_id,
+                locked_until=now + timedelta(seconds=effective_lock_seconds),
+                attempts=next_attempts, updated_at=now,
+            )
+        )
         return {
-            **_job_summary(row),
+            "jobId": row.job_id,
+            "jobType": row.job_type,
+            "idempotencyKey": row.idempotency_key,
+            "origin": row.origin,
+            "status": "running",
+            "attempts": next_attempts,
+            "maxAttempts": row.max_attempts,
+            "availableAt": row.available_at.isoformat(),
+            "deduplicated": False,
             "payload": json.loads(row.payload_json or "{}"),
             "evidenceHash": row.evidence_hash,
         }
+
+
+def expire_exhausted_jobs() -> int:
+    """Move terminal queue debris out of the hot claim path."""
+
+    now = utc_now()
+    with session_scope() as session:
+        result = session.execute(
+            update(ServerJobRow)
+            .where(
+                (ServerJobRow.attempts >= ServerJobRow.max_attempts)
+                & or_(
+                    ServerJobRow.status.in_(("pending", "retry")),
+                    (ServerJobRow.status == "running")
+                    & (ServerJobRow.locked_until.is_not(None))
+                    & (ServerJobRow.locked_until <= now),
+                )
+            )
+            .values(
+                status="failed", locked_by=None, locked_until=None,
+                updated_at=now,
+                last_error="Maximum attempts exhausted before claim.",
+            )
+        )
+        return int(result.rowcount or 0)
 
 
 def complete_job(job_id: str, result: dict[str, Any]) -> None:

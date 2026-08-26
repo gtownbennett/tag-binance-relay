@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from .event_driven_chad import chad_usage_report
+from .outbound_requests import governed_async_request
 from .terminal_database import ProviderUsageSnapshotRow, json_dumps, session_scope, utc_now
 
 PROVIDERS: dict[str, dict[str, str]] = {
@@ -383,8 +384,10 @@ async def refresh_cost_usage(client: httpx.AsyncClient, *, force: bool = False) 
     github_user = os.getenv("GITHUB_BILLING_USER", "").strip()
     if github_token and github_user and "github" not in refreshed:
         try:
-            response = await client.get(
+            response = await governed_async_request(
+                client, "GET",
                 f"https://api.github.com/users/{github_user}/settings/billing/usage",
+                provider="other", job="provider_usage",
                 headers={
                     "Accept": "application/vnd.github+json",
                     "Authorization": f"Bearer {github_token}",
@@ -424,8 +427,10 @@ async def refresh_cost_usage(client: httpx.AsyncClient, *, force: bool = False) 
     if openai_admin_key and openai_refresh and "openai" not in refreshed:
         try:
             start, end = _month_cycle(now)
-            response = await client.get(
+            response = await governed_async_request(
+                client, "GET",
                 "https://api.openai.com/v1/organization/costs",
+                provider="other", job="provider_usage",
                 params={"start_time": int(start.timestamp()), "limit": 180},
                 headers={"Authorization": f"Bearer {openai_admin_key}"},
             )
