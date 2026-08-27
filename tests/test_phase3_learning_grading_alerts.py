@@ -502,6 +502,9 @@ def test_staged_alert_timeline_hysteresis_dedupe_cooldown_and_outcomes() -> None
         }
     )
     assert held["stage"] == "URGENT ACTION" and held["stageChanged"] is False
+    current = active_alerts(now=NOW + timedelta(minutes=5))[0]
+    assert current["stage"] == "URGENT ACTION"
+    assert current["signalScore"] == 84.0
     outcome = finalize_alert(
         {
             "alertId": alert_id, "auditKey": "alert-final-1", "resultClass": "timely",

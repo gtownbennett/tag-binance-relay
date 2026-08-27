@@ -40,6 +40,7 @@ from app.historical_memory import (
     detect_and_persist_events,
     find_event_analogs,
     finish_backfill_range,
+    historical_event_report,
     historical_production_summary,
     import_binance_vision_candles,
     normalize_historical_observation,
@@ -720,6 +721,34 @@ def test_compact_production_summary_uses_persisted_metadata_not_raw_history() ->
     assert summary["replayRuns"][0]["noLookahead"] is True
     assert summary["sideEffects"] == "none"
     assert "rows" not in summary
+
+
+def test_historical_event_report_counts_only_latest_versions_by_family() -> None:
+    first = _event(
+        "versioned-event",
+        datetime(2025, 8, 1, tzinfo=timezone.utc),
+        datetime(2025, 8, 2, tzinfo=timezone.utc),
+        feature=0.4,
+    )
+    persist_event_version(first)
+    revised = copy.deepcopy(first)
+    revised["eventFamily"] = "BREAKDOWN"
+    revised["featuresAvailableAtCutoff"]["priceStructure"] = -0.4
+    persist_event_version(revised)
+    second = _event(
+        "second-event",
+        datetime(2025, 9, 1, tzinfo=timezone.utc),
+        datetime(2025, 9, 2, tzinfo=timezone.utc),
+        feature=0.2,
+    )
+    persist_event_version(second)
+
+    report = historical_event_report()
+
+    assert report["totalEvents"] == 2
+    assert report["familyCounts"] == {"BREAKDOWN": 1, "BREAKOUT": 1}
+    assert report["breakouts"] == 1
+    assert report["breakdowns"] == 1
 
 
 def test_maintenance_detector_plan_is_source_bounded_and_incremental() -> None:

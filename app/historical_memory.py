@@ -1729,13 +1729,18 @@ def historical_event_report() -> dict[str, Any]:
             .group_by(HistoricalEventVersionRow.event_key)
             .subquery()
         )
-        rows = list(
+        family_rows = list(
             session.execute(
-                select(HistoricalEventVersionRow.event_key, HistoricalEventVersionRow.event_family).join(
+                select(
+                    HistoricalEventVersionRow.event_family,
+                    func.count(HistoricalEventVersionRow.event_key),
+                )
+                .join(
                     latest,
                     (HistoricalEventVersionRow.event_key == latest.c.event_key)
                     & (HistoricalEventVersionRow.event_version == latest.c.version),
                 )
+                .group_by(HistoricalEventVersionRow.event_family)
             )
         )
         known_keys = {definition[0] for definition in KNOWN_EPISODES}
@@ -1750,12 +1755,12 @@ def historical_event_report() -> dict[str, Any]:
         )
     families: dict[str, int] = defaultdict(int)
     named: dict[str, Any] = {}
-    for event_key, event_family in rows:
-        families[event_family] += 1
+    for event_family, event_count in family_rows:
+        families[str(event_family)] = int(event_count)
     for event_key, payload_json in named_rows:
         named[event_key] = _json(payload_json, {})
     return {
-        "totalEvents": len(rows),
+        "totalEvents": sum(families.values()),
         "familyCounts": dict(sorted(families.items())),
         "breakouts": sum(families[name] for name in ("BREAKOUT", "ATH_BREAK")),
         "breakdowns": families["BREAKDOWN"],

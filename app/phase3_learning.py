@@ -1481,14 +1481,23 @@ def active_alerts(*, limit: int = 50, now: datetime | None = None) -> list[dict[
             .limit(max(1, min(limit, 200)))
         ).all()
         case_ids = [case.alert_id for case in cases]
+        latest_event_ids = (
+            select(
+                AlertStageEventRow.event_id.label("event_id"),
+                func.row_number().over(
+                    partition_by=AlertStageEventRow.alert_id,
+                    order_by=AlertStageEventRow.sequence_number.desc(),
+                ).label("row_rank"),
+            )
+            .where(AlertStageEventRow.alert_id.in_(case_ids))
+            .subquery()
+        )
         events = session.scalars(
             select(AlertStageEventRow)
-            .where(AlertStageEventRow.alert_id.in_(case_ids))
-            .order_by(AlertStageEventRow.alert_id, AlertStageEventRow.sequence_number.desc())
+            .join(latest_event_ids, AlertStageEventRow.event_id == latest_event_ids.c.event_id)
+            .where(latest_event_ids.c.row_rank == 1)
         ).all() if case_ids else []
-        latest_by_case: dict[str, AlertStageEventRow] = {}
-        for event in events:
-            latest_by_case.setdefault(event.alert_id, event)
+        latest_by_case = {event.alert_id: event for event in events}
         results: list[dict[str, Any]] = []
         for case in cases:
             latest = latest_by_case.get(case.alert_id)
