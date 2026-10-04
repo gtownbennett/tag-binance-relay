@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 import httpx
 
-from .outbound_requests import governed_sync_request
+from .outbound_requests import OutboundUnavailable, governed_sync_request
 
 
 _CACHE_TTL_SECONDS = 21_600.0
@@ -141,7 +141,7 @@ def apply_usd_display_conversions(
         for currency in sorted(needed):
             try:
                 rates[currency] = _usd_rate(currency, client=http)
-            except FxConversionError as error:
+            except (FxConversionError, OutboundUnavailable) as error:
                 failures[currency] = type(error).__name__
     finally:
         if owned:
@@ -168,7 +168,8 @@ def apply_usd_display_conversions(
         "convertedCurrencies": sorted(rates),
         "unavailableCurrencies": sorted(failures),
         "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "provider": "Frankfurter / ECB reference rates" if rates else "not_required",
+        "provider": "Frankfurter / ECB reference rates" if needed else "not_required",
+        "status": "degraded" if failures else "current",
         "nativeValuesRetainedAsProvenance": True,
         "forecastSemanticsChanged": False,
         "secretsIncluded": False,
