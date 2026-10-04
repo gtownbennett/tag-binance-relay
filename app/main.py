@@ -3429,6 +3429,7 @@ async def tag_control_center(
         "ok": True,
         **await asyncio.to_thread(
             canonical_control_center_snapshot,
+            portfolio_quantity_tokens=x_portfolio_quantity_tokens,
         ),
     }
 

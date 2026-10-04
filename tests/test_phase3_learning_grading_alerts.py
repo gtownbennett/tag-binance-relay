@@ -1158,7 +1158,14 @@ def test_control_center_v2_portfolio_math_labels_issue_and_current_returns() -> 
     )
 
 
-def test_control_center_v2_is_versioned_server_selected_and_not_locally_ambiguous() -> None:
+def test_control_center_v2_is_versioned_server_selected_and_not_locally_ambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import phase4_control_center_v2 as production_control
+
+    def bulk_report_must_not_run() -> dict:
+        raise AssertionError("A forecast refresh must not execute bulk research evaluation")
+
+    monkeypatch.setattr(production_control, "historical_production_summary", bulk_report_must_not_run)
+    monkeypatch.setattr(production_control, "prospective_population", bulk_report_must_not_run)
     forecast = _forecast(horizon="24h")
     persist_canonical_forecast(forecast)
     snapshot = canonical_control_center_snapshot_v2(
@@ -1174,6 +1181,9 @@ def test_control_center_v2_is_versioned_server_selected_and_not_locally_ambiguou
     assert snapshot["aiReview"]["automaticPaidCallMadeByThisRequest"] is False
     assert snapshot["portfolioImpact"]["quantityTokens"] == 100_812_406.0
     assert snapshot["grading"]["gradesOverdue"] == 0
+    assert snapshot["historicalProduction"]["status"] == "DEFERRED"
+    assert snapshot["prospectiveLearning"]["status"] == "DEFERRED"
+    assert snapshot["prospectiveLearning"]["predictiveImprovement"]["state"] == "NOT_DEMONSTRATED"
 
 
 def test_control_center_v2_keeps_stale_but_unexpired_forecast_selectable() -> None:

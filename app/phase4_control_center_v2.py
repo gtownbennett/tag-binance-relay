@@ -691,6 +691,17 @@ def canonical_control_center_snapshot(
         "alerts": active_alerts(limit=50),
         "marketCapLevels": current_user_levels(seed_defaults=False),
         "marketTruth": market_truth,
-        "historicalProduction": historical_production_summary(),
-        "prospectiveLearning": prospective_population(),
+        "historicalProduction": {
+            "available": False,
+            "status": "DEFERRED",
+            "reason": "Bulk historical research is omitted from ordinary forecast refreshes.",
+        },
+        "prospectiveLearning": {
+            "available": False,
+            "status": "DEFERRED",
+            "reason": "Bulk prospective evaluation is omitted from ordinary forecast refreshes.",
+            "predictiveImprovement": {"state": "NOT_DEMONSTRATED"},
+            "automaticProductionWeightChanges": "OFF",
+            "automaticPaidAiCalls": 0,
+        },
     }
