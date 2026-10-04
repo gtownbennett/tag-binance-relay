@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from sqlalchemy import select
+from sqlalchemy.orm import defer
 
 from .forecast_research import persist_research_run
 from .phase1_reliability import stable_hash
@@ -196,7 +197,7 @@ def _clean_grades() -> list[tuple[CanonicalForecastGradeRow, CanonicalForecastRo
         evidence_runs = session.scalars(select(ForecastResearchRunRow).where(
             ForecastResearchRunRow.run_kind == "live_forecast_evidence",
             ForecastResearchRunRow.no_lookahead.is_(True),
-        )).all()
+        )).yield_per(25)
         assessed_ids: set[str] = set()
         for run in evidence_runs:
             payload = json.loads(run.payload_json or "{}")
@@ -204,7 +205,7 @@ def _clean_grades() -> list[tuple[CanonicalForecastGradeRow, CanonicalForecastRo
             forecast_id = str(results.get("forecastId") or "")
             if forecast_id:
                 assessed_ids.add(forecast_id)
-        rows = list(session.execute(select(CanonicalForecastGradeRow, CanonicalForecastRow).join(
+        rows = list(session.execute(select(CanonicalForecastGradeRow, CanonicalForecastRow).options(defer(CanonicalForecastRow.payload_json)).join(
             CanonicalForecastRow, CanonicalForecastGradeRow.forecast_id == CanonicalForecastRow.forecast_id,
         ).join(
             ForecastEvaluationDispositionRow,
@@ -235,10 +236,10 @@ def forecast_grade_census() -> dict[str, Any]:
     """Reconcile authoritative server rows without blending local/replay data."""
     now = utc_now()
     with session_scope() as session:
-        forecasts = session.scalars(select(CanonicalForecastRow).where(
+        forecasts = session.scalars(select(CanonicalForecastRow).options(defer(CanonicalForecastRow.payload_json)).where(
             CanonicalForecastRow.producer == "tagalysis"
         )).all()
-        shadows = session.scalars(select(CanonicalForecastRow).where(
+        shadows = session.scalars(select(CanonicalForecastRow).options(defer(CanonicalForecastRow.payload_json)).where(
             CanonicalForecastRow.producer == "baseline"
         )).all()
         grades = session.scalars(select(CanonicalForecastGradeRow).where(
@@ -318,7 +319,7 @@ def reconcile_matched_shadow_grades() -> dict[str, Any]:
             if tag is None:
                 excluded.append({"forecastId": str(tag_grade.forecast_id), "reason": "orphaned_tag_grade"})
                 continue
-            shadow = session.scalar(select(CanonicalForecastRow).where(
+            shadow = session.scalar(select(CanonicalForecastRow).options(defer(CanonicalForecastRow.payload_json)).where(
                 CanonicalForecastRow.producer == "baseline",
                 CanonicalForecastRow.horizon == tag.horizon,
                 CanonicalForecastRow.issued_at == tag.issued_at,
@@ -391,7 +392,7 @@ def reconcile_missed_deadline_dispositions() -> dict[str, Any]:
             )) is not None:
                 continue
             candidates.append((forecast_id, reason, _finite(result.get("captureLagSeconds"))))
-        due_tagalysis = session.scalars(select(CanonicalForecastRow).where(
+        due_tagalysis = session.scalars(select(CanonicalForecastRow).options(defer(CanonicalForecastRow.payload_json)).where(
             CanonicalForecastRow.producer == "tagalysis",
             CanonicalForecastRow.deadline <= reconciliation_now - missing_job_grace,
         )).all()
@@ -420,11 +421,11 @@ def reconcile_missed_deadline_dispositions() -> dict[str, Any]:
 
     shadow_classified: list[str] = []
     with session_scope() as session:
-        tag_rows = session.scalars(select(CanonicalForecastRow).where(
+        tag_rows = session.scalars(select(CanonicalForecastRow).options(defer(CanonicalForecastRow.payload_json)).where(
             CanonicalForecastRow.producer == "tagalysis",
         )).all()
         tag_by_deadline = {(row.horizon, row.deadline): row for row in tag_rows}
-        baseline_rows = session.scalars(select(CanonicalForecastRow).where(
+        baseline_rows = session.scalars(select(CanonicalForecastRow).options(defer(CanonicalForecastRow.payload_json)).where(
             CanonicalForecastRow.producer == "baseline",
             CanonicalForecastRow.deadline <= reconciliation_now,
         )).all()
