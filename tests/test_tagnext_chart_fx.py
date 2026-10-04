@@ -9,6 +9,7 @@ from app import main
 from app.tagnext_chart import chart_payload, parse_chart_response
 from app.tagnext_fx import _USD_RATE_CACHE, apply_usd_display_conversions
 from app.tagnext_intelligence import PRIMARY_POOL, TAG_CONTRACT
+from app.outbound_requests import OutboundUnavailable
 
 
 def test_chart_parser_orders_candles_and_builds_usd_indicators() -> None:
@@ -80,6 +81,22 @@ def test_prediction_currency_conversion_keeps_native_provenance_but_displays_usd
     assert selected["displayCurrency"] == "USD"
     assert selected["usdConversion"]["forecastSemanticsChanged"] is False
     assert result["currencyConversion"]["nativeValuesRetainedAsProvenance"] is True
+
+
+def test_fx_outage_preserves_our_forecast_and_native_external_values() -> None:
+    payload = {
+        "ourForecast": {"forecastId": "test-frozen-forecast", "pointForecastPrice": 0.001},
+        "externalForecasts": [{"targetCurrency": "CNY", "targetNativePrice": 0.02}],
+    }
+    with patch("app.tagnext_fx._usd_rate", side_effect=OutboundUnavailable("fx", "rate_limited")):
+        result = apply_usd_display_conversions(payload)
+    assert result["ourForecast"] == payload["ourForecast"]
+    assert result["externalForecasts"][0]["targetNativePrice"] == 0.02
+    assert result["externalForecasts"][0]["targetPriceUsd"] is None
+    assert result["externalForecasts"][0]["usdConversion"]["state"] == "unavailable"
+    assert result["currencyConversion"]["unavailableCurrencies"] == ["CNY"]
+    assert result["currencyConversion"]["status"] == "degraded"
+    assert "targetPriceUsd" not in payload["externalForecasts"][0]
 
 
 def test_chart_and_provider_routes_are_authenticated_and_provider_read_is_side_effect_free() -> None:
